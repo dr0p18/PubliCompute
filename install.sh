@@ -490,6 +490,22 @@ if [ "$need_model" = 1 ]; then
     as_agent mv -fT -- "$part" "$model"
 fi
 
+# An upgrade keeps the model the node already serves: the agent verifies its
+# weights at startup, and the default model is only for new installs.
+if [ -f "$conf/agent.conf" ] && [ ! -L "$conf/agent.conf" ]; then
+    old_path=$(sed -n 's/^MODEL_PATH=//p' "$conf/agent.conf" | head -n 1)
+    old_id=$(sed -n 's/^MODEL_ID=//p' "$conf/agent.conf" | head -n 1)
+    old_quant=$(sed -n 's/^QUANTIZATION=//p' "$conf/agent.conf" | head -n 1)
+    case "$old_path" in
+        "$state"/models/*.gguf)
+            if [ "$old_path" != "$model" ] && [ -n "$old_id" ] && [ -n "$old_quant" ] &&
+                as_agent test -f "$old_path" && as_agent test ! -L "$old_path"; then
+                printf 'Keeping the configured model %s %s.\n' "$old_id" "$old_quant"
+                model=$old_path model_id=$old_id quant=$old_quant
+            fi ;;
+    esac
+fi
+
 printf 'COORDINATOR=%s\nSERVER_NAME=%s\nMODEL_PATH=%s\nMODEL_ID=%s\nQUANTIZATION=%s\n' \
     "$coordinator" "$server_name" "$model" "$model_id" "$quant" > "$scratch/agent.conf"
 if [ -n "$gpu_uuid" ]; then printf 'PUBLICOMPUTE_GPU_UUID=%s\n' "$gpu_uuid" >> "$scratch/agent.conf"; fi
