@@ -2,17 +2,14 @@
   <img src="logo.svg" alt="PubliCompute logo" width="160">
 </p>
 
-**PubliCompute** is a network of (smaller) gaming GPUs that run large language
-models together. Connect to the network to use models bigger than your memory,
-**for free**. When part of a Chain, you may also compute tokens for other users:
-this extra work is paid in **credits**, which you spend on PubliCompute when your
-PC is offline, through the chat.
+**PubliCompute** is a network of (smaller) gaming GPUs that run large language models together.\
+Connect to the network to use models bigger than your memory, **for free**.\
+When part of a Chain, you may also compute tokens for other users: this extra work is paid in **credits**, which you spend on PubliCompute when your PC is offline, through the chat.
 
-A model that does not fit on one card is split into stages, each stage on a
-different home GPU, forming a **Chain**. A 16 GB card cannot hold
-DeepSeek V4 Flash, but four or five cards (in the same region) can. Every card
-contributing to the computation of a model gets free use of it. As we see it,
-this is an alternative to paying for an AI subscription, or a way to use it less.
+A model that does not fit on one card is split into stages, each stage on a different home GPU, forming a **Chain**.\
+A 16 GB card cannot hold DeepSeek V4 Flash, but four or five cards (in the same region) can.\
+Every card contributing to the computation of a model gets free use of it.\
+As we see it, this is an alternative to paying for an AI subscription, or a way to use it less.
 
 ## Supported hardware
 
@@ -94,12 +91,9 @@ and the patches keep their MIT license.
 
 ## Acknowledgements to antirez and DwarfStar
 
-PubliCompute started from [DwarfStar](https://github.com/antirez/ds4) by
-Salvatore Sanfilippo (antirez): the idea that a few excellent open models can
-run well on hardware people actually own, and the way of working, with code
-kept small and readable, measurements before claims, and coding agents used
-openly. DwarfStar is still our reference for what efficient inference on
-consumer hardware looks like. Thank you.
+The idea of PubliCompute came from studying [DwarfStar](https://github.com/antirez/ds4),
+the inference engine by antirez. From it I tried to learn a way of working with
+AI for coding.
 
 ## Status
 
@@ -123,9 +117,9 @@ to another account.
 ```sh
 publicompute status            # what your card is doing, credits, Chain
 publicompute use <model>       # pick the model you want to use for free
-publicompute free              # FARM mode: the scheduler decides
-publicompute pause on          # leave the network (gaming, night...)
-publicompute pause off         # come back
+publicompute farm              # FARM mode: the scheduler decides
+publicompute pause             # leave the network (gaming, night...)
+publicompute start             # come back
 publicompute uninstall         # remove everything, keep or delete the models
 ```
 
