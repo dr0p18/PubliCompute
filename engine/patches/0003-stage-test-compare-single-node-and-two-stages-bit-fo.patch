@@ -1,0 +1,280 @@
+diff --git a/tools/publicompute-stage-test/stage-test.cpp b/tools/publicompute-stage-test/stage-test.cpp
+index 7a3ec20cb7fb986bfd9e8962f3abf9ba55e26efc..cd562be002c2531f69f0b517ca4e7a0415fefef1 100644
+--- a/tools/publicompute-stage-test/stage-test.cpp
++++ b/tools/publicompute-stage-test/stage-test.cpp
+@@ -46,16 +46,18 @@ struct Chain {
+ };
+ 
+ static int g_threads = 6;
++static int g_ngl = 0;                // GPU layer count for the full range.
++static int g_ngl_st[2] = {-2, -2};   // GPU layers for each stage. Use the full-range setting by default.
+ 
+ #ifndef STAGE_BASELINE
+-static bool load_stage(Stage & s, const char * path, int a, int b, int n_seq_max, bool set_range) {
++static bool load_stage(Stage & s, const char * path, int a, int b, int n_seq_max, bool set_range, int ngl = -2) {
+     llama_model_params mp = llama_model_default_params();
+-    mp.n_gpu_layers = 0;
++    mp.n_gpu_layers = ngl == -2 ? g_ngl : ngl;
+     if (set_range) { mp.layer_start = a; mp.layer_end = b; }
+ #else
+-static bool load_stage(Stage & s, const char * path, int, int, int n_seq_max, bool) {
++static bool load_stage(Stage & s, const char * path, int, int, int n_seq_max, bool, int ngl = -2) {
+     llama_model_params mp = llama_model_default_params();
+-    mp.n_gpu_layers = 0;
++    mp.n_gpu_layers = ngl == -2 ? g_ngl : ngl;
+ #endif
+     g_log.clear();
+     s.model = llama_model_load_from_file(path, mp);
+@@ -189,9 +191,41 @@ static void print_log(const char * title, const std::vector<std::string> & l, bo
+     if (lines) for (auto & s : l) if (s.find("stage:") != std::string::npos || s.find("kv_cache: size") != std::string::npos) printf("    %s\n", s.c_str());
+ }
+ 
++struct B2 { std::vector<std::vector<float>> l0, l1; bool ok = false; };
++
++// Compare the per-step logits of two sequences that share a batch.
++// Use tokens from the single-sequence runs to keep each compared prefix fixed.
++static void batch2(Chain & ch, const std::vector<llama_token> & t0, const std::vector<llama_token> & t1,
++                   const Run & r0, const Run & r1, int n4, B2 & r, bool all_out = false, bool sep_prefill = false) {
++    reset_chain(ch);
++    r.l0.clear(); r.l1.clear();
++    std::vector<Row> rows; std::vector<std::vector<float>> out;
++    for (size_t i = 0; i < t0.size(); ++i) rows.push_back({t0[i], (llama_pos) i, 0, all_out || i + 1 == t0.size()});
++    for (size_t i = 0; i < t1.size(); ++i) rows.push_back({t1[i], (llama_pos) i, 1, all_out || i + 1 == t1.size()});
++    bool ok = true;
++    std::vector<float> first0, first1; // Retain the last logits of each sequence when their prefill calls are separate.
++    if (sep_prefill) {
++        std::vector<Row> ra(rows.begin(), rows.begin() + t0.size()), rb(rows.begin() + t0.size(), rows.end());
++        ok = chain_decode(ch, ra, out); if (ok) first0 = out[all_out ? t0.size() - 1 : 0];
++        ok = ok && chain_decode(ch, rb, out); if (ok) first1 = out[all_out ? t1.size() - 1 : 0];
++        out.clear(); out.push_back(first0); out.push_back(first1);
++        all_out = false;
++    } else ok = chain_decode(ch, rows, out);
++    size_t i0 = 0, i1 = 1; // Track the positions of the two comparison rows when additional outputs are enabled.
++    if (all_out) { i0 = t0.size() - 1; i1 = t0.size() + t1.size() - 1; }
++    llama_pos p0 = (llama_pos) t0.size(), p1 = (llama_pos) t1.size();
++    for (int s = 0; ok && s < n4; ++s) {
++        r.l0.push_back(out[i0]); r.l1.push_back(out[i1]); i0 = 0; i1 = 1;
++        if (s + 1 == n4) break;
++        rows = {{r0.toks[s], p0++, 0, true}, {r1.toks[s], p1++, 1, true}};
++        ok = chain_decode(ch, rows, out);
++    }
++    r.ok = ok;
++}
++
+ int main(int argc, char ** argv) {
+     if (argc < 3) {
+-        fprintf(stderr, "Usage: %s MODEL.gguf {full-range|split|memory|batch|all|dump FILE|compare FILE} [-t THREAD] [-n TOKEN] [-v]\n", argv[0]);
++        fprintf(stderr, "Usage: %s MODEL.gguf {full-range|split|memory|batch|all|dump FILE|compare FILE} [-t THREAD] [-n TOKEN] [-ngl N] [-ngl0 N] [-ngl1 N] [-v]\n", argv[0]);
+         return 2;
+     }
+     const char * path = argv[1];
+@@ -203,6 +237,9 @@ int main(int argc, char ** argv) {
+     for (; ai < argc; ++ai) {
+         if (!strcmp(argv[ai], "-t") && ai + 1 < argc) g_threads = atoi(argv[++ai]);
+         else if (!strcmp(argv[ai], "-n") && ai + 1 < argc) n_tok_t2 = atoi(argv[++ai]);
++        else if (!strcmp(argv[ai], "-ngl") && ai + 1 < argc) g_ngl = atoi(argv[++ai]);
++        else if (!strcmp(argv[ai], "-ngl0") && ai + 1 < argc) g_ngl_st[0] = atoi(argv[++ai]);
++        else if (!strcmp(argv[ai], "-ngl1") && ai + 1 < argc) g_ngl_st[1] = atoi(argv[++ai]);
+         else if (!strcmp(argv[ai], "-v")) g_verbose = true;
+     }
+     llama_log_set(log_cb, nullptr);
+@@ -239,17 +276,37 @@ int main(int argc, char ** argv) {
+ 
+ #ifndef STAGE_BASELINE
+     const bool all = cmd == "all";
++    // Free the reference before loading the split model so both copies
++    // do not compete for GPU memory.
++    const bool diag = cmd == "batch-diagnostics";
++    const bool want_t1 = all || cmd == "full-range", want_t2 = all || cmd == "split", want_t4 = all || cmd == "batch" || diag;
++    const int n4 = std::min(n_tok_t2, 32);
++    std::vector<std::vector<llama_token>> TT(5);
++    std::vector<Run> A1(3), A(5);   // Independent full-range reference runs for the single-prompt comparisons.
++    Run r0, r1; B2 bref, bref2, bref_all, bref_sep;            // Keep distinct references for isolated and batched sequences.
++    const std::vector<std::string> ref_log = ref.st[0].log;
++    for (int p = 0; p < 5; ++p) TT[p] = tok(ref.st[0].model, PROMPTS[p]);
++    if (want_t1) for (int p = 0; p < 3; ++p) generate(ref, TT[p], N1, nullptr, A1[p]);
++    if (want_t2) for (int p = 0; p < 5; ++p) generate(ref, TT[p], n_tok_t2, nullptr, A[p]);
++    if (want_t4) {
++        generate(ref, TT[1], n4, nullptr, r0); generate(ref, TT[3], n4, nullptr, r1);
++        batch2(ref, TT[1], TT[3], r0, r1, n4, bref);
++        batch2(ref, TT[1], TT[3], r0, r1, n4, bref2); // Repeat the same batch to check determinism before comparing stage layouts.
++        if (diag) { batch2(ref, TT[1], TT[3], r0, r1, n4, bref_all, true); batch2(ref, TT[1], TT[3], r0, r1, n4, bref_sep, false, true); }
++    }
++    free_chain(ref);
++
+     // Explicit full-range bounds should take the same path as the defaults.
+-    if (all || cmd == "full-range") {
++    if (want_t1) {
+         printf("Full range [0,%d) against default, 3 prompts, %d steps (first + 32 tokens)\n", n_layer, N1);
+         Chain full; full.st.resize(1);
+         if (!load_stage(full.st[0], path, 0, n_layer, 2, true)) return 1;
+         full.n_vocab = ref.n_vocab;
+         int diffs = 0, steps = 0;
+         for (int p = 0; p < 3; ++p) {
+-            Run a, b;
+-            auto t = tok(ref.st[0].model, PROMPTS[p]);
+-            generate(ref, t, N1, nullptr, a); generate(full, t, N1, nullptr, b);
++            Run b;
++            generate(full, TT[p], N1, nullptr, b);
++            const Run & a = A1[p];
+             for (int s = 0; s < N1; ++s, ++steps) if (!bit_equal(a.logits[s], b.logits[s])) { diffs++; printf("  Logits differ at prompt %d step %d\n", p, s); }
+             if (a.toks != b.toks) { diffs++; printf("  Tokens differ for prompt %d\n", p); }
+         }
+@@ -258,18 +315,88 @@ int main(int argc, char ** argv) {
+         free_chain(full);
+     }
+ 
++    // Compare the layouts using the last row of each prompt and then all rows.
++    // Holding the requested outputs fixed makes batch effects easier to identify.
++    if (diag) {
++        const int k = n_layer / 2;
++        Chain full; full.st.resize(1);
++        if (!load_stage(full.st[0], path, 0, n_layer, 2, true)) return 1;
++        full.n_vocab = ref.n_vocab;
++        B2 d, d_all, c, c_all;
++        batch2(full, TT[1], TT[3], r0, r1, n4, d); batch2(full, TT[1], TT[3], r0, r1, n4, d_all, true);
++        free_chain(full);
++        Chain two; two.st.resize(2);
++        if (!load_stage(two.st[0], path, 0, k, 2, true, g_ngl_st[0])) return 1;
++        two.st[0].tail = false;
++        if (!load_stage(two.st[1], path, k, n_layer, 2, true, g_ngl_st[1])) return 1;
++        two.n_vocab = ref.n_vocab;
++        batch2(two, TT[1], TT[3], r0, r1, n4, c); batch2(two, TT[1], TT[3], r0, r1, n4, c_all, true);
++        free_chain(two);
++        const char * nm[6] = {"b  single context, 2 sequences (last rows)", "b' single context, 2 sequences (all rows)", "d  full range in a separate context (last rows)",
++                              "d' full range in a separate context (all rows)", "c  two stages (last rows)", "c' two stages (all rows)"};
++        const B2 * v[6] = {&bref, &bref_all, &d, &d_all, &c, &c_all};
++        printf("Maximum difference per step and sequence between [0] and [4] (zero means bit-identical)\n");
++        for (int st = 0; st < n4; ++st)
++            printf("  step %2d: seq0 %.3g seq1 %.3g\n", st, max_abs_diff(bref.l0[st], c.l0[st]), max_abs_diff(bref.l1[st], c.l1[st]));
++        {   auto cmp = [&](const char * what, const B2 & x, const B2 & y) {
++                int nd = 0; double md = 0;
++                for (int st = 0; st < n4; ++st) {
++                    nd += !bit_equal(x.l0[st], y.l0[st]) + !bit_equal(x.l1[st], y.l1[st]);
++                    md = std::max({md, max_abs_diff(x.l0[st], y.l0[st]), max_abs_diff(x.l1[st], y.l1[st])});
++                }
++                printf("  %s: %d/%d differ, maximum difference %.3g, step 0: seq0 %.3g seq1 %.3g\n", what, nd, 2 * n4, md,
++                       max_abs_diff(x.l0[0], y.l0[0]), max_abs_diff(x.l1[0], y.l1[0]));
++            };
++            B2 cs; Chain two2; two2.st.resize(2);
++            const int ks[3] = {15 * n_layer / 30, 1, n_layer - 1};
++            two2.n_vocab = ref.n_vocab;
++            printf("Batch layouts:\n");
++            // Compare layouts when the two sequences are prefilled in separate calls.
++            {   Chain t2c; t2c.st.resize(2);
++                if (!load_stage(t2c.st[0], path, 0, k, 2, true, g_ngl_st[0])) return 1;
++                t2c.st[0].tail = false;
++                if (!load_stage(t2c.st[1], path, k, n_layer, 2, true, g_ngl_st[1])) return 1;
++                t2c.n_vocab = ref.n_vocab;
++                batch2(t2c, TT[1], TT[3], r0, r1, n4, cs, false, true);
++                cmp("separate prefill (single context vs. two stages)", bref_sep, cs);
++                cmp("shared batch vs. separate prefill (single context)", bref, bref_sep);
++                free_chain(t2c); }
++            for (int ki = 1; ki < 3; ++ki) {
++                const int kk = ks[ki];
++                Chain t2c; t2c.st.resize(2);
++                if (!load_stage(t2c.st[0], path, 0, kk, 2, true, g_ngl_st[0])) return 1;
++                t2c.st[0].tail = false;
++                if (!load_stage(t2c.st[1], path, kk, n_layer, 2, true, g_ngl_st[1])) return 1;
++                t2c.n_vocab = ref.n_vocab;
++                B2 ck; batch2(t2c, TT[1], TT[3], r0, r1, n4, ck);
++                char nmk[96]; snprintf(nmk, sizeof nmk, "shared batch, stage boundary at k=%d (single context vs. two stages)", kk);
++                cmp(nmk, bref, ck);
++                free_chain(t2c); }
++        }
++        printf("Batch diagnostics: differences out of %d logit rows\n", 2 * n4);
++        for (int i = 0; i < 6; ++i) printf("  [%d] %s\n", i, nm[i]);
++        for (int i = 0; i < 6; ++i) for (int j = i + 1; j < 6; ++j) {
++            int nd = 0; double md = 0;
++            for (int st = 0; st < n4; ++st) {
++                nd += !bit_equal(v[i]->l0[st], v[j]->l0[st]) + !bit_equal(v[i]->l1[st], v[j]->l1[st]);
++                md = std::max({md, max_abs_diff(v[i]->l0[st], v[j]->l0[st]), max_abs_diff(v[i]->l1[st], v[j]->l1[st])});
++            }
++            printf("  [%d] vs. [%d]: %d/%d differ, maximum difference %.3g\n", i, j, nd, 2 * n4, md);
++        }
++    }
++
+     // Reuse the same two-stage setup for parity, memory and batching checks.
+     if (all || cmd == "split" || cmd == "memory" || cmd == "batch") {
+         const int k = n_layer / 2;
+         Chain two; two.st.resize(2);
+-        if (!load_stage(two.st[0], path, 0, k, 2, true)) { fprintf(stderr, "failed to load stage 0\n"); return 1; }
++        if (!load_stage(two.st[0], path, 0, k, 2, true, g_ngl_st[0])) { fprintf(stderr, "failed to load stage 0\n"); return 1; }
+         two.st[0].tail = false;
+-        if (!load_stage(two.st[1], path, k, n_layer, 2, true)) { fprintf(stderr, "failed to load stage 1\n"); return 1; }
++        if (!load_stage(two.st[1], path, k, n_layer, 2, true, g_ngl_st[1])) { fprintf(stderr, "failed to load stage 1\n"); return 1; }
+         two.n_vocab = ref.n_vocab;
+ 
+         if (all || cmd == "memory") {
+             printf("Memory usage from startup logs and llama_model_size\n");
+-            print_log("single context", ref.st[0].log, true);
++            print_log("single context", ref_log, true);
+             for (int i = 0; i < 2; ++i) {
+                 char t[64]; snprintf(t, sizeof t, "stage %d [%d,%d)", i, i ? k : 0, i ? n_layer : k);
+                 print_log(t, two.st[i].log, true);
+@@ -283,9 +410,8 @@ int main(int argc, char ** argv) {
+                 int tok_mismatch = 0, argmax_diff = 0, steps = 0; double maxd = 0, maxd_tf = 0;
+                 int bitwise = 0;
+                 for (int p = 0; p < 5; ++p) {
+-                    Run a, b, c;
+-                    auto t = tok(ref.st[0].model, PROMPTS[p]);
+-                    generate(ref, t, n_tok_t2, nullptr, a);
++                    Run & a = A[p], b, c;
++                    const auto & t = TT[p];
+                     generate(two, t, n_tok_t2, nullptr, c);       // greedy libero a due stadi
+                     generate(two, t, n_tok_t2, &a.toks, b);       // teacher forcing: logit confrontabili passo per passo
+                     if (a.toks != c.toks) tok_mismatch++;
+@@ -306,29 +432,31 @@ int main(int argc, char ** argv) {
+         }
+ 
+         if (all || cmd == "batch") {
+-            const int n4 = std::min(n_tok_t2, 32);
+-            printf("Two sequences (IDs 0 and 1) in the same batch across both stages, %d steps\n", n4);
+-            auto t0 = tok(ref.st[0].model, PROMPTS[1]), t1 = tok(ref.st[0].model, PROMPTS[3]);
+-            Run r0, r1;
+-            generate(ref, t0, n4, nullptr, r0); generate(ref, t1, n4, nullptr, r1);
+-            reset_chain(two);
+-            std::vector<Row> rows; std::vector<std::vector<float>> out;
+-            for (size_t i = 0; i < t0.size(); ++i) rows.push_back({t0[i], (llama_pos) i, 0, i + 1 == t0.size()});
+-            for (size_t i = 0; i < t1.size(); ++i) rows.push_back({t1[i], (llama_pos) i, 1, i + 1 == t1.size()});
+-            bool ok = chain_decode(two, rows, out);
+-            std::vector<int> g0, g1; double maxd = 0;
+-            llama_pos p0 = (llama_pos) t0.size(), p1 = (llama_pos) t1.size();
+-            for (int s = 0; ok && s < n4; ++s) {
+-                g0.push_back(argmax(out[0])); g1.push_back(argmax(out[1]));
+-                maxd = std::max({maxd, max_abs_diff(out[0], r0.logits[s]), max_abs_diff(out[1], r1.logits[s])});
+-                if (s + 1 == n4) break;
+-                rows = {{r0.toks[s], p0++, 0, true}, {r1.toks[s], p1++, 1, true}}; // token di riferimento (teacher forcing)
+-                ok = chain_decode(two, rows, out);
++            printf("Two sequences (IDs 0 and 1) in the same batch, %d steps forced to the reference tokens\n", n4);
++            B2 & b = bref, c; // Compare the same two-sequence batch with and without a stage boundary.
++            batch2(two, TT[1], TT[3], r0, r1, n4, c);
++            if (!b.ok || !c.ok) { printf("  Batched decode failed\n"); fails++; }
++            else {
++                int a_vs_b = 0, b_vs_c = 0, tok_ab = 0, tok_ac = 0; double d_ab = 0, d_bc = 0, d_ac = 0;
++                for (int s = 0; s < n4; ++s) {
++                    for (int q = 0; q < 2; ++q) {
++                        const auto & Aa = q ? r1.logits[s] : r0.logits[s];
++                        const auto & Bv = q ? b.l1[s] : b.l0[s];
++                        const auto & C = q ? c.l1[s] : c.l0[s];
++                        a_vs_b += !bit_equal(Aa, Bv); b_vs_c += !bit_equal(Bv, C);
++                        d_ab = std::max(d_ab, max_abs_diff(Aa, Bv)); d_bc = std::max(d_bc, max_abs_diff(Bv, C)); d_ac = std::max(d_ac, max_abs_diff(Aa, C));
++                        tok_ab += argmax(Aa) != argmax(Bv); tok_ac += argmax(Aa) != argmax(C);
++                    }
++                }
++                printf("  Single context: (a) one sequence vs. (b) two sequences, %d/%d logit rows differ, maximum difference %.3g, %d argmax differences\n", a_vs_b, 2 * n4, d_ab, tok_ab);
++                {   int rep_diff = 0; double d_rep = 0;
++                    for (int s = 0; s < n4; ++s) { rep_diff += !bit_equal(b.l0[s], bref2.l0[s]) + !bit_equal(b.l1[s], bref2.l1[s]);
++                        d_rep = std::max({d_rep, max_abs_diff(b.l0[s], bref2.l0[s]), max_abs_diff(b.l1[s], bref2.l1[s])}); }
++                    printf("  (b) repeated in the same process: %d/%d logit rows differ, maximum difference %.3g\n", rep_diff, 2 * n4, d_rep); }
++                printf("  (a) vs. (c) two stages with two sequences: maximum difference %.3g, %d argmax differences\n", d_ac, tok_ac);
++                printf("  Batched %s: (c) vs. (b), %d/%d logit rows differ, maximum difference %.3g\n", b_vs_c ? "FAIL" : "OK", b_vs_c, 2 * n4, d_bc);
++                fails += b_vs_c != 0;
+             }
+-            const bool same = ok && g0 == r0.toks && g1 == r1.toks;
+-            printf("  Batched %s: tokens for seq0 %s and seq1 %s the reference, maximum logit difference %.3g\n", same ? "OK" : "FAIL",
+-                   g0 == r0.toks ? "match" : "differ from", g1 == r1.toks ? "match" : "differ from", maxd);
+-            fails += !same;
+         }
+         free_chain(two);
+     }

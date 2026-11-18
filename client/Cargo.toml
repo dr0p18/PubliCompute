@@ -1,0 +1,16 @@
+[package]
+name = "publicompute"
+version = "0.1.1"
+description = "Command-line client for the PubliCompute agent"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "publicompute"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+crossterm = "0.28"

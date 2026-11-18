@@ -1,0 +1,16 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index fb1394d533efa7c08c7ce74ef1535677587ae07d..3639524eb49e5847253158b50000bc590f68c6ef 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2028,7 +2028,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     // when computing embeddings, all tokens are output
+     const bool output_all   = cparams.embeddings;
+     // non-causal attention needs the whole sequence in one ubatch
+-    const bool embd_all     = output_all || !cparams.causal_attn;
++    // Preserve the single-stage microbatch partition even when a partial stage
++    // exports every row. Splitting by sequence changes which tokens each expert
++    // processes together and can change the numerical result.
++    const bool embd_all     = (output_all && !model.stage_partial()) || !cparams.causal_attn;
+     const bool has_samplers = !sampling.samplers.empty();
+ 
+     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;

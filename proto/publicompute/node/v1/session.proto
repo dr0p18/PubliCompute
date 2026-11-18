@@ -1,0 +1,356 @@
+// The node opens the control stream first on a mutually authenticated QUIC
+// connection. The stream begins with Hello and Welcome, followed by an
+// attestation challenge for eligible nodes. Work takes a separate stream
+// per lease so bulk responses cannot delay heartbeats or offers.
+syntax = "proto3";
+
+package publicompute.node.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "publicompute/common/v1/common.proto";
+import "publicompute/node/v1/attestation.proto";
+import "publicompute/node/v1/chain.proto";
+import "publicompute/node/v1/hardware.proto";
+import "publicompute/node/v1/work.proto";
+
+option go_package = "publicompute/proto/gen/go/publicompute/node/v1;nodev1";
+
+message NodeMessage {
+  // Starts at 1 for each session. Errors can refer to this sequence number.
+  uint64 seq = 1;
+  oneof body {
+    Hello hello = 10;
+    Heartbeat heartbeat = 11;
+    AvailabilityUpdate availability = 12;
+    LeaseAccept lease_accept = 13;
+    LeaseReject lease_reject = 14;
+    LeaseRelease lease_release = 15;
+    AttestationQuote attestation_quote = 16;
+    MeasurementPong measurement_pong = 17;
+    ModelInventory model_inventory = 18;
+    Goodbye goodbye = 19;
+    StageStatus stage_status = 20;
+    // Send these three message types only when Welcome advertises protocol minor 2 or higher.
+    ContributionPreference contribution = 21;
+    ModelDirectiveStatus model_directive_status = 22;
+    Leaving leaving = 23;
+  }
+}
+
+message CoordinatorMessage {
+  uint64 seq = 1;
+  oneof body {
+    Welcome welcome = 10;
+    WorkOffer work_offer = 11;
+    LeaseUpdate lease_update = 12;
+    AttestationChallenge attestation_challenge = 13;
+    AttestationResult attestation_result = 14;
+    MeasurementPing measurement_ping = 15;
+    ProbeRequest probe_request = 16;
+    ModelInstallRequest model_install = 17;
+    ModelRemoveRequest model_remove = 18;
+    Drain drain = 19;
+    publicompute.common.v1.Error error = 20;
+    StageAssign stage_assign = 21;
+    StageRelease stage_release = 22;
+    ContributionStatus contribution_status = 23;
+    ModelDirective model_directive = 24;
+    ContributionSummary contribution_summary = 25;
+    LeaveOk leave_ok = 26;
+  }
+}
+
+// Session setup and departure.
+
+message Hello {
+  publicompute.common.v1.ProtocolVersion protocol_version = 1;
+  string agent_version = 2;
+  // Report the current profile each time a session opens.
+  HardwareProfile hardware = 3;
+  ModelInventory models = 4;
+  Availability availability = 5;
+  // Optional region claim. Only an allowed claim takes effect, and an assigned
+  // region takes priority.
+  string region = 6;
+  // NAT classification measured with two STUN requests. Empty means unknown.
+  // The observed IP address and mapped port are not sent in Hello.
+  string nat_class = 7;
+  // Routing identity for the forwarder. Empty selects direct TCP.
+  string iroh_node_id = 8;
+  // Absent means the node is in FREE mode.
+  ContributionPreference contribution = 9;
+  // The coordinator gates messages 23 through 25 on the CONTRIBUTION capability.
+  repeated AgentFeature features = 10;
+}
+
+message Welcome {
+  string session_id = 1;
+  // A TPM-bound node begins at BASE until it passes attestation.
+  publicompute.common.v1.TrustTier tier = 2;
+  google.protobuf.Duration heartbeat_interval = 3;
+  // Used to estimate the offset between coordinator and node clocks.
+  google.protobuf.Timestamp server_time = 4;
+  // When set, halt work until the agent meets the required release.
+  string min_agent_version = 5;
+  // Ed25519 key for verifying signed chain capabilities. Empty means the
+  // coordinator does not advertise a signing key.
+  bytes capability_pub = 6;
+  // If absent, the node withholds message bodies that require minor version 2.
+  publicompute.common.v1.ProtocolVersion protocol_version = 7;
+}
+
+message Goodbye {
+  GoodbyeReason reason = 1;
+}
+
+enum GoodbyeReason {
+  GOODBYE_REASON_UNSPECIFIED = 0;
+  GOODBYE_REASON_HOST_STOPPED = 1;
+  GOODBYE_REASON_SYSTEM_SHUTDOWN = 2;
+  GOODBYE_REASON_UPDATING = 3;
+  // Requests a reboot into the environment that supports boot attestation.
+  GOODBYE_REASON_REBOOT_TO_IMAGE = 4;
+}
+
+// Finish active leases without accepting new work, then disconnect before
+// the grace period expires.
+message Drain {
+  string reason = 1;
+  google.protobuf.Duration grace = 2;
+}
+
+// Availability and heartbeat reporting.
+
+// Sent at the interval set by Welcome. Renews every listed lease.
+message Heartbeat {
+  google.protobuf.Timestamp node_time = 1;
+  Telemetry telemetry = 2;
+  repeated LeaseProgress leases = 3;
+}
+
+enum Availability {
+  AVAILABILITY_UNSPECIFIED = 0;
+  AVAILABILITY_IDLE = 1;
+  // Local activity has priority over work.
+  AVAILABILITY_USER_ACTIVE = 2;
+  AVAILABILITY_PAUSED_BY_HOST = 3;
+  AVAILABILITY_THERMAL_LIMIT = 4;
+  AVAILABILITY_OUTSIDE_SCHEDULE = 5;
+  // Includes restart and post-fault health checks.
+  AVAILABILITY_ENGINE_RECOVERING = 6;
+  // Work remains paused until the host intervenes after repeated restart failures.
+  AVAILABILITY_ENGINE_QUARANTINED = 7;
+}
+
+// Announce the availability change before releasing leases.
+message AvailabilityUpdate {
+  Availability availability = 1;
+}
+
+// Weight inventory and downloads.
+
+message ModelInventory {
+  repeated InstalledModel models = 1;
+}
+
+message InstalledModel {
+  publicompute.common.v1.ModelRef model = 1;
+  ModelStatus status = 2;
+  // True when the engine can serve requests without loading the weights first.
+  bool loaded = 3;
+  uint64 size_bytes = 4;
+  // Concurrent conversation capacity. Zero is interpreted as one slot.
+  uint32 slots = 5;
+  uint64 downloaded_bytes = 6;
+}
+
+enum ModelStatus {
+  MODEL_STATUS_UNSPECIFIED = 0;
+  MODEL_STATUS_DOWNLOADING = 1;
+  MODEL_STATUS_VERIFYING = 2;
+  // The file passed the ModelRef.weights_sha256 check.
+  MODEL_STATUS_READY = 3;
+  MODEL_STATUS_FAILED = 4;
+}
+
+// Download the weights and report progress in ModelInventory. Discard the
+// downloaded file if its hash differs from model.weights_sha256.
+message ModelInstallRequest {
+  publicompute.common.v1.ModelRef model = 1;
+  repeated string urls = 2;
+  uint64 size_bytes = 3;
+}
+
+message ModelRemoveRequest {
+  publicompute.common.v1.ModelRef model = 1;
+}
+
+// Latency probes on the control stream and at a separate endpoint.
+
+// Echo the nonce immediately so the endpoint can measure round-trip time
+// even while the node is serving work.
+message MeasurementPing {
+  string probe_id = 1;
+  bytes nonce = 2;
+}
+
+message MeasurementPong {
+  string probe_id = 1;
+  bytes nonce = 2;
+}
+
+// The node initiates the connection to the measurement endpoint and presents
+// the token there. This lets an endpoint measure latency without dialing the node.
+message ProbeRequest {
+  string probe_id = 1;
+  // QUIC endpoint as host:port. Verify it with the same pinned certificate.
+  string endpoint = 2;
+  bytes token = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+// Used on the connection opened for ProbeRequest.
+message ProbeNodeMessage {
+  oneof body {
+    // The first message binds the connection to the probe ID and token.
+    ProbeHello hello = 1;
+    MeasurementPong pong = 2;
+  }
+}
+
+message ProbeServerMessage {
+  oneof body {
+    MeasurementPing ping = 1;
+  }
+}
+
+message ProbeHello {
+  string probe_id = 1;
+  bytes token = 2;
+}
+
+// Contribution preferences, model placement, and graceful leave.
+
+enum AgentFeature {
+  AGENT_FEATURE_UNSPECIFIED = 0;
+  // Receives contribution status and account summaries.
+  AGENT_FEATURE_CONTRIBUTION = 1;
+  AGENT_FEATURE_BUSY_DETECTION = 2;
+  // Supports model installation and removal requests.
+  AGENT_FEATURE_MODEL_INSTALL = 3;
+  // Can load a model to serve on one node.
+  AGENT_FEATURE_MODEL_SWITCH = 4;
+  // Can enter and leave standby for a stage assignment.
+  AGENT_FEATURE_ENGINE_SWITCH = 5;
+}
+
+enum ContributionMode {
+  CONTRIBUTION_MODE_UNSPECIFIED = 0; // Unspecified is interpreted as FREE.
+  CONTRIBUTION_MODE_USE = 1;         
+  CONTRIBUTION_MODE_FREE = 2;        
+}
+
+// Send in Hello and whenever the member changes the card preference.
+message ContributionPreference {
+  ContributionMode mode = 1;
+  publicompute.common.v1.ModelRef model = 2; // Required for USE. Empty for FREE.
+  uint64 revision = 3;                   // Increase on every change. Revisions at or below the stored revision are ignored.
+}
+
+enum FreeSeatReason {
+  FREE_SEAT_REASON_UNSPECIFIED = 0;
+  FREE_SEAT_REASON_OK = 1;              
+  FREE_SEAT_REASON_MODE_FREE = 2;       // Includes both explicitly freed and automatically freed cards.
+  FREE_SEAT_REASON_NOT_PLACED = 3;      
+  FREE_SEAT_REASON_BUSY = 4;            
+  FREE_SEAT_REASON_WARMING_UP = 5;      // Minimum service time or latency probe still pending.
+  FREE_SEAT_REASON_UNVERIFIED = 6;      
+  FREE_SEAT_REASON_BELOW_QUALITY = 7;   
+  FREE_SEAT_REASON_NO_ACCOUNT = 8;      
+  FREE_SEAT_REASON_MODEL_MISSING = 9;   
+  FREE_SEAT_REASON_SUSPENDED = 10;      // Eligibility is suspended for 24 hours after three abrupt exits in seven days.
+}
+
+// Reports what the card is serving and whether the member earns a slot. Sent on change.
+message ContributionStatus {
+  ContributionMode effective_mode = 1;
+  publicompute.common.v1.ModelRef serving = 2; // Empty when the card is not serving a model.
+  bool in_chain = 3;
+  bool free_seat = 4;
+  FreeSeatReason reason = 5;
+  google.protobuf.Timestamp stable_until = 6; // Earliest time the preference can take effect.
+  uint64 revision = 7;                        
+}
+
+enum ModelRole {
+  MODEL_ROLE_UNSPECIFIED = 0; // Unspecified is interpreted as SINGLE.
+  MODEL_ROLE_SINGLE = 1;      
+  MODEL_ROLE_STAGE_STANDBY = 2; // Keep weights on disk and wait for StageAssign.
+}
+
+// Requests that the agent prepare or serve a set of weights.
+message ModelDirective {
+  publicompute.common.v1.ModelRef model = 1;
+  uint64 epoch = 2; // Monotonic per node.
+  string reason = 3; // Diagnostics only.
+  ModelRole role = 4;
+  uint32 slots = 5;        // Slot capacity for SINGLE. Zero means one.
+  uint32 ctx_per_slot = 6; // Zero uses the agent's configured context size.
+}
+
+enum RejectReason {
+  REJECT_REASON_UNSPECIFIED = 0;
+  REJECT_REASON_UNSUPPORTED = 1;
+  REJECT_REASON_STALE_EPOCH = 2;
+  REJECT_REASON_NOT_INSTALLED = 3;
+  REJECT_REASON_IN_CHAIN = 4;
+  REJECT_REASON_BUSY = 5;
+  REJECT_REASON_TOO_SOON = 6;
+  REJECT_REASON_FAILED_RECENTLY = 7;
+  REJECT_REASON_INSUFFICIENT_MEMORY = 8;
+}
+
+message ModelDirectiveStatus {
+  uint64 epoch = 1;
+  publicompute.common.v1.ModelRef model = 2;
+  // buf:lint:ignore ENUM_VALUE_PREFIX
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    ACCEPTED = 1;
+    UNLOADING = 2;
+    LOADING = 3;
+    SERVING = 4;      
+    REJECTED = 5;     // Terminal rejection with the current service state preserved.
+    FAILED = 6;       // A later rollback or availability update will report the outcome.
+    ROLLED_BACK = 7;  // Terminal result after restoring the model that was loaded before the directive.
+  }
+  State state = 3;
+  RejectReason reject = 4;
+  string error = 5; // Diagnostic text for the coordinator. Omit host paths.
+  double load_seconds = 6;
+}
+
+// Sent after Welcome, then on change with at least ten minutes between updates.
+message ContributionSummary {
+  uint32 days = 1;            // Window length in days.
+  int64 free_value_mc = 2;    // Listed price of free service used in the window.
+  uint32 free_chats = 3;
+  int64 earned_mc = 4;        // Includes paid and external work.
+  uint64 service_seconds = 5;
+  uint64 work_seconds = 6;
+  int64 balance_mc = 7;       
+  google.protobuf.Timestamp as_of = 8;
+}
+
+// The coordinator stops offering work and waits for active leases to finish.
+// It acknowledges departure at the earlier of completion and the grace limit
+// (requested seconds, capped at 60).
+message Leaving {
+  uint32 grazia_s = 1;
+}
+
+// The node may disconnect. lease_interrotte counts leases still open at departure.
+message LeaveOk {
+  uint32 lease_interrotte = 1;
+}

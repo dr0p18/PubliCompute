@@ -1,0 +1,297 @@
+diff --git a/include/llama.h b/include/llama.h
+index 87579fa276e2b7c546876843eeee89b20ad785bb..cb0ca0a6994a67f74f63af46efd89a4dcf7eba48 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -349,12 +349,13 @@ extern "C" {
+         const struct llama_model_kv_override * kv_overrides;
+ 
+         // stage of a layer-split model: this process loads and computes only the layers [layer_start, layer_end)
+-        // of the whole GGUF (currently only the gemma4 architecture). Defaults (0, -1) = the whole model.
++        // of the whole GGUF (gemma4 and qwen4exp architectures). Defaults (0, -1) = the whole model.
+         //   head  (layer_start == 0):        input from tokens (embedding); otherwise input = llama_batch.embd,
+         //                                    the raw hidden state produced by the previous stage
+         //   tail  (layer_end == n_layer):    final norm, output head and logits; otherwise the output of the
+         //                                    stage is the residual stream after layer layer_end-1, to be read with
+         //                                    llama_get_embeddings_ith() (the context enables embeddings by itself)
++        // Use the same boundary row width when loading and decoding a stage.
+         int32_t layer_start;
+         int32_t layer_end;
+ 
+@@ -611,6 +612,12 @@ extern "C" {
+     LLAMA_API int32_t llama_model_n_embd       (const struct llama_model * model);
+     LLAMA_API int32_t llama_model_n_embd_inp   (const struct llama_model * model);
+     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
++
++    // Width of one row of the state exchanged between the stages of a layer-split model (see layer_start/layer_end):
++    // what a stage that is not the tail returns with llama_get_embeddings_ith() and what a stage that is not the
++    // head takes in llama_batch.embd. It is n_embd for gemma4 and hc_mult * n_embd for qwen4exp (all the residual
++    // streams of the hyper-connections).
++    LLAMA_API int32_t llama_model_n_embd_stage(const struct llama_model * model);
+     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
+     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
+     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
+diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
+index f84c6d50be61594d7f2581c2713e2f36e3c1924e..ab198ad6e3c658fa431774dd9c0106c61c28bbca 100644
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -1193,7 +1193,8 @@ llama_batch_ext::llama_batch_ext(llama_context * ctx) :
+         n_seq_max(llama_n_seq_max(ctx)),
+         mem(llama_get_memory(ctx)),
+         n_vocab(llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)))),
+-        n_pos_per_embd(llama_get_model(ctx)->hparams.n_pos_per_embd()) {
++        n_pos_per_embd(llama_get_model(ctx)->hparams.n_pos_per_embd()),
++        stage_embd(!llama_get_model(ctx)->stage_head()) {
+     clear();
+ }
+ 
+@@ -1505,6 +1506,11 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
+             if (has_token) {
+                 // token batch: one position per token
+                 t.pos[0] = batch_inp.pos[i];
++            } else if (batch_ext->stage_embd) {
++                // Stage activations carry one text position per row, like token input.
++                for (uint32_t j = 0; j < batch_ext->n_pos_per_embd; ++j) {
++                    t.pos[j] = j < 3 ? batch_inp.pos[i] : 0;
++                }
+             } else {
+                 // embedding batch (M-RoPE): section-major layout pos[j*n_tokens + i]
+                 for (uint32_t j = 0; j < batch_ext->n_pos_per_embd; ++j) {
+diff --git a/src/llama-batch.h b/src/llama-batch.h
+index d2361396cd49c38cec25bc2fed4b65ee4648ad66..4b53db79a2fab18bfe46128ad97eda379294f012 100644
+--- a/src/llama-batch.h
++++ b/src/llama-batch.h
+@@ -106,6 +106,11 @@ struct llama_batch_ext {
+     const llama_token n_vocab;     // max token ID that we accept
+     const size_t n_pos_per_embd;
+ 
++    // Interpret intermediate activation rows as text positions. For multi-axis
++    // rotation, expand each position using the token layout so the stage receives
++    // the same coordinates as a full-range decode.
++    bool stage_embd = false;
++
+     // actual embd row width of this batch, set by the first set_token_embd()
+     // must be either n_embd_inp or n_embd_inp_enc; encode/decode verify it against the graph input
+     size_t n_embd = 0;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 39307642ba87160204704706cca8ccca0e11ef85..0d8f16cf1e2e481798d67100f905e8346c84b8cd 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2478,8 +2478,16 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
+         const bool is_block  = tn.bid >= 0 && (uint32_t) tn.bid < hparams.n_layer();
+         const bool is_embd   = tn.tensor == LLM_TENSOR_TOKEN_EMBD && !(flags & TENSOR_DUPLICATED); // input embedding
+         const bool is_head   = tn.tensor == LLM_TENSOR_OUTPUT || tn.tensor == LLM_TENSOR_OUTPUT_NORM ||
++                               // qwen4exp: the final hyper-connection mixer collapses the streams before the output head
++                               tn.tensor == LLM_TENSOR_HC_HEAD_NORM || tn.tensor == LLM_TENSOR_HC_HEAD_DOWN || tn.tensor == LLM_TENSOR_HC_HEAD_UP ||
+                                (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED)); // output head tied to the embeddings
+-        if ((is_block && !stage_has_layer(tn.bid)) || (is_embd && !stage_head()) || (is_head && !stage_tail())) {
++        // qwen4exp: the n-gram table is looked up from the token ids, which only the head has
++        const bool is_ple    = tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD;
++        // the blocks after the trunk (MTP / NextN) are never part of a stage
++        const bool is_nextn  = hparams.n_layer_nextn > 0 && tn.bid >= 0 && (uint32_t) tn.bid >= hparams.n_layer() &&
++                               (uint32_t) tn.bid < hparams.n_layer_all;
++        if ((is_block && !stage_has_layer(tn.bid)) || (is_embd && !stage_head()) || (is_head && !stage_tail()) ||
++            (is_ple && !stage_head()) || is_nextn) {
+             flags |= TENSOR_SKIP | TENSOR_NOT_REQUIRED;
+         }
+     }
+@@ -3292,6 +3300,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                         }
+                     }
+ 
++                    // Allocate memory only for local layers, including attention and indexer
++                    // cells, recurrent state, and the embedding convolution history.
++                    if (stage_partial()) {
++                        const auto in_stage = [this](llama_memory_hybrid::layer_filter_cb f) -> llama_memory_hybrid::layer_filter_cb {
++                            return [this, f](uint32_t il) { return stage_has_layer(il) && (!f || f(il)); };
++                        };
++                        filter_attn = in_stage(filter_attn);
++                        filter_recr = in_stage(filter_recr);
++                        if (filter_idx) {
++                            filter_idx = in_stage(filter_idx);
++                        }
++                    }
++
+                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                         // Use hybrid-iswa for hybrid models with SWA
+                         res = new llama_memory_hybrid_iswa(
+@@ -3545,6 +3566,14 @@ int32_t llama_model_n_embd_out(const llama_model * model) {
+     return model->hparams.n_embd_out();
+ }
+ 
++int32_t llama_model_n_embd_stage(const llama_model * model) {
++    // qwen4exp carries hc_mult residual streams from layer to layer, and a stage boundary must pass all of them
++    if (model->arch == LLM_ARCH_QWEN4EXP) {
++        return model->hparams.dsv4_hc_mult * model->hparams.n_embd;
++    }
++    return model->hparams.n_embd;
++}
++
+ int32_t llama_model_n_layer(const llama_model * model) {
+     return model->hparams.n_layer();
+ }
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 8454db2b745229f0ffd027b1f33a26ff84e5ca04..09877e00d3a37d158d3c703817e55217c9363a39 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -358,8 +358,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+             model->layer_start = params.layer_start;
+             model->layer_end   = il_end;
+             if (model->stage_partial()) {
+-                if (model->arch != LLM_ARCH_GEMMA4) {
+-                    throw std::runtime_error("loading a layer range is only implemented for the gemma4 architecture");
++                if (model->arch != LLM_ARCH_GEMMA4 && model->arch != LLM_ARCH_QWEN4EXP) {
++                    throw std::runtime_error("loading a layer range is only implemented for the gemma4 and qwen4exp architectures");
+                 }
+                 LLAMA_LOG_INFO("%s: stage: layers [%u, %u) of %d, head = %d, tail = %d\n", __func__,
+                         model->layer_start, model->layer_end, n_layer, model->stage_head(), model->stage_tail());
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index e4848cb77f26c52e97acb42e1240da377e0404c3..ffa8d376e21a4db8453a0452578a4cb419e2bc16 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -182,6 +182,28 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+     const int trunk_flags = nf.trunk;
+     const int mtp_flags   = nf.mtp;
+ 
++    // The head owns the token embeddings and n-gram table. The tail owns the
++    // final stream mixer and output projection. Each stage loads only its layer
++    // weights, and the auxiliary prediction block is outside the range.
++    if (stage_partial()) {
++        // The n-gram table is indexed by token ID. Keep the layer that reads it in
++        // the head, which receives those IDs.
++        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
++            // Reject a cut before that layer because the following stage would lack its inputs.
++            if (hparams.is_ple(il) && stage_head() != stage_has_layer(il)) {
++                throw std::runtime_error(format("the PLE layer %u must be inside the head stage: the range [%u, %u) is not allowed",
++                                                il, layer_start, stage_end()));
++            }
++        }
++        if (ml.load_mtp) {
++            throw std::runtime_error("a layer range cannot load the MTP block");
++        }
++        if (!stage_head()) {
++            // Use all residual streams supplied by the upstream stage for each row.
++            hparams.n_embd_inp_impl = hparams.dsv4_hc_mult * hparams.n_embd;
++        }
++    }
++
+     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+ 
+     // there is no output_norm: the final hyper-connection mixer carries it
+@@ -465,36 +487,85 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+                 "the indexer cache must track the attention cache cell for cell");
+     }
+ 
++
++    const int  il_beg     = (int) model.layer_start;
++    const int  il_end     = (int) model.stage_end();
++    const bool stage_head = model.stage_head();
++
++    bool stage_has_attn = false;
++    bool stage_has_recr = false;
++    for (int il = il_beg; il < il_end; ++il) {
++        stage_has_attn = stage_has_attn || !hparams.is_recr(il);
++        stage_has_recr = stage_has_recr ||  hparams.is_recr(il);
++    }
++
++    if (model.stage_partial()) {
++        // Allocate memory inputs even for a range that has no layer consuming them.
++        // The runtime still binds those inputs for each microbatch.
++        if (!stage_has_recr) {
++            ggml_build_forward_expand(gf, inp->get_recr()->s_copy);
++        }
++        if (!stage_has_attn) {
++            ggml_build_forward_expand(gf, inp->get_attn()->self_k_idxs);
++            ggml_build_forward_expand(gf, inp->get_attn()->self_v_idxs);
++        }
++    }
++
++    // Weight loading enforces that the n-gram lookup runs in the head.
+     ggml_tensor * ple_emb = nullptr;
+-    if (hparams.ple_n_heads > 0) {
++    if (hparams.ple_n_heads > 0 && stage_head) {
+         ple_emb = build_inp_ple(mctx_hyb);
+         // make sure ple_emb and build_inp_embd are in the same graph split
+         ggml_build_forward_expand(gf, ple_emb);
+     }
+ 
+-    ggml_tensor * inpL = build_inp_embd(model.tok_embd);
+-    cb(inpL, "model.input_embed", -1);
+-    ggml_build_forward_expand(gf, inpL);
++    ggml_tensor * inpL = nullptr;
++    if (stage_head) {
++        inpL = build_inp_embd(model.tok_embd);
++        cb(inpL, "model.input_embed", -1);
++        ggml_build_forward_expand(gf, inpL);
++    }
+ 
+     // the QSA layers share one set of k-pool inputs
+     // the CUDA lightning indexer takes 32 or 64 heads, QSA has a few, so it scores with plain ops
+     llm_graph_input_kpool * inp_kpool = nullptr;
+-    if (mctx_idx && hparams.indexer_kpool > 0) {
++    if (mctx_idx && hparams.indexer_kpool > 0 && stage_has_attn) {
+         inp_kpool = build_inp_kpool(mctx_hyb);
+     }
+ 
+     ggml_tensor * inp_pos     = build_inp_pos();
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
+-    // the wide residual starts as hc identical copies of the embedding
+-    ggml_tensor * res_hc = ggml_repeat_4d(ctx0,
+-            ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
+-            n_embd, hc, n_tokens, 1);
+-    cb(res_hc, "hc_init", -1);
++    if (model.stage_partial() && !stage_has_attn) {
++        // Bind rotary positions for each microbatch even if its local layers do not use them.
++        ggml_build_forward_expand(gf, inp_pos);
++    }
++
++    ggml_tensor * res_hc = nullptr;
++    if (stage_head) {
++        // Seed every residual stream with a copy of the token embedding.
++        res_hc = ggml_repeat_4d(ctx0,
++                ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
++                n_embd, hc, n_tokens, 1);
++        cb(res_hc, "hc_init", -1);
++    } else {
++        // Continue from every residual stream of each input row. The public stage
++        // width includes all streams packed into one row.
++        auto inp_stage = std::make_unique<llm_graph_input_embd>(n_embd*hc);
++        inp_stage->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd*hc, n_tokens);
++        cb(inp_stage->embd, "inp_stage", -1);
++        ggml_set_input(inp_stage->embd);
++        res->t_inp_embd = inp_stage->embd;
++
++        res_hc = ggml_reshape_3d(ctx0, inp_stage->embd, n_embd, hc, n_tokens);
++        cb(res_hc, "hc_stage", -1);
++
++        res->add_input(std::move(inp_stage));
++    }
+     // make sure hc_init is in the same graph split as the first layer (-sm tensor)
+     ggml_build_forward_expand(gf, res_hc);
+ 
+-    for (int il = 0; il < n_layer; ++il) {
++    for (int il = il_beg; il < il_end; ++il) {
+         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+             res->t_layer_inp[il] = hc_stream_mean(ctx0, res_hc);
+             cb(res->t_layer_inp[il], "layer_inp", il);
+@@ -552,6 +623,20 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+         cb(res_hc, "l_last", il);
+     }
+ 
++    if (!model.stage_tail()) {
++        // Intermediate results are the residual streams at the layer boundary.
++        // The tail owns the final mixing and vocabulary projection.
++        ggml_tensor * out = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
++        // The context requests embeddings for every row so the next stage receives the full batch.
++        if (inp_out_ids) {
++            out = ggml_get_rows(ctx0, out, inp_out_ids);
++        }
++        cb(out, "result_stage", -1);
++        res->t_embd = out;
++        ggml_build_forward_expand(gf, out);
++        return;
++    }
++
+     // the MTP head reads the hc-wide residual, before the final mixer
+     res->t_h_nextn = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+     cb(res->t_h_nextn, "h_nextn", -1);

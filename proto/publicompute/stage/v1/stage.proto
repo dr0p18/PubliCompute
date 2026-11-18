@@ -1,0 +1,203 @@
+// Stage links use one TCP connection per stream. Prefill carries Open and PrefillBlock,
+// generation carries Step and Close, and control carries Confirmation toward the
+// head. The tail uses a separate token stream back to the head. Every connection
+// starts with Hello and HelloAck. Messages use varint framing with a 16 MiB limit.
+syntax = "proto3";
+
+package publicompute.stage.v1;
+
+option go_package = "publicompute/proto/gen/go/publicompute/stage/v1;stagev1";
+
+enum Stream {
+  STREAM_UNSPECIFIED = 0;
+  STREAM_PREFILL = 1;
+  STREAM_GENERATION = 2;
+  STREAM_CONTROL = 3;
+  STREAM_TOKEN = 4;
+}
+
+// Wire encoding of residual state passed between neighboring layer ranges.
+enum StateFormat {
+  STATE_FORMAT_UNSPECIFIED = 0;
+  // n_token rows of n_embd little-endian float32 values.
+  STATE_FORMAT_FP32_LE = 1;
+  // n_token rows of n_embd little-endian IEEE 754 binary16 values.
+  STATE_FORMAT_FP16_LE = 2;
+  // Each row carries a little-endian float32 scale (max absolute value divided
+  // by 127) followed by n_embd signed bytes. Multiply each byte by the scale.
+  STATE_FORMAT_INT8_ROW_LE = 3;
+  // Split each row into stream_count equal segments. Each segment carries a
+  // little-endian float32 scale followed by its signed bytes. A row occupies
+  // n_embd + 4 * stream_count bytes. A single segment has the INT8_ROW_LE layout.
+  STATE_FORMAT_INT8_STREAM_LE = 4;
+}
+
+message Hello {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  Stream stream = 3;
+  // Opening side's link epoch. Increase it on reconnect. The accepting side
+  // echoes it in confirmations so the head can discard a fault from a retired
+  // link. Zero leaves the epoch unspecified.
+  uint32 epoch = 4;
+  // Set on the token stream when the tail can propose multi-token drafts. A head
+  // configured for that draft source requires this capability during the handshake.
+  bool mtp = 5;
+}
+
+message HelloAck {
+  bool ok = 1;
+  string error = 2;
+}
+
+message Sampling {
+  // Zero selects greedy sampling.
+  float temperature = 1;
+  // Derive each sampling seed from the root seed, conversation ID, and logical step.
+  uint64 root_seed = 2;
+  // Zero disables the corresponding sampling cutoff.
+  float top_p = 3;
+  uint32 top_k = 4;
+}
+
+// Reserve this conversation's slot before sending the first PrefillBlock.
+message Open {
+  uint64 conversation_id = 1;
+  // Starts at 1 because the watermark is initialized to zero.
+  uint32 attempt_id = 2;
+  uint32 group_id = 3;
+  // Sequence ID for context memory. Keep it the same across the chain.
+  uint32 slot = 4;
+  uint32 context_limit = 5;
+  // Length of the confirmed prefix when rebuilding context. Zero on initial admission.
+  uint32 start_position = 6;
+  Sampling sampling = 7;
+  // State encoding for subsequent PrefillBlock and Step messages. Zero selects
+  // float32. An intermediate stage replaces this field with the encoding it
+  // will use on its outgoing link.
+  StateFormat state_format = 8;
+}
+
+// Carries rows for one conversation during prefill.
+message PrefillBlock {
+  uint64 conversation_id = 1;
+  uint32 attempt_id = 2;
+  uint32 group_id = 3;
+  uint32 start_position = 4;
+  uint32 n_token = 5;
+  uint32 n_embd = 6;
+  StateFormat format = 7;
+  bytes state = 8;
+  // On the final block the tail also samples the first response token.
+  bool last = 9;
+  // The step sampled after the final block is zero for a fresh prompt. During
+  // recovery it is the number of response tokens already in the confirmed prefix.
+  uint32 first_token_step = 10;
+  // Set only for rows encoded as STATE_FORMAT_INT8_STREAM_LE.
+  uint32 stream_count = 11;
+  // Input token for each row, in row order. A tail that drafts from the residual
+  // state also needs these token IDs to populate its draft context. Empty
+  // disables this draft source for the conversation. Forward the IDs unchanged.
+  repeated int32 token = 12;
+  // On the final block, requested draft length after the first sampled token.
+  // Zero requests one. The tail applies its configured maximum.
+  uint32 draft_count = 13;
+}
+
+message StepRow {
+  uint64 conversation_id = 1;
+  uint32 attempt_id = 2;
+  // Generation starts at step 1 because step 0 is sampled during prefill.
+  uint32 conversation_step = 3;
+  uint32 position = 4;
+  // Input token proposed by the draft, present on rows after the mandatory
+  // row. The tail verifies a proposal against the sample from the preceding row.
+  int32 draft_token = 5;
+  // On the mandatory row, request this many draft tokens after the accepted
+  // prefix. Zero requests one. The tail applies its configured maximum.
+  uint32 draft_count = 6;
+}
+
+// All rows in a group step travel in one frame per link.
+message Step {
+  uint32 group_id = 1;
+  // High 32 bits identify the recovery episode. Low 32 bits count rounds.
+  uint64 group_round = 2;
+  repeated StepRow rows = 3;
+  uint32 n_embd = 4;
+  StateFormat format = 5;
+  // One state row per entry in rows, in the same order.
+  bytes state = 6;
+  // Set only for rows encoded as STATE_FORMAT_INT8_STREAM_LE.
+  uint32 stream_count = 7;
+}
+
+message TokenRow {
+  uint64 conversation_id = 1;
+  uint32 attempt_id = 2;
+  uint32 conversation_step = 3;
+  int32 token = 4;
+  // Log-softmax over the full vocabulary before sampling adjustments.
+  float logprob = 5;
+  // Ordered draft tokens following token. Each step picks the highest-scoring
+  // token using the preceding token and the draft state. The head uses the
+  // draft from the last accepted row for the conversation. The list can end
+  // early at a generation marker or the context limit.
+  repeated int32 draft = 6;
+}
+
+message Token {
+  uint32 group_id = 1;
+  // High 32 bits identify the recovery episode. Low 32 bits count rounds.
+  uint64 group_round = 2;
+  // Set for the token sampled from the final prefill block.
+  bool prefill = 3;
+  repeated TokenRow rows = 4;
+  // Sending stage, counted from the head starting at 1. Zero is unspecified.
+  uint32 stage = 5;
+}
+
+enum AckKind {
+  ACK_KIND_UNSPECIFIED = 0;
+  ACK_KIND_OPEN = 1;
+  ACK_KIND_ERROR = 2;
+  // Cumulative timing snapshot. The head keeps the latest report per stage.
+  // Send with ok set and conversation_id zero.
+  ACK_KIND_TIMINGS = 3;
+}
+
+// Sent upstream along the control links until it reaches the head.
+message Confirmation {
+  AckKind kind = 1;
+  uint64 conversation_id = 2;
+  uint32 attempt_id = 3;
+  bool ok = 4;
+  string error = 5;
+  // The origin keeps its stage index as intermediates forward the message.
+  // Zero leaves the origin unspecified.
+  uint32 stage = 6;
+  // Each forwarder uses the epoch of its own upstream link. The head ignores
+  // chain-wide confirmations from superseded epochs. Zero is unspecified.
+  uint32 epoch = 7;
+  // JSON timing data for ACK_KIND_TIMINGS. Keep the payload in sync with
+  // the timing representation in stage/src/timings.rs.
+  string timings_json = 8;
+}
+
+message Close {
+  uint64 conversation_id = 1;
+  uint32 attempt_id = 2;
+}
+
+message Message {
+  oneof body {
+    Hello hello = 1;
+    HelloAck ack = 2;
+    Open open = 3;
+    PrefillBlock block = 4;
+    Step step = 5;
+    Token token = 6;
+    Confirmation confirmation = 7;
+    Close close = 8;
+  }
+}

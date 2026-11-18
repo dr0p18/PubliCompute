@@ -1,0 +1,326 @@
+// Offers and renewals travel on the control stream. Requests and results
+// travel on one work stream per lease. Request IDs are scoped to their lease.
+// Keep customer metadata out of these messages and encode verification
+// requests the same way as ordinary work unless assigning a verifier task.
+syntax = "proto3";
+
+package publicompute.node.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "publicompute/common/v1/common.proto";
+
+option go_package = "publicompute/proto/gen/go/publicompute/node/v1;nodev1";
+
+// Offers and lease state on the control stream.
+
+message Lease {
+  string lease_id = 1;
+  // The default expiry is 60 seconds after issue. Without renewal the work
+  // returns to the queue and the coordinator discards late results.
+  google.protobuf.Timestamp expires_at = 2;
+  // Default renewal interval is ten seconds.
+  google.protobuf.Duration renew_interval = 3;
+}
+
+message WorkOffer {
+  Lease lease = 1;
+  publicompute.common.v1.ModelRef model = 2;
+  // Settings for the token probability commitment included in each result.
+  LogicParams logic = 3;
+  // Offered payment lets the host compare earnings with its operating cost.
+  PayoutRate payout = 4;
+  oneof task {
+    BatchTask batch = 10;
+    ChatTask chat = 11;
+    VerifyTask verify = 12;
+  }
+}
+
+message PayoutRate {
+  publicompute.common.v1.Money per_million_input_tokens = 1;
+  publicompute.common.v1.Money per_million_output_tokens = 2;
+}
+
+// Send a Heartbeat listing the lease after LeaseAccept. Open the work
+// stream only after the renewal arrives. QUIC streams can arrive in either
+// order, so opening early can race acceptance.
+message LeaseAccept {
+  string lease_id = 1;
+}
+
+message LeaseReject {
+  string lease_id = 1;
+  LeaseRejectReason reason = 2;
+  string detail = 3;
+}
+
+enum LeaseRejectReason {
+  LEASE_REJECT_REASON_UNSPECIFIED = 0;
+  LEASE_REJECT_REASON_MODEL_NOT_READY = 1;
+  LEASE_REJECT_REASON_HOST_BUSY = 2;
+  LEASE_REJECT_REASON_UNPROFITABLE = 3;
+  LEASE_REJECT_REASON_INSUFFICIENT_MEMORY = 4;
+  LEASE_REJECT_REASON_THERMAL = 5;
+  LEASE_REJECT_REASON_CONTEXT_TOO_LONG = 6;
+}
+
+// Release active work early. Send any completed results before releasing
+// the lease so the coordinator can requeue only outstanding requests.
+message LeaseRelease {
+  string lease_id = 1;
+  LeaseReleaseReason reason = 2;
+}
+
+enum LeaseReleaseReason {
+  LEASE_RELEASE_REASON_UNSPECIFIED = 0;
+  LEASE_RELEASE_REASON_USER_ACTIVE = 1;
+  LEASE_RELEASE_REASON_THERMAL = 2;
+  LEASE_RELEASE_REASON_ENGINE_FAILURE = 3;
+  LEASE_RELEASE_REASON_SHUTDOWN = 4;
+}
+
+// Reporting an active lease renews it. The coordinator also checks the
+// progress counter against the phase's limit: a working connection can
+// send heartbeats even when inference has stalled.
+message LeaseProgress {
+  string lease_id = 1;
+  uint32 requests_completed = 2;
+  uint64 tokens_generated = 3;
+  // UNSPECIFIED disables phase stall detection for this lease.
+  LeasePhase phase = 4;
+  // Increment on every completed prompt block, produced token, or finished
+  // request. The coordinator uses this counter to detect progress within a phase.
+  uint64 progress_seq = 5;
+  // Counts prompt tokens for the current request. Zero means unknown.
+  uint64 prompt_tokens_processed = 6;
+}
+
+// Each active phase has its own stall limit.
+enum LeasePhase {
+  LEASE_PHASE_UNSPECIFIED = 0;
+  LEASE_PHASE_STARTING = 1;
+  // Increase progress_seq as prompt blocks complete so a long prefill does
+  // not exceed the phase limit while the engine is still making progress.
+  LEASE_PHASE_PREFILL = 2;
+  // Advance progress_seq on each generated token.
+  LEASE_PHASE_DECODE = 3;
+  LEASE_PHASE_BETWEEN_REQUESTS = 4;
+  // Includes sending the final results and closing the lease.
+  LEASE_PHASE_FINISHING = 5;
+}
+
+// Can acknowledge renewal or revoke an active lease at any time.
+message LeaseUpdate {
+  string lease_id = 1;
+  oneof status {
+    google.protobuf.Timestamp renewed_until = 2;
+    LeaseRevokeReason revoked = 3;
+  }
+}
+
+enum LeaseRevokeReason {
+  LEASE_REVOKE_REASON_UNSPECIFIED = 0;
+  LEASE_REVOKE_REASON_EXPIRED = 1;
+  // Includes an explicitly canceled job or a closed chat.
+  LEASE_REVOKE_REASON_CANCELLED = 2;
+  LEASE_REVOKE_REASON_REASSIGNED = 3;
+  LEASE_REVOKE_REASON_TRUST_DOWNGRADED = 4;
+  // The engine exceeded the phase stall limit. The node pauses and its work
+  // becomes eligible for reassignment.
+  LEASE_REVOKE_REASON_NO_PROGRESS = 5;
+  // The total time limit is based on request size and the minimum accepted
+  // throughput. It also applies while the host-reported progress counter advances.
+  LEASE_REVOKE_REASON_WORK_DEADLINE = 6;
+}
+
+// Batch, chat, and verification tasks.
+
+// One schedulable block of requests from a batch job.
+message BatchTask {
+  repeated InferenceRequest requests = 1;
+}
+
+// One streamed chat response assigned under a single lease.
+message ChatTask {
+  InferenceRequest request = 1;
+}
+
+message InferenceRequest {
+  string request_id = 1;
+  // Apply the chat template stored with the referenced weights.
+  repeated ChatMessage messages = 2;
+  SamplingParams sampling = 3;
+}
+
+message ChatMessage {
+  ChatRole role = 1;
+  string content = 2;
+}
+
+enum ChatRole {
+  CHAT_ROLE_UNSPECIFIED = 0;
+  CHAT_ROLE_SYSTEM = 1;
+  CHAT_ROLE_USER = 2;
+  CHAT_ROLE_ASSISTANT = 3;
+}
+
+message SamplingParams {
+  float temperature = 1;
+  float top_p = 2;
+  uint32 top_k = 3;
+  uint32 max_tokens = 4;
+  // Set by the coordinator to make verification repeatable.
+  uint64 seed = 5;
+  repeated string stop = 6;
+}
+
+message LogicParams {
+  uint32 format_version = 1;
+  // Number of candidate token probabilities to record per position.
+  uint32 top_k = 2;
+}
+
+// To spot-check an answer, prefill the prompt and the supplied response
+// together, then recompute probabilities at the requested positions.
+message VerifyTask {
+  string verify_id = 1;
+  InferenceRequest request = 2;
+  repeated uint32 output_token_ids = 3;
+  // Index into output_token_ids for each position to verify.
+  repeated uint32 positions = 4;
+  uint32 top_k = 5;
+}
+
+// Each lease has one bidirectional QUIC work stream opened by the node.
+
+message WorkStreamNodeMessage {
+  oneof body {
+    WorkStreamOpen open = 1;
+    TokenDelta token_delta = 2;
+    RequestResult request_result = 3;
+    VerifyResult verify_result = 4;
+    // Marks the end of request delivery for this lease.
+    LeaseComplete lease_complete = 5;
+  }
+}
+
+message WorkStreamCoordinatorMessage {
+  oneof body {
+    ResultAck result_ack = 1;
+    // Stop generation for this request without canceling other work on the lease.
+    CancelRequest cancel_request = 2;
+  }
+}
+
+message WorkStreamOpen {
+  string lease_id = 1;
+}
+
+// A streamed fragment. RequestResult still carries the complete response and commitment.
+message TokenDelta {
+  string request_id = 1;
+  // Zero-based token offset in the response.
+  uint32 index = 2;
+  string text = 3;
+  repeated uint32 token_ids = 4;
+}
+
+message RequestResult {
+  string request_id = 1;
+  oneof outcome {
+    Completion completion = 2;
+    RequestFailure failure = 3;
+  }
+}
+
+message Completion {
+  string text = 1;
+  // Used for verification and to count billable tokens.
+  repeated uint32 token_ids = 2;
+  FinishReason finish_reason = 3;
+  Usage usage = 4;
+  // Results without a commitment are rejected.
+  LogicCommitment logic = 5;
+  // SHA-256 of templated prompt tokens in order as little-endian uint32 values.
+  // This lets verification detect a different tokenized prompt.
+  bytes prompt_tokens_sha256 = 6;
+  Timing timing = 7;
+}
+
+enum FinishReason {
+  FINISH_REASON_UNSPECIFIED = 0;
+  FINISH_REASON_STOP = 1;
+  FINISH_REASON_LENGTH = 2;
+  FINISH_REASON_CANCELLED = 3;
+}
+
+message Usage {
+  uint32 prompt_tokens = 1;
+  uint32 completion_tokens = 2;
+}
+
+message Timing {
+  google.protobuf.Duration prefill = 1;
+  google.protobuf.Duration generation = 2;
+}
+
+// The work protocol carries the commitment as opaque bytes. The verifier
+// selects the record layout by format_version. See agent/src/logic.rs for
+// the encoding of per-token log probabilities.
+message LogicCommitment {
+  uint32 format_version = 1;
+  bytes data = 2;
+  // IDs or scores were incomplete, so this commitment cannot be verified.
+  bool verification_incomplete = 3;
+}
+
+message RequestFailure {
+  RequestFailureCode code = 1;
+  string detail = 2;
+}
+
+enum RequestFailureCode {
+  REQUEST_FAILURE_CODE_UNSPECIFIED = 0;
+  REQUEST_FAILURE_CODE_CONTEXT_TOO_LONG = 1;
+  REQUEST_FAILURE_CODE_ENGINE_ERROR = 2;
+  REQUEST_FAILURE_CODE_OUT_OF_MEMORY = 3;
+}
+
+message VerifyResult {
+  string verify_id = 1;
+  repeated PositionLogprobs positions = 2;
+  bytes prompt_tokens_sha256 = 3;
+  // Count produced by the verifier for comparison with usage.prompt_tokens
+  // on the result under review. Zero leaves the count unchecked.
+  uint32 prompt_tokens = 4;
+}
+
+message PositionLogprobs {
+  uint32 position = 1;
+  // Highest probability first.
+  repeated TokenLogprob top = 2;
+  // Probability of the actual sampled token in log space.
+  float chosen_logprob = 3;
+}
+
+message TokenLogprob {
+  uint32 token_id = 1;
+  float logprob = 2;
+}
+
+message ResultAck {
+  string request_id = 1;
+  // A malformed result or missing commitment fails initial acceptance. Spot
+  // checks report their outcome separately.
+  bool accepted = 2;
+  string reason = 3;
+}
+
+message CancelRequest {
+  string request_id = 1;
+}
+
+message LeaseComplete {
+  string lease_id = 1;
+}

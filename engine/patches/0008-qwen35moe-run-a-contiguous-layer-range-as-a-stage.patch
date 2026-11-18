@@ -1,0 +1,119 @@
+diff --git a/include/llama.h b/include/llama.h
+index 68ce7391d194237677cd2aca3db7242618202157..42d6c1e4687a843d7990f615cf7b829eded9d0d7 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -349,7 +349,7 @@ extern "C" {
+         const struct llama_model_kv_override * kv_overrides;
+ 
+         // stage of a layer-split model: this process loads and computes only the layers [layer_start, layer_end)
+-        // of the whole GGUF (gemma4, qwen4exp and laguna architectures). Defaults (0, -1) = the whole model.
++        // from the full GGUF. A zero start and negative end request the full range.
+         //   head  (layer_start == 0):        input from tokens (embedding); otherwise input = llama_batch.embd,
+         //                                    the raw hidden state produced by the previous stage
+         //   tail  (layer_end == n_layer):    final norm, output head and logits; otherwise the output of the
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 47aeaf042a2573b273eaffc5bf85ceb5ff06c393..c841c00429b66735f50751e6cc7c60a59b65ccc1 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -358,8 +358,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+             model->layer_start = params.layer_start;
+             model->layer_end   = il_end;
+             if (model->stage_partial()) {
+-                if (model->arch != LLM_ARCH_GEMMA4 && model->arch != LLM_ARCH_QWEN4EXP && model->arch != LLM_ARCH_LAGUNA) {
+-                    throw std::runtime_error("loading a layer range is only implemented for the gemma4, qwen4exp and laguna architectures");
++                if (model->arch != LLM_ARCH_GEMMA4 && model->arch != LLM_ARCH_QWEN4EXP &&
++                    model->arch != LLM_ARCH_LAGUNA && model->arch != LLM_ARCH_QWEN35MOE) {
++                    throw std::runtime_error("loading a layer range is only implemented for the gemma4, qwen4exp, laguna and qwen35moe architectures");
+                 }
+                 LLAMA_LOG_INFO("%s: stage: layers [%u, %u) of %d, head = %d, tail = %d\n", __func__,
+                         model->layer_start, model->layer_end, n_layer, model->stage_head(), model->stage_tail());
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 939f10f7f061680336619f43907ab7c20bfbcc9b..7dedd2e5e83d7cc1a8aa78715983ab92dc29703f 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -40,6 +40,12 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
+     const int trunk_flags = nf.trunk;
+     const int mtp_flags   = nf.mtp;
+ 
++    // a stage [layer_start, layer_end) loads only its own tensors (see llama_model_base::create_tensor): the token
++    // embeddings on the head, the final norm and the output head on the tail; the MTP block is never part of a stage
++    if (stage_partial() && ml.load_mtp) {
++        throw std::runtime_error("a layer range cannot load the MTP block");
++    }
++
+     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+ 
+     // output
+@@ -165,6 +171,12 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
+     ggml_tensor * cur;
+     ggml_tensor * inpL;
+ 
++    // Keep the activation rows from the previous stage in their original layout.
++    // The following layers read one embedding-width residual per row from
++    // the batch embedding buffer.
++    const int il_beg = (int) model.layer_start;
++    const int il_end = (int) model.stage_end();
++
+     inpL = build_inp_embd(model.tok_embd);
+ 
+     cb(inpL, "model.input_embed", -1);
+@@ -174,8 +186,28 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
+     ggml_tensor * inp_pos     = build_inp_pos();
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
++    if (model.stage_partial()) {
++        // Bind both sets of memory inputs because the runtime fills them on every
++        // microbatch, even when there is no consumer in this range.
++        bool stage_has_attn = false;
++        bool stage_has_recr = false;
++        for (int il = il_beg; il < il_end; ++il) {
++            stage_has_attn = stage_has_attn || !hparams.is_recr(il);
++            stage_has_recr = stage_has_recr ||  hparams.is_recr(il);
++        }
++        if (!stage_has_recr) {
++            ggml_build_forward_expand(gf, inp->get_recr()->s_copy);
++        }
++        if (!stage_has_attn) {
++            ggml_build_forward_expand(gf, inp->get_attn()->self_k_idxs);
++            ggml_build_forward_expand(gf, inp->get_attn()->self_v_idxs);
++            // Bind rotary coordinates for every microbatch, including ranges without full attention.
++            ggml_build_forward_expand(gf, inp_pos);
++        }
++    }
++
+     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
+-    for (int il = 0; il < n_layer; ++il) {
++    for (int il = il_beg; il < il_end; ++il) {
+         res->t_layer_inp[il] = inpL;
+ 
+         ggml_tensor * inpSA = inpL;
+@@ -194,7 +226,8 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
+             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+         }
+ 
+-        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
++        // Only the tail can apply the output mask because intermediate stages forward every row.
++        if (il == il_end - 1 && model.stage_tail() && crop_before_nextn(inp_out_ids)) {
+             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
+             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+         }
+@@ -226,6 +259,19 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
+     }
+     cur = inpL;
+ 
++    if (!model.stage_tail()) {
++        // Pass the residual stream across the boundary before output normalization
++        // or vocabulary projection. The stage context requests embeddings for
++        // every row so all of them reach the next stage.
++        if (inp_out_ids) {
++            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++        }
++        cb(cur, "result_stage", -1);
++        res->t_embd = cur;
++        ggml_build_forward_expand(gf, cur);
++        return;
++    }
++
+     // post-norm hidden state feeds both the LM head and the MTP seed below
+     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+ 

@@ -1,0 +1,288 @@
+diff --git a/tools/publicompute-stage-test/stage-test.cpp b/tools/publicompute-stage-test/stage-test.cpp
+index c6330addf0292e7fef6ea45cd855249e9f60cd46..0256d42ede0eea0823c23ca21fc96996f34a4368 100644
+--- a/tools/publicompute-stage-test/stage-test.cpp
++++ b/tools/publicompute-stage-test/stage-test.cpp
+@@ -5,9 +5,14 @@
+ //   split compares tokens and logits across two stages using FP32 and FP16.
+ //   memory compares weight and cache allocations from the startup log.
+ //   batch checks shared batches across two stages.
+-//   recurrent compares recurrent state across split layouts.
+-//   Try two- and three-stage cuts, shared batches and chunked prefill.
+-//   Reuse sequence IDs to verify that removed state stays cleared.
++// Verify split parity against a single context across two- and three-stage
++// layouts. Exercise concurrent sequences, sequence reuse, and chunked
++// prefill to check cache isolation. Compare allocated weight memory to
++// make sure shared tensor roles do not cause duplicate allocations.
++// Only the head needs input embeddings and only the tail needs the output head.
++//   rollback verifies a batched draft and rewinds it with seq_rm.
++//   Compare recurrent state through subsequent steps on both layouts.
++// invalid-ranges checks range and draft-weight validation.
+ #include "llama.h"
+ #include "ggml.h"
+ 
+@@ -49,6 +54,7 @@ struct Chain {
+ };
+ 
+ static int g_threads = 6;
++static int g_rs_seq = 0;             // Recurrent snapshots per sequence for rollback.
+ static int g_ngl = 0;                // GPU layer count for the full range.
+ static int g_ngl_st[2] = {-2, -2};   // GPU layers for each stage. Use the full-range setting by default.
+ 
+@@ -68,6 +74,7 @@ static bool load_stage(Stage & s, const char * path, int, int, int n_seq_max, bo
+     llama_context_params cp = llama_context_default_params();
+     cp.n_ctx = 1024; cp.n_batch = 512; cp.n_ubatch = 512; cp.n_seq_max = n_seq_max;
+     cp.n_threads = g_threads; cp.n_threads_batch = g_threads;
++    cp.n_rs_seq = g_rs_seq;
+     s.ctx = llama_init_from_model(s.model, cp);
+     if (!s.ctx) return false;
+ #ifndef STAGE_BASELINE
+@@ -198,6 +205,16 @@ static void print_log(const char * title, const std::vector<std::string> & l, bo
+     if (lines) for (auto & s : l) if (s.find("stage:") != std::string::npos || s.find("kv_cache: size") != std::string::npos) printf("    %s\n", s.c_str());
+ }
+ 
++// Sum the weight allocations reported in MiB by the startup log.
++static double log_weights_mib(const std::vector<std::string> & l) {
++    double w = 0;
++    for (auto & s : l) {
++        const size_t p = s.find("buffer size =");
++        if (p != std::string::npos && s.find("model buffer size") != std::string::npos) w += atof(s.c_str() + p + 13);
++    }
++    return w;
++}
++
+ struct B2 { std::vector<std::vector<float>> l0, l1; bool ok = false; };
+ 
+ // Compare the per-step logits of two sequences that share a batch.
+@@ -308,10 +325,12 @@ static bool run_batched_reuse(Chain & c, const std::vector<llama_token> & A, con
+         if (!chain_decode(c, rows, out)) return false;
+     }
+     const llama_token next_c = rows[1].tok;
++    const llama_pos   pos_c  = rows[1].pos; // The loop does not decode its final prepared row, so that row gives the next position.
+     if (!seq_rm_chain(c, 0)) { fprintf(stderr, "seq_rm was rejected\n"); return false; }
+     rows.clear();
+     for (size_t i = 0; i < B.size(); ++i) rows.push_back({B[i], (llama_pos) i, 0, i + 1 == B.size()});
+-    rows.push_back({next_c, p1++, 1, true});
++    rows.push_back({next_c, pos_c, 1, true});
++    p1 = pos_c + 1;
+     if (!chain_decode(c, rows, out)) return false;
+     p0 = (llama_pos) B.size();
+     for (int s = 0; s < n; ++s) {
+@@ -404,6 +423,7 @@ static int recurrent_suite(const char * path, Chain & ref, int n_layer, const st
+         for (auto & t : R.toks) v.insert(v.end(), t.begin(), t.end());
+         std::sort(v.begin(), v.end()); distinct = (int) (std::unique(v.begin(), v.end()) - v.begin());
+         printf("  Reference generated %d distinct tokens out of %zu\n", distinct, v.size()); }
++    const double ref_mib = log_weights_mib(ref.st[0].log);
+     printf("  Reference checks:\n");
+     fails += compare_logits("reused sequence B vs. B with an empty cache", R.fresh_b, R.reuse, 0, R.i_b) != 0;
+     for (int i = 0; i < 3; ++i) {
+@@ -428,6 +448,14 @@ static int recurrent_suite(const char * path, Chain & ref, int n_layer, const st
+             ch.st[i].tail = i + 2 == b.size();
+         }
+         if (!ok) { printf("    FAIL: could not load stage\n"); fails++; free_chain(ch); continue; }
++        {   // Weight ownership should account for every tensor exactly once across the stages.
++            double somma = 0;
++            for (auto & s : ch.st) somma += log_weights_mib(s.log);
++            const bool uguale = std::fabs(somma - ref_mib) <= 0.03 * (double) ch.st.size() + 1e-9; // Allow for rounding of each logged buffer size to two decimal places.
++            printf("    %-58s %s: all stages %.2f MiB, reference %.2f MiB\n", "weight memory: each tensor is loaded by one stage",
++                   uguale ? "OK" : "FAIL", somma, ref_mib);
++            fails += !uguale;
++        }
+         RecurrentReference C;
+         if (!recurrent_run(ch, TT, long_prompt, n, C)) { printf("    FAIL: decode failed\n"); fails++; free_chain(ch); continue; }
+         int tok_div = 0, nd = 0;
+@@ -452,6 +480,156 @@ static int recurrent_suite(const char * path, Chain & ref, int n_layer, const st
+     return fails;
+ }
+ 
++
++// Verify a draft in one batch, then keep only its first proposed token.
++// Roll back the remaining rows on every stage in one operation, since
++// the recurrent snapshot can be consumed only once. Continue greedy
++// decoding from the retained prefix.
++static bool p_rollback(Chain & c, const std::vector<llama_token> & prompt, int K, int n_after, Logs & l, bool & rm_ok,
++                       std::vector<llama_token> & acc) {
++    reset_chain(c);
++    acc.clear();
++    Logs out;
++    std::vector<Row> rows;
++    for (size_t i = 0; i < prompt.size(); ++i) rows.push_back({prompt[i], (llama_pos) i, 0, i + 1 == prompt.size()});
++    if (!chain_decode(c, rows, out)) return false;
++    l.push_back(out[0]);
++    const llama_pos L = (llama_pos) prompt.size();
++    const llama_token t0 = argmax(out[0]);
++    rows = {{t0, L, 0, true}};
++    for (int i = 1; i <= K; ++i) rows.push_back({(llama_token) ((t0 + 97 * i) % c.n_vocab), L + i, 0, true}); // Generate deterministic draft tokens to give both paths the same batch input.
++    if (!chain_decode(c, rows, out)) return false;
++    for (const auto & v : out) l.push_back(v);
++    acc = {rows[0].tok, rows[1].tok};                        // Keep the verified prefix and the first accepted proposal.
++    for (auto & s : c.st) rm_ok = llama_memory_seq_rm(llama_get_memory(s.ctx), 0, L + 2, -1) && rm_ok; // Remove rejected positions from every stage before resuming decode.
++    const llama_token x = argmax(out[1]);                    // Resume from the distribution at the last accepted row.
++    acc.push_back(x);
++    llama_pos pos = L + 2;
++    rows = {{x, pos++, 0, true}};
++    for (int s = 0; s < n_after; ++s) {
++        if (!chain_decode(c, rows, out)) return false;
++        l.push_back(out[0]);
++        if (s + 1 < n_after) { acc.push_back(argmax(out[0])); rows = {{acc.back(), pos++, 0, true}}; }
++    }
++    return true;
++}
++
++// Replay the retained tokens step by step to get a reference without rollback.
++static bool run_without_draft(Chain & c, const std::vector<llama_token> & prompt, const std::vector<llama_token> & acc, Logs & l) {
++    reset_chain(c);
++    Logs out;
++    std::vector<Row> rows;
++    for (size_t i = 0; i < prompt.size(); ++i) rows.push_back({prompt[i], (llama_pos) i, 0, i + 1 == prompt.size()});
++    if (!chain_decode(c, rows, out)) return false;
++    llama_pos pos = (llama_pos) prompt.size();
++    for (size_t i = 0; i < acc.size(); ++i) {
++        rows = {{acc[i], pos++, 0, true}};
++        if (!chain_decode(c, rows, out)) return false;
++        if (i >= 2) l.push_back(out[0]);                    // Compare only the logits after the retained prefix.
++    }
++    return true;
++}
++
++struct RollRef { std::vector<Logs> l, plain; std::vector<std::vector<llama_token>> acc; bool rm_ok = true; };
++
++static bool roll_run(Chain & c, const std::vector<std::vector<llama_token>> & TT, int K, int n_after, RollRef & r) {
++    r.l.assign(3, {}); r.plain.assign(3, {}); r.acc.assign(3, {});
++    for (int p = 0; p < 3; ++p) {
++        if (!p_rollback(c, TT[p], K, n_after, r.l[p], r.rm_ok, r.acc[p])) return false;
++        if (!run_without_draft(c, TT[p], r.acc[p], r.plain[p])) return false;
++    }
++    return true;
++}
++
++// Report numerical differences from the stepwise reference, whose batch shape differs.
++static void roll_vs_plain(const RollRef & R, int & ad, int & n, double & md) {
++    ad = 0; n = 0; md = 0;
++    for (int p = 0; p < 3; ++p) for (size_t i = 0; i < R.plain[p].size(); ++i, ++n) {
++        const auto & a = R.l[p][R.l[p].size() - R.plain[p].size() + i];
++        const auto & b = R.plain[p][i];
++        ad += argmax(a) != argmax(b); md = std::max(md, max_abs_diff(a, b));
++    }
++}
++
++static int rollback_suite(const char * path, Chain & ref, int n_layer, const std::vector<int> & cuts, const std::vector<int> & three_stage_cuts, int K) {
++    int fails = 0;
++    const int n_after = 8;
++    std::vector<std::vector<llama_token>> TT(3);
++    for (int p = 0; p < 3; ++p) TT[p] = tok(ref.st[0].model, PROMPTS[p]);
++    printf("rollback: %d draft tokens (1 kept, %d removed with seq_rm), n_rs_seq = %d, %d steps after rollback\n", K, K - 1, g_rs_seq, n_after);
++    RollRef R;
++    if (!roll_run(ref, TT, K, n_after, R)) { printf("rollback: reference decode failed\n"); return 1; }
++    printf("  Reference: seq_rm %s\n", R.rm_ok ? "accepted" : "rejected");
++    if (!R.rm_ok) fails++;
++    {   int ad, n; double md;
++        roll_vs_plain(R, ad, n, md);
++        printf("  Reference with and without rollback (diagnostic): %d logit rows, %d argmax differences, maximum difference %.3g\n", n, ad, md); }
++    free_chain(ref);
++
++    std::vector<std::vector<int>> cfg;
++    for (int k : cuts) cfg.push_back({k});
++    if (three_stage_cuts.size() == 2) cfg.push_back(three_stage_cuts);
++    for (const auto & cuts : cfg) {
++        std::vector<int> b = {0}; b.insert(b.end(), cuts.begin(), cuts.end()); b.push_back(n_layer);
++        std::string name;
++        for (size_t i = 0; i + 1 < b.size(); ++i) { char t[32]; snprintf(t, sizeof t, "%s[%d,%d)", i ? "+" : "", b[i], b[i + 1]); name += t; }
++        printf("  Chain %s:\n", name.c_str());
++        Chain ch; ch.st.resize(b.size() - 1); ch.n_vocab = ref.n_vocab;
++        bool ok = true;
++        for (size_t i = 0; ok && i + 1 < b.size(); ++i) {
++            ok = load_stage(ch.st[i], path, b[i], b[i + 1], 2, true);
++            ch.st[i].tail = i + 2 == b.size();
++        }
++        if (!ok) { printf("    FAIL: could not load stage\n"); fails++; free_chain(ch); continue; }
++        RollRef C;
++        if (!roll_run(ch, TT, K, n_after, C)) { printf("    FAIL: decode failed\n"); fails++; free_chain(ch); continue; }
++        int nd = 0, n = 0; double md = 0;
++        for (int p = 0; p < 3; ++p) {
++            if (R.l[p].size() != C.l[p].size()) { nd++; continue; }
++            for (size_t i = 0; i < R.l[p].size(); ++i, ++n) {
++                nd += !bit_equal(R.l[p][i], C.l[p][i]); md = std::max(md, max_abs_diff(R.l[p][i], C.l[p][i]));
++            }
++        }
++        printf("    %-58s %s: %d logit rows compared, %d differ, maximum difference %.3g\n", "draft, rollback and subsequent steps against reference", nd ? "FAIL" : "OK", n, nd, md);
++        printf("    %-58s %s\n", "all stages accepted seq_rm", C.rm_ok ? "OK" : "FAIL");
++        int ad, nn; double mp;
++        roll_vs_plain(C, ad, nn, mp);
++        printf("    %-58s (diagnostic): %d logit rows, %d argmax differences, maximum difference %.3g\n", "chain with and without rollback", nn, ad, mp);
++        fails += (nd != 0) + (!C.rm_ok);
++        free_chain(ch);
++    }
++    return fails;
++}
++
++// Check the loader rejects invalid layer ranges and unsupported draft layouts.
++static int invalid_ranges_suite(const char * path, int n_layer, int n_nextn) {
++    int fails = 0;
++    auto prova = [&](const char * what, int a, int b, bool mtp, bool expected_ok) {
++        llama_model_params mp = llama_model_default_params();
++        mp.n_gpu_layers = 0; mp.layer_start = a; mp.layer_end = b; mp.load_mtp = mtp;
++        llama_model * m = llama_model_load_from_file(path, mp);
++        const bool ok = m != nullptr;
++        if (m) llama_model_free(m);
++        printf("  %-62s %s: %s\n", what, ok == expected_ok ? "OK" : "FAIL", ok ? "loaded" : "rejected");
++        return ok == expected_ok ? 0 : 1;
++    };
++    printf("invalid-ranges: n_layer = %d, auxiliary blocks = %d\n", n_layer, n_nextn);
++    fails += prova("empty range [3,3)", 3, 3, false, false);
++    fails += prova("reversed range [5,2)", 5, 2, false, false);
++    fails += prova("negative start [-1,4)", -1, 4, false, false);
++    fails += prova("end beyond the model [0,n+1)", 0, n_layer + 1, false, false);
++    fails += prova("valid head range [0,n-1)", 0, n_layer - 1, false, true);
++    if (n_nextn > 0) {
++        fails += prova("MTP with the full model (reference)", 0, -1, true, true);
++        fails += prova("MTP with head range [0,4)", 0, 4, true, false);
++        fails += prova("MTP with tail range [4,n)", 4, n_layer, true, false);
++        fails += prova("MTP with head range [0,n-1)", 0, n_layer - 1, true, false);
++    } else {
++        printf("  No MTP block in this model. Skipping MTP range cases.\n");
++    }
++    return fails;
++}
++
+ static std::vector<int> parse_ints(const char * s) {
+     std::vector<int> v;
+     while (*s) { v.push_back(atoi(s)); while (*s && *s != ',') ++s; if (*s == ',') ++s; }
+@@ -461,7 +639,7 @@ static std::vector<int> parse_ints(const char * s) {
+ 
+ int main(int argc, char ** argv) {
+     if (argc < 3) {
+-        fprintf(stderr, "Usage: %s MODEL.gguf {full-range|split|memory|batch|all|recurrent|dump FILE|compare FILE} [-t THREAD] [-n TOKEN] [-ngl N] [-ngl0 N] [-ngl1 N] "
++        fprintf(stderr, "Usage: %s MODEL.gguf {full-range|split|memory|batch|all|recurrent|rollback|invalid-ranges|dump FILE|compare FILE} [-t THREAD] [-n TOKEN] [-ngl N] [-ngl0 N] [-ngl1 N] "
+                         "[-cuts a,b,...] [-three a,b] [-v]\n", argv[0]);
+         return 2;
+     }
+@@ -486,6 +664,7 @@ int main(int argc, char ** argv) {
+ #endif
+         else if (!strcmp(argv[ai], "-v")) g_verbose = true;
+     }
++    if (cmd == "rollback") g_rs_seq = 3;
+     llama_log_set(log_cb, nullptr);
+     llama_backend_init();
+     int fails = 0;
+@@ -526,6 +705,21 @@ int main(int argc, char ** argv) {
+         printf("%s\n", fails ? "FAIL" : "PASS");
+         return fails ? 1 : 0;
+     }
++    if (cmd == "rollback") {
++        if (cuts.empty()) cuts = {n_layer / 2, 1, n_layer - 1};
++        fails = rollback_suite(path, ref, n_layer, cuts, three_stage_cuts, 3);
++        llama_backend_free();
++        printf("%s\n", fails ? "FAIL" : "PASS");
++        return fails ? 1 : 0;
++    }
++    if (cmd == "invalid-ranges") {
++        const int n_nextn = llama_model_n_layer_nextn(ref.st[0].model);
++        free_chain(ref);
++        fails = invalid_ranges_suite(path, n_layer, n_nextn);
++        llama_backend_free();
++        printf("%s\n", fails ? "FAIL" : "PASS");
++        return fails ? 1 : 0;
++    }
+     const bool all = cmd == "all";
+     // Free the reference before loading the split model so both copies
+     // do not compete for GPU memory.

@@ -1,0 +1,29 @@
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index fe2f4232d153272176fdc52e2c5577f46b6efc72..b1997a24f1c8bd71b54ef3fbe2df80c72ce66a59 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -770,12 +770,23 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
+             ? layer.nextn.shared_head_norm
+             : model.output_norm;
+     GGML_ASSERT(head_norm_w && "QWEN35MOE MTP: missing both nextn.shared_head_norm and output_norm");
++
++    // To chain draft steps, expose the state for the rows that return logits.
++    // Normalization works on each row independently, so gathering those rows
++    // before normalization preserves their values.
++    const bool nextn_masked = inp_out_ids != nullptr && cparams.embeddings_nextn && cparams.embeddings_nextn_masked;
++    if (nextn_masked) {
++        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++    }
++
+     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+ 
+     cb(cur, "h_nextn", -1);
+     res->t_h_nextn= cur;
+ 
+-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++    if (!nextn_masked) {
++        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++    }
+     cb(cur, "mtp_shared_head_norm", -1);
+ 
+     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;

@@ -1,0 +1,107 @@
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index aa475eb05ce88c085524b1fc83eda6989f478bac..c94b49f5d61a016ea68d9e2f27b8b36584e73856 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2488,9 +2488,10 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
+         // the blocks after the trunk (MTP / NextN) are never part of a stage
+         const bool is_nextn  = hparams.n_layer_nextn > 0 && tn.bid >= 0 && (uint32_t) tn.bid >= hparams.n_layer() &&
+                                (uint32_t) tn.bid < hparams.n_layer_all;
+-        // deepseek4: the tail stage may load the MTP block (the loader refuses it for any other stage); the MTP step
+-        // embeds the token it is given, so the tail then keeps the input embedding too
+-        const bool tail_mtp  = arch == LLM_ARCH_DEEPSEEK4 && ml.load_mtp && stage_tail() && hparams.n_layer_nextn > 0;
++        // A tail that loads the draft block also needs input embeddings because
++        // each draft step consumes the proposed token ID.
++        const bool tail_mtp  = (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_QWEN35MOE) && ml.load_mtp && stage_tail() &&
++                               hparams.n_layer_nextn > 0;
+         if ((is_block && !stage_has_layer(tn.bid)) || (is_embd && !stage_head() && !tail_mtp) || (is_head && !stage_tail()) ||
+             (is_ple && !stage_head()) || (is_nextn && !tail_mtp)) {
+             flags |= TENSOR_SKIP | TENSOR_NOT_REQUIRED;
+@@ -3410,8 +3411,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                         }
+                     }
+ 
+-                    // a stage keeps the KV cache of its own layers only
+-                    if (stage_partial()) {
++                    // A separate draft context caches the auxiliary layer beyond the main
++                    // range, so use the draft-layer filter there.
++                    if (stage_partial() && !mtp_on_hybrid_qwen) {
+                         filter = [&](uint32_t il) { return stage_has_layer(il); };
+                     }
+ 
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 7dedd2e5e83d7cc1a8aa78715983ab92dc29703f..fe2f4232d153272176fdc52e2c5577f46b6efc72 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -41,9 +41,12 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
+     const int mtp_flags   = nf.mtp;
+ 
+     // a stage [layer_start, layer_end) loads only its own tensors (see llama_model_base::create_tensor): the token
+-    // embeddings on the head, the final norm and the output head on the tail; the MTP block is never part of a stage
+-    if (stage_partial() && ml.load_mtp) {
+-        throw std::runtime_error("a layer range cannot load the MTP block");
++    // Keep the main embeddings in the head and the output layers in the tail.
++    // A tail with a draft block also needs embeddings if that block has no table.
++    if (stage_partial() && ml.load_mtp && !(stage_tail() && hparams.n_layer_nextn > 0)) {
++        throw std::runtime_error(stage_tail() ?
++            "load_mtp: the file has no MTP block to load" :
++            "a layer range that is not the tail cannot load the MTP block");
+     }
+ 
+     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+@@ -150,6 +153,10 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
+     for (int i = n_layer; i < n_layer_all; ++i) {
+         load_block_mtp(i);
+     }
++    // Detect missing draft tensors at load time because the context cannot decode without them.
++    if (stage_partial() && ml.load_mtp && layers[n_layer].nextn.eh_proj == nullptr) {
++        throw std::runtime_error("load_mtp: the file has no MTP block to load");
++    }
+ }
+ 
+ std::unique_ptr<llm_graph_context> llama_model_qwen35moe::build_arch_graph(const llm_graph_params & params) const {
+diff --git a/tools/publicompute-stage-test/stage-test.cpp b/tools/publicompute-stage-test/stage-test.cpp
+index f2109ff40339dff7ed44912b0c34c795bb7b6d93..668c20625daabeefa8afd43b0962734844baf57d 100644
+--- a/tools/publicompute-stage-test/stage-test.cpp
++++ b/tools/publicompute-stage-test/stage-test.cpp
+@@ -620,7 +620,8 @@ static int rollback_suite(const char * path, Chain & ref, int n_layer, const std
+ }
+ 
+ // Check the loader rejects invalid layer ranges and unsupported draft layouts.
+-static int invalid_ranges_suite(const char * path, int n_layer, int n_nextn, int n_hash) {
++// The tail_mtp flag enables the auxiliary prediction block for a supported tail range.
++static int invalid_ranges_suite(const char * path, int n_layer, int n_nextn, int n_hash, bool tail_mtp) {
+     int fails = 0;
+     auto prova = [&](const char * what, int a, int b, bool mtp, bool expected_ok) {
+         llama_model_params mp = llama_model_default_params();
+@@ -640,12 +641,16 @@ static int invalid_ranges_suite(const char * path, int n_layer, int n_nextn, int
+     if (n_nextn > 0) {
+         fails += prova("MTP with the full model (reference)", 0, -1, true, true);
+         fails += prova("MTP with head range [0,4)", 0, 4, true, false);
+-        // The tail owns the draft block because it consumes the main model's final state.
+-        fails += prova("MTP with tail range [4,n)", 4, n_layer, true, n_hash > 0);
++        // Only a supported tail can load the auxiliary prediction block for a partial range.
++        fails += prova("MTP with tail range [4,n)", 4, n_layer, true, tail_mtp);
+         fails += prova("MTP with head range [0,n-1)", 0, n_layer - 1, true, false);
+         if (n_hash > 0) {
+             fails += prova("MTP with middle range [hash,n-1)", n_hash, n_layer - 1, true, false);
++        } else if (tail_mtp) {
++            fails += prova("MTP with middle range [1,n-1)", 1, n_layer - 1, true, false);
+         }
++    } else if (tail_mtp && n_hash <= 0) {
++        fails += prova("MTP with tail range [4,n) without draft weights", 4, n_layer, true, false);
+     } else if (n_hash <= 0) {
+         printf("  No MTP block in this model. Skipping MTP range cases.\n");
+     }
+@@ -754,8 +759,11 @@ int main(int argc, char ** argv) {
+             char b[32] = {0};
+             if (llama_model_meta_val_str(ref.st[0].model, "deepseek4.hash_layer_count", b, sizeof b) > 0) n_hash = atoi(b);
+         }
++        char arch[64] = {0};
++        llama_model_meta_val_str(ref.st[0].model, "general.architecture", arch, sizeof arch);
++        const bool tail_mtp = strcmp(arch, "deepseek4") == 0 || strcmp(arch, "qwen35moe") == 0;
+         free_chain(ref);
+-        fails = invalid_ranges_suite(path, n_layer, n_nextn, n_hash);
++        fails = invalid_ranges_suite(path, n_layer, n_nextn, n_hash, tail_mtp);
+         llama_backend_free();
+         printf("%s\n", fails ? "FAIL" : "PASS");
+         return fails ? 1 : 0;

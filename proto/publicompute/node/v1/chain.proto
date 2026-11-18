@@ -1,0 +1,87 @@
+// The coordinator assigns each stage a layer range, its neighbors, and the
+// settings it needs to join the chain. The head handles work for the chain
+// and reports readiness after all stage links have acknowledged their hello.
+syntax = "proto3";
+
+package publicompute.node.v1;
+
+import "publicompute/common/v1/common.proto";
+
+option go_package = "publicompute/proto/gen/go/publicompute/node/v1;nodev1";
+
+message StageAssign {
+  string chain_id = 1;
+  uint32 stage_index = 2;        // 1 is the head.
+  uint32 n_stages = 3;
+  publicompute.common.v1.ModelRef model = 4;
+  uint32 layer_start = 5;
+  int32  layer_end = 6;          // -1 includes the final layer.
+  uint32 slots = 7;              // Every stage must allocate the same number of conversation slots.
+  uint32 ctx_per_slot = 8;
+  uint32 groups = 9;             // Number of groups that can be in flight together.
+  uint32 n_batch = 10;
+  string state_format = 11;      // Wire encoding of residuals, either "fp32" or "fp16".
+  string listen_addr = 12;       // Listen address for the predecessor. Empty at the head.
+  string next_addr = 13;         // Connect address for the successor. Empty at the tail.
+  string head_token_addr = 14;   // Address where the head receives sampled tokens from the tail.
+  bytes  capability = 15;        // Serialized SignedCapability. Empty selects plaintext mode.
+  uint64 assign_epoch = 16;      // Increase on reassignment so a stage can distinguish assignments of the same chain.
+  // A peer ID tells the agent to route a stage connection through a local
+  // forwarder. Stage TLS still authenticates the remote endpoint end to end.
+  // Empty IDs use direct TCP to the advertised addresses.
+  string next_node_id = 17;        // Peer ID of the successor. Empty at the tail.
+  string head_token_node_id = 18;  // Peer ID of the head for the tail's token stream.
+  string relay_url = 19;           // Relay used to reach the stage peers.
+  repeated string peer_iroh_ids = 20;   // Only these peer IDs may connect through the forwarder.
+}
+
+message StageRelease {
+  string chain_id = 1;
+  uint64 assign_epoch = 2;
+  string reason = 3;
+}
+
+message StageStatus {
+  string chain_id = 1;
+  uint64 assign_epoch = 2;
+  // buf:lint:ignore ENUM_VALUE_PREFIX
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    LOADING = 1;
+    READY = 2;
+    RUNNING = 3;
+    FAILED = 4;
+    STOPPED = 5;
+  }
+  State state = 3;
+  string error = 4;
+  uint32 port = 5;               // Port bound by a downstream stage.
+  double load_seconds = 6;
+}
+
+// The signed capability binds node identities and layer ranges to a chain.
+// The receiving endpoint checks that the certificate identity occupies
+// the predecessor position for stage traffic or the tail position for
+// tokens sent to the head. Refresh with a StageAssign at the same epoch.
+message ChainCapability {
+  string chain_id = 1;
+  uint64 assign_epoch = 2;
+  int64  expires_unix = 3;       // Unix seconds.
+  repeated CapStage stages = 4;  // Ordered from the head at index 1.
+}
+
+message CapStage {
+  uint32 index = 1;              // 1 is the head.
+  string node_id = 2;
+  bytes  model_sha256 = 3;
+  uint32 layer_start = 4;
+  int32  layer_end = 5;          // -1 includes the final layer.
+}
+
+// StageAssign.capability contains this envelope. The Ed25519 signature covers
+// the serialized ChainCapability in body.
+message SignedCapability {
+  bytes  body = 1;
+  bytes  signature = 2;
+  string key_id = 3;             // First eight bytes of the signing public key's SHA-256, encoded in hex.
+}

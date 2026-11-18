@@ -1,0 +1,316 @@
+//! An interactive terminal opens a live view when invoked without arguments.
+//! Commands and non-interactive invocations print one line and return a status code.
+
+mod render;
+mod sock;
+mod status;
+
+use std::{
+    io::{IsTerminal, Write},
+    path::{Path, PathBuf},
+    process::Command,
+    sync::mpsc,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use crossterm::{
+    cursor,
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+};
+
+use sock::Socket;
+use status::Status;
+
+const CHAT_URL: &str = "https://publicompute.com/chat";
+const USAGE: &str = "usage: publicompute [--data-dir DIR | --socket FILE] [status [--json] | use <model> [--quant Q] | farm | pause | start | uninstall [--keep-models | --remove-models]]";
+const UNINSTALLER: &str = "/opt/publicompute-agent/uninstall.sh";
+
+fn main() {
+    std::process::exit(run(std::env::args().skip(1).collect()));
+}
+
+fn run(args: Vec<String>) -> i32 {
+    let (socket, rest) = match parse_args(args) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("{e}\n{USAGE}");
+            return 1;
+        }
+    };
+    if rest.is_empty() && std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+        return match interactive(&socket) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("error: {e}");
+                1
+            }
+        };
+    }
+    match command(&socket, &rest) {
+        Ok(out) => {
+            if !out.is_empty() {
+                println!("{out}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
+    }
+}
+
+/// Extract socket overrides from any position and return the remaining command arguments.
+fn parse_args(args: Vec<String>) -> Result<(Socket, Vec<String>), String> {
+    let mut socket = None;
+    let mut dir = None;
+    let mut rest = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--data-dir" => dir = Some(PathBuf::from(it.next().ok_or("--data-dir needs a value")?)),
+            "--socket" => socket = Some(PathBuf::from(it.next().ok_or("--socket needs a value")?)),
+            _ => rest.push(a),
+        }
+    }
+    let socket = socket.or_else(|| dir.map(|p| p.join("agent.sock"))).map_or(Socket::Default, Socket::Explicit);
+    Ok((socket, rest))
+}
+
+/// Dispatch a one-shot command and return its printable response or error.
+fn command(socket: &Socket, args: &[String]) -> Result<String, String> {
+    command_with_uninstaller(socket, args, uninstall)
+}
+
+fn command_with_uninstaller(
+    socket: &Socket,
+    args: &[String],
+    uninstall: impl FnOnce(&[String]) -> Result<(), String>,
+) -> Result<String, String> {
+    let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    match a.as_slice() {
+        ["--help"] | ["-h"] => Ok(USAGE.into()),
+        [] | ["status"] => Ok(status::status_line(&sock::get_status(socket)?).0),
+        ["status", "--json"] => {
+            let v = sock::request(socket, &serde_json::json!({"op": "status"}))?;
+            Ok(v["status"].to_string())
+        }
+        ["farm"] => {
+            sock::set_preference(socket, None, None)?;
+            Ok("FARM mode: set".into())
+        }
+        ["use", model] => use_model(socket, model, None),
+        ["use", model, "--quant", q] => use_model(socket, model, Some(q)),
+        ["pause"] => switch_pause(socket, true),
+        ["start"] => switch_pause(socket, false),
+        ["uninstall"] | ["uninstall", "--keep-models" | "--remove-models"] => {
+            uninstall(&args[1..])?;
+            Ok(String::new())
+        }
+        _ => Err(format!("unknown command\n{USAGE}")),
+    }
+}
+
+/// Pause or start the card. Asking first lets us tell the user when the card is
+/// already in that state, instead of silently doing nothing.
+fn switch_pause(socket: &Socket, pause: bool) -> Result<String, String> {
+    if sock::get_status(socket)?.paused == pause {
+        let notice = if pause {
+            "already paused: run `publicompute start` to rejoin the network"
+        } else {
+            "already running: run `publicompute pause` to leave the network"
+        };
+        return Ok(notice.into());
+    }
+    sock::set_pause(socket, pause)?;
+    Ok(if pause { "paused" } else { "started" }.into())
+}
+
+fn uninstall(args: &[String]) -> Result<(), String> {
+    let script = Path::new(UNINSTALLER);
+    if !script.is_file() {
+        return Err(sock::connect_error(script, &std::io::ErrorKind::NotFound.into(), false));
+    }
+    let root = Command::new("id").arg("-u").output().is_ok_and(|o| o.status.success() && o.stdout == b"0\n");
+    let mut command = if root {
+        Command::new(script)
+    } else {
+        let mut sudo = Command::new("sudo");
+        sudo.arg("--").arg(script);
+        sudo
+    };
+    run_uninstaller(&mut command, args)
+}
+
+fn run_uninstaller(command: &mut Command, args: &[String]) -> Result<(), String> {
+    let status = command.args(args).status().map_err(|e| format!("cannot run uninstaller: {e}"))?;
+    if !status.success() {
+        return Err(format!("uninstaller exited with {status}"));
+    }
+    Ok(())
+}
+
+fn use_model(socket: &Socket, model: &str, quant: Option<&str>) -> Result<String, String> {
+    sock::set_preference(socket, Some(model), quant)?;
+    Ok(format!("using {model}"))
+}
+
+enum Msg {
+    Status(Status),
+    Down(String),
+    Key(KeyEvent),
+    Resize,
+}
+
+/// Restore the terminal on return and during panic unwinding. In raw mode
+/// Ctrl-C arrives as a key event and follows the normal exit path.
+struct TermGuard;
+
+impl TermGuard {
+    fn enter() -> std::io::Result<Self> {
+        terminal::enable_raw_mode()?;
+        let g = TermGuard;
+        execute!(std::io::stdout(), EnterAlternateScreen, cursor::Hide)?;
+        Ok(g)
+    }
+}
+
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        let _ = execute!(std::io::stdout(), cursor::Show, LeaveAlternateScreen);
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+fn draw(lines: &[String]) {
+    let mut out = std::io::stdout().lock();
+    // Clear one row at a time to avoid flicker, then erase any rows left below the new frame.
+    let _ = write!(out, "\x1b[H");
+    for l in lines {
+        let _ = write!(out, "{l}\x1b[K\r\n");
+    }
+    let _ = write!(out, "\x1b[J");
+    let _ = out.flush();
+}
+
+fn interactive(socket: &Socket) -> Result<(), String> {
+    let color = std::env::var_os("NO_COLOR").is_none();
+    let _guard = TermGuard::enter().map_err(|e| e.to_string())?;
+
+    let (tx, rx) = mpsc::channel::<Msg>();
+
+    // Keep retrying the subscription so the display recovers when the agent comes back.
+    let t = tx.clone();
+    let sock_path = socket.clone();
+    thread::spawn(move || loop {
+        let why = sock::follow(&sock_path, |s| t.send(Msg::Status(s)).is_ok());
+        if t.send(Msg::Down(why)).is_err() {
+            return;
+        }
+        thread::sleep(Duration::from_secs(2));
+    });
+    // The key reader can remain blocked until process exit. It needs no join on shutdown.
+    let t = tx;
+    thread::spawn(move || loop {
+        let msg = match event::read() {
+            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => Msg::Key(k),
+            Ok(Event::Resize(..)) => Msg::Resize,
+            Ok(_) => continue,
+            Err(_) => return,
+        };
+        if t.send(msg).is_err() {
+            return;
+        }
+    });
+
+    // Key events queue while the startup logo is displayed.
+    let (w, _) = terminal::size().unwrap_or((80, 24));
+    draw(&render::render_logo(w, color));
+    thread::sleep(Duration::from_millis(700));
+
+    let mut status: Option<Status> = None;
+    let mut down = String::new();
+    let mut notice = String::new();
+    let mut picking: Vec<sock::LocalModel> = Vec::new();
+
+    loop {
+        let (w, h) = terminal::size().unwrap_or((80, 24));
+        match &status {
+            Some(s) => draw(&render::render(s, w, h, now_unix(), &notice, color)),
+            // Wait for an initial status or connection failure before replacing the startup view.
+            None if down.is_empty() => {}
+            None => draw(&render::render_down(w, &down, color)),
+        }
+
+        match rx.recv() {
+            Ok(Msg::Status(s)) => status = Some(s),
+            Ok(Msg::Down(why)) => {
+                status = None;
+                down = why;
+            }
+            Ok(Msg::Resize) => {}
+            Ok(Msg::Key(k)) => {
+                if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
+                    return Ok(());
+                }
+                if !picking.is_empty() {
+                    notice = match k.code {
+                        KeyCode::Char(c) => match c.to_digit(10).filter(|d| *d >= 1 && *d as usize <= picking.len()) {
+                            Some(d) => {
+                                let m = &picking[d as usize - 1];
+                                match sock::set_preference(socket, Some(&m.id), Some(&m.quant)) {
+                                    Ok(()) => format!("using {}", m.id),
+                                    Err(e) => e,
+                                }
+                            }
+                            None => String::new(),
+                        },
+                        _ => String::new(),
+                    };
+                    picking.clear();
+                    continue;
+                }
+                notice.clear();
+                match k.code {
+                    KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char('u') | KeyCode::Char('U') if status.is_some() => match sock::get_models(socket) {
+                        Ok(m) if m.is_empty() => notice = "no models installed".into(),
+                        Ok(m) => {
+                            let list: Vec<String> =
+                                m.iter().enumerate().map(|(i, x)| format!("[{}] {} {}", i + 1, x.id, x.quant)).collect();
+                            notice = format!("Use which model?  {}  (any other key cancels)", list.join("  "));
+                            picking = m;
+                        }
+                        Err(e) => notice = e,
+                    },
+                    KeyCode::Char('f') | KeyCode::Char('F') if status.is_some() => {
+                        notice = match sock::set_preference(socket, None, None) {
+                            Ok(()) => "FARM mode: set".into(),
+                            Err(e) => e,
+                        };
+                    }
+                    KeyCode::Char('p') | KeyCode::Char('P') => {
+                        if let Some(s) = &status {
+                            if let Err(e) = sock::set_pause(socket, !s.paused) {
+                                notice = e;
+                            }
+                        }
+                    }
+                    KeyCode::Char('c') | KeyCode::Char('C') => notice = format!("Chat: {CHAT_URL}"),
+                    _ => {}
+                }
+            }
+            Err(_) => return Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

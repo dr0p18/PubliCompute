@@ -1,0 +1,119 @@
+diff --git a/tools/publicompute-stage-test/stage-test.cpp b/tools/publicompute-stage-test/stage-test.cpp
+index 0256d42ede0eea0823c23ca21fc96996f34a4368..6be2fcf0eac880360b2ce26eaec97ce289a9edd2 100644
+--- a/tools/publicompute-stage-test/stage-test.cpp
++++ b/tools/publicompute-stage-test/stage-test.cpp
+@@ -1,4 +1,5 @@
+-// Compare a full GGUF with execution across half-open layer ranges.
++// Compare full-range execution with chains that split a GGUF across
++// half-open layer intervals.
+ //
+ //   full-range checks that explicit bounds produce the default logits.
+ //   Build with -DSTAGE_BASELINE to dump logits for a separate comparison.
+@@ -13,6 +14,9 @@
+ //   rollback verifies a batched draft and rewinds it with seq_rm.
+ //   Compare recurrent state through subsequent steps on both layouts.
+ // invalid-ranges checks range and draft-weight validation.
++//   Keep token-routed layers in the head, where token IDs are available.
++//   -pad N repeats prompts to reach the requested token count.
++//   Use long prompts to exercise 128:1 HCA compression and indexing.
+ #include "llama.h"
+ #include "ggml.h"
+ 
+@@ -54,6 +58,7 @@ struct Chain {
+ };
+ 
+ static int g_threads = 6;
++static int g_pad = 0;                // Optional minimum prompt length in tokens. Zero uses each prompt as supplied.
+ static int g_rs_seq = 0;             // Recurrent snapshots per sequence for rollback.
+ static int g_ngl = 0;                // GPU layer count for the full range.
+ static int g_ngl_st[2] = {-2, -2};   // GPU layers for each stage. Use the full-range setting by default.
+@@ -72,7 +77,7 @@ static bool load_stage(Stage & s, const char * path, int, int, int n_seq_max, bo
+     s.model = llama_model_load_from_file(path, mp);
+     if (!s.model) return false;
+     llama_context_params cp = llama_context_default_params();
+-    cp.n_ctx = 1024; cp.n_batch = 512; cp.n_ubatch = 512; cp.n_seq_max = n_seq_max;
++    cp.n_ctx = g_pad > 0 ? 2048 : 1024; cp.n_batch = g_pad > 0 ? 1024 : 512; cp.n_ubatch = cp.n_batch; cp.n_seq_max = n_seq_max; // The padded prompt path needs larger context and batch budgets.
+     cp.n_threads = g_threads; cp.n_threads_batch = g_threads;
+     cp.n_rs_seq = g_rs_seq;
+     s.ctx = llama_init_from_model(s.model, cp);
+@@ -170,6 +175,18 @@ static std::vector<llama_token> tok(const llama_model * m, const char * text) {
+     int n = llama_tokenize(v, text, (int) strlen(text), t.data(), (int) t.size(), true, false);
+     if (n < 0) { t.resize(-n); n = llama_tokenize(v, text, (int) strlen(text), t.data(), (int) t.size(), true, false); }
+     t.resize(n);
++    if (g_pad > 0 && n < g_pad) {
++        // Repeat the same prompt to reach the requested length without changing the test input source.
++        std::string full = text;
++        while (n < g_pad) {
++            full += " ";
++            full += text;
++            t.assign(full.size() + 8, 0);
++            n = llama_tokenize(v, full.c_str(), (int) full.size(), t.data(), (int) t.size(), true, false);
++            if (n < 0) { t.resize(-n); n = llama_tokenize(v, full.c_str(), (int) full.size(), t.data(), (int) t.size(), true, false); }
++        }
++        t.resize(n);
++    }
+     return t;
+ }
+ 
+@@ -602,7 +619,7 @@ static int rollback_suite(const char * path, Chain & ref, int n_layer, const std
+ }
+ 
+ // Check the loader rejects invalid layer ranges and unsupported draft layouts.
+-static int invalid_ranges_suite(const char * path, int n_layer, int n_nextn) {
++static int invalid_ranges_suite(const char * path, int n_layer, int n_nextn, int n_hash) {
+     int fails = 0;
+     auto prova = [&](const char * what, int a, int b, bool mtp, bool expected_ok) {
+         llama_model_params mp = llama_model_default_params();
+@@ -624,9 +641,19 @@ static int invalid_ranges_suite(const char * path, int n_layer, int n_nextn) {
+         fails += prova("MTP with head range [0,4)", 0, 4, true, false);
+         fails += prova("MTP with tail range [4,n)", 4, n_layer, true, false);
+         fails += prova("MTP with head range [0,n-1)", 0, n_layer - 1, true, false);
+-    } else {
++    } else if (n_hash <= 0) {
+         printf("  No MTP block in this model. Skipping MTP range cases.\n");
+     }
++    if (n_hash > 0) {
++        // Keep all token-routed experts in the head because expert selection reads token IDs.
++        printf("  Hash layers 0-%d must all be in the head\n", n_hash - 1);
++        fails += prova("head range ending before the last hash layer [0,hash-1)", 0, n_hash - 1, false, false);
++        fails += prova("head range containing exactly the hash layers [0,hash)", 0, n_hash, false, true);
++        fails += prova("non-head stage containing hash layers [1,n)", 1, n_layer, false, false);
++        fails += prova("non-head stage after all hash layers [hash,n)", n_hash, n_layer, false, true);
++        fails += prova("MTP with head range [0,hash) regardless of draft weights", 0, n_hash, true, false);
++        fails += prova("MTP with tail range [hash,n) regardless of draft weights", n_hash, n_layer, true, false);
++    }
+     return fails;
+ }
+ 
+@@ -640,7 +667,7 @@ static std::vector<int> parse_ints(const char * s) {
+ int main(int argc, char ** argv) {
+     if (argc < 3) {
+         fprintf(stderr, "Usage: %s MODEL.gguf {full-range|split|memory|batch|all|recurrent|rollback|invalid-ranges|dump FILE|compare FILE} [-t THREAD] [-n TOKEN] [-ngl N] [-ngl0 N] [-ngl1 N] "
+-                        "[-cuts a,b,...] [-three a,b] [-v]\n", argv[0]);
++                        "[-cuts a,b,...] [-three a,b] [-pad N] [-v]\n", argv[0]);
+         return 2;
+     }
+     const char * path = argv[1];
+@@ -662,6 +689,7 @@ int main(int argc, char ** argv) {
+         else if (!strcmp(argv[ai], "-cuts") && ai + 1 < argc) cuts = parse_ints(argv[++ai]);
+         else if (!strcmp(argv[ai], "-three") && ai + 1 < argc) three_stage_cuts = parse_ints(argv[++ai]);
+ #endif
++        else if (!strcmp(argv[ai], "-pad") && ai + 1 < argc) g_pad = atoi(argv[++ai]);
+         else if (!strcmp(argv[ai], "-v")) g_verbose = true;
+     }
+     if (cmd == "rollback") g_rs_seq = 3;
+@@ -714,8 +742,13 @@ int main(int argc, char ** argv) {
+     }
+     if (cmd == "invalid-ranges") {
+         const int n_nextn = llama_model_n_layer_nextn(ref.st[0].model);
++        int n_hash = 0;
++        {   // Read the count of layers that require token IDs to select experts.
++            char b[32] = {0};
++            if (llama_model_meta_val_str(ref.st[0].model, "deepseek4.hash_layer_count", b, sizeof b) > 0) n_hash = atoi(b);
++        }
+         free_chain(ref);
+-        fails = invalid_ranges_suite(path, n_layer, n_nextn);
++        fails = invalid_ranges_suite(path, n_layer, n_nextn, n_hash);
+         llama_backend_free();
+         printf("%s\n", fails ? "FAIL" : "PASS");
+         return fails ? 1 : 0;

@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["proto/rust", "agent", "client", "stage", "stage/llama-sys"]
+# Keep the native engine out of default builds so protocol and agent tests
+# can run without the llama.cpp headers and shared libraries.
+default-members = ["proto/rust", "agent"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.91"
+
+[workspace.dependencies]
+prost = "0.13"
+prost-types = "0.13"
+prost-build = "0.13"
+protox = "0.7"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Limit debug information to keep development builds small and fast to link.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# Optimize weight hashing because it reads gigabytes at startup.
+[profile.dev.package.sha2]
+opt-level = 3

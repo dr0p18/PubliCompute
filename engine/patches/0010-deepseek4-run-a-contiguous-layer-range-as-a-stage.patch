@@ -1,0 +1,197 @@
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 06e218ba65afb8d07c016246cd5fd527e252d918..b2cd56d372a647b19a6b8a0fe38e1e34b651af12 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -314,7 +314,9 @@ llama_kv_cache::llama_kv_cache(
+             hparams.n_embd_head_k() % 64 == 0;
+ 
+         // always create Hadamard rotation tensors for DeepSeek lightning indexers
+-        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 ||
++        // Skip rotation when no local layer uses the indexer cache. A zero key width
++        // would make the rotation-size loop continue until it overflows.
++        if (n_embd_head_k_all > 0 && (model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 ||
+                 model.arch == LLM_ARCH_GLM_DSA || model.arch == LLM_ARCH_DOTS3NOTE ||
+                 model.arch == LLM_ARCH_MISTRAL_LARGE4) &&
+                 hparams.n_embd_head_k_full == hparams.indexer_head_size) {
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 0d8f16cf1e2e481798d67100f905e8346c84b8cd..b17319295a71632ce44e86b62701a2cea66e0e45 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2480,6 +2480,8 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
+         const bool is_head   = tn.tensor == LLM_TENSOR_OUTPUT || tn.tensor == LLM_TENSOR_OUTPUT_NORM ||
+                                // qwen4exp: the final hyper-connection mixer collapses the streams before the output head
+                                tn.tensor == LLM_TENSOR_HC_HEAD_NORM || tn.tensor == LLM_TENSOR_HC_HEAD_DOWN || tn.tensor == LLM_TENSOR_HC_HEAD_UP ||
++                               // Apply the final projection after reducing the residual streams to one.
++                               tn.tensor == LLM_TENSOR_HC_HEAD_FN || tn.tensor == LLM_TENSOR_HC_HEAD_BASE || tn.tensor == LLM_TENSOR_HC_HEAD_SCALE ||
+                                (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED)); // output head tied to the embeddings
+         // qwen4exp: the n-gram table is looked up from the token ids, which only the head has
+         const bool is_ple    = tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD;
+@@ -3189,6 +3191,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             nullptr,
+                             nullptr);
+                 } else {
++                    // Allocate the attention window, compressed caches and compressor state only for local layers.
++                    llama_memory_i::layer_filter_cb filter_stage = nullptr;
++                    if (stage_partial()) {
++                        filter_stage = [this](int32_t il) { return stage_has_layer(il); };
++                    }
++
+                     res = new llama_kv_cache_dsv4(
+                             *this,
+                             params.no_alloc,
+@@ -3202,7 +3210,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             cparams.n_seq_max,
+                             cparams.n_ubatch,
+                             cparams.n_rs_seq,
+-                            nullptr,
++                            filter_stage,
+                             nullptr);
+                 }
+             } break;
+@@ -3567,8 +3575,8 @@ int32_t llama_model_n_embd_out(const llama_model * model) {
+ }
+ 
+ int32_t llama_model_n_embd_stage(const llama_model * model) {
+-    // qwen4exp carries hc_mult residual streams from layer to layer, and a stage boundary must pass all of them
+-    if (model->arch == LLM_ARCH_QWEN4EXP) {
++    // Boundary rows carry every residual stream so the next stage can continue the same computation.
++    if (model->arch == LLM_ARCH_QWEN4EXP || model->arch == LLM_ARCH_DEEPSEEK4) {
+         return model->hparams.dsv4_hc_mult * model->hparams.n_embd;
+     }
+     return model->hparams.n_embd;
+diff --git a/src/llama.cpp b/src/llama.cpp
+index c841c00429b66735f50751e6cc7c60a59b65ccc1..8c9456f363696471513d79fc98e3bc244d04cabf 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -359,8 +359,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+             model->layer_end   = il_end;
+             if (model->stage_partial()) {
+                 if (model->arch != LLM_ARCH_GEMMA4 && model->arch != LLM_ARCH_QWEN4EXP &&
+-                    model->arch != LLM_ARCH_LAGUNA && model->arch != LLM_ARCH_QWEN35MOE) {
+-                    throw std::runtime_error("loading a layer range is only implemented for the gemma4, qwen4exp, laguna and qwen35moe architectures");
++                    model->arch != LLM_ARCH_LAGUNA && model->arch != LLM_ARCH_QWEN35MOE && model->arch != LLM_ARCH_DEEPSEEK4) {
++                    throw std::runtime_error("loading a layer range is only implemented for the gemma4, qwen4exp, laguna, qwen35moe and deepseek4 architectures");
+                 }
+                 LLAMA_LOG_INFO("%s: stage: layers [%u, %u) of %d, head = %d, tail = %d\n", __func__,
+                         model->layer_start, model->layer_end, n_layer, model->stage_head(), model->stage_tail());
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 1207c3bb73b3aa19f14f34c09e2b500667ead5a5..1e4cd8a4080aceeb5f72b11a17fbd7f085c1eafa 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -89,6 +89,28 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
+     const int trunk_flags = nf.trunk;
+     const int mtp_flags   = nf.mtp;
+ 
++    // a stage [layer_start, layer_end) loads only its own tensors (see llama_model_base::create_tensor):
++    //   head: token embeddings; tail: final hyper-connection head (output_hc_*), output norm and output head;
++    //   the MTP block is never loaded
++    if (stage_partial()) {
++        // the hash layers route the experts from the token ids (ffn_gate_tid2eid), which only the head has: they
++        // must all sit in the head stage, and a stage that is not the head cannot hold any of them
++        for (uint32_t il = 0; il < hparams.dsv4_hash_layer_count && il < hparams.n_layer(); ++il) {
++            if (stage_head() != stage_has_layer(il)) {
++                throw std::runtime_error(format("the hash layers 0-%u route the experts from the token ids and must all be inside "
++                                                "the head stage: the range [%u, %u) is not allowed",
++                                                hparams.dsv4_hash_layer_count - 1, layer_start, stage_end()));
++            }
++        }
++        if (ml.load_mtp) {
++            throw std::runtime_error("a layer range cannot load the MTP block");
++        }
++        if (!stage_head()) {
++            // the input of a stage that is not the head is the hc-wide residual of the previous stage (llama_batch.embd)
++            hparams.n_embd_inp_impl = hparams.dsv4_hc_mult * hparams.n_embd;
++        }
++    }
++
+     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+ 
+     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+@@ -1232,19 +1254,48 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     llm_graph_context(params) {
+     ggml_tensor * cur;
+ 
+-    ggml_tensor * inp = build_inp_embd(model.tok_embd);
++
++    const int  il_beg     = (int) model.layer_start;
++    const int  il_end     = (int) model.stage_end();
++    const bool stage_head = model.stage_head();
++    const bool stage_tail = model.stage_tail();
++
++    const int64_t hc = hparams.dsv4_hc_mult;
++
++    ggml_tensor * inpL = nullptr;
++    if (stage_head) {
++        ggml_tensor * inp = build_inp_embd(model.tok_embd);
++        inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
++        inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
++        cb(inpL, "hc_init", -1);
++    } else {
++        // Read a packed row of all residual streams for each incoming token.
++        // The stage-width accessor gives the required number of values.
++        auto inp_stage = std::make_unique<llm_graph_input_embd>(n_embd*hc);
++        inp_stage->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd*hc, n_tokens);
++        cb(inp_stage->embd, "inp_stage", -1);
++        ggml_set_input(inp_stage->embd);
++        res->t_inp_embd = inp_stage->embd;
++
++        inpL = ggml_reshape_3d(ctx0, inp_stage->embd, n_embd, hc, n_tokens);
++        cb(inpL, "hc_stage", -1);
++
++        res->add_input(std::move(inp_stage));
++    }
++
+     ggml_tensor * inp_pos = build_inp_pos();
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
++    // The runtime fills memory inputs for every microbatch. Tensors with no
++    // local consumer have no buffer and are skipped when binding inputs.
+     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
+     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
+     ggml_build_forward_expand(gf, inp_attn->self_attn_mask.raw);
++    if (model.stage_partial()) {
++        // Bind rotary positions on every microbatch regardless of the local layer mix.
++        ggml_build_forward_expand(gf, inp_pos);
++    }
+ 
+-    const int64_t hc = hparams.dsv4_hc_mult;
+-    ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
+-    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+-    cb(inpL, "hc_init", -1);
+-
+-    for (int il = 0; il < n_layer; ++il) {
++    for (int il = il_beg; il < il_end; ++il) {
+         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+             res->t_layer_inp[il] = build_hc_mean(inpL);
+             cb(res->t_layer_inp[il], "layer_inp", il);
+@@ -1289,8 +1340,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
+ 
+         // may apply exp_probs_b_vl is input is from mtmd
++        // Intermediate activation rows always contain the preceding stage's state.
+         ASSERT_EMBD_OR_TOKEN(ubatch);
+-        const bool is_media = ubatch.embd != nullptr;
++        const bool is_media = stage_head && ubatch.embd != nullptr;
+         if (is_media) {
+             if (layer.ffn_exp_probs_b_vl) {
+                 exp_probs_b = layer.ffn_exp_probs_b_vl;
+@@ -1334,6 +1386,20 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         cb(inpL, "l_last", il);
+     }
+ 
++    if (!stage_tail) {
++        // Forward all residual streams at the boundary. Final normalization and
++        // projection belong to the tail and are not part of the transfer.
++        ggml_tensor * out = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
++        // Request every row through the embeddings API to preserve the next stage's batch.
++        if (inp_out_ids) {
++            out = ggml_get_rows(ctx0, out, inp_out_ids);
++        }
++        cb(out, "result_stage", -1);
++        res->t_embd = out;
++        ggml_build_forward_expand(gf, out);
++        return;
++    }
++
+     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
+         res->t_layer_inp[n_layer] = build_hc_mean(inpL);
+         cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);

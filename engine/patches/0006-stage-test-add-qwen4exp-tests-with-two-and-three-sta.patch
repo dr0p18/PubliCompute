@@ -1,0 +1,301 @@
+diff --git a/tools/publicompute-stage-test/stage-test.cpp b/tools/publicompute-stage-test/stage-test.cpp
+index cd562be002c2531f69f0b517ca4e7a0415fefef1..c6330addf0292e7fef6ea45cd855249e9f60cd46 100644
+--- a/tools/publicompute-stage-test/stage-test.cpp
++++ b/tools/publicompute-stage-test/stage-test.cpp
+@@ -5,6 +5,9 @@
+ //   split compares tokens and logits across two stages using FP32 and FP16.
+ //   memory compares weight and cache allocations from the startup log.
+ //   batch checks shared batches across two stages.
++//   recurrent compares recurrent state across split layouts.
++//   Try two- and three-stage cuts, shared batches and chunked prefill.
++//   Reuse sequence IDs to verify that removed state stays cleared.
+ #include "llama.h"
+ #include "ggml.h"
+ 
+@@ -67,7 +70,11 @@ static bool load_stage(Stage & s, const char * path, int, int, int n_seq_max, bo
+     cp.n_threads = g_threads; cp.n_threads_batch = g_threads;
+     s.ctx = llama_init_from_model(s.model, cp);
+     if (!s.ctx) return false;
++#ifndef STAGE_BASELINE
++    s.n_embd = llama_model_n_embd_stage(s.model); // Allocate the boundary buffer using the width of one complete activation row.
++#else
+     s.n_embd = llama_model_n_embd(s.model);
++#endif
+     s.log = g_log;
+     return true;
+ }
+@@ -223,15 +230,248 @@ static void batch2(Chain & ch, const std::vector<llama_token> & t0, const std::v
+     r.ok = ok;
+ }
+ 
++#ifndef STAGE_BASELINE
++// Run the same sequence operations in a full context and a split chain.
++// Compare the resulting logits bit for bit.
++typedef std::vector<std::vector<float>> Logs;
++
++static bool seq_rm_chain(Chain & c, llama_seq_id seq) {
++    bool ok = true;
++    for (auto & s : c.st) ok = llama_memory_seq_rm(llama_get_memory(s.ctx), seq, -1, -1) && ok;
++    return ok;
++}
++
++// Prefill the selected sequence without clearing other state, then append logits from greedy steps.
++static bool gen_seq(Chain & c, const std::vector<llama_token> & prompt, llama_seq_id seq, int n, Logs & l, std::vector<int> * toks = nullptr) {
++    std::vector<Row> rows; Logs out;
++    for (size_t i = 0; i < prompt.size(); ++i) rows.push_back({prompt[i], (llama_pos) i, seq, i + 1 == prompt.size()});
++    if (!chain_decode(c, rows, out)) return false;
++    llama_pos pos = (llama_pos) prompt.size();
++    for (int s = 0; s < n; ++s) {
++        l.push_back(out[0]);
++        const int t = argmax(out[0]);
++        if (toks) toks->push_back(t);
++        if (s + 1 == n) break;
++        rows = {{t, pos++, seq, true}};
++        if (!chain_decode(c, rows, out)) return false;
++    }
++    return true;
++}
++
++// Establish parity for one sequence before testing shared batches.
++static bool p_gen(Chain & c, const std::vector<llama_token> & p, int n, Logs & l, std::vector<int> * toks = nullptr) {
++    reset_chain(c);
++    return gen_seq(c, p, 0, n, l, toks);
++}
++
++// Advance two sequences independently inside the same batch.
++static bool run_batched(Chain & c, const std::vector<llama_token> & t0, const std::vector<llama_token> & t1, int n, Logs & l) {
++    reset_chain(c);
++    std::vector<Row> rows; Logs out;
++    for (size_t i = 0; i < t0.size(); ++i) rows.push_back({t0[i], (llama_pos) i, 0, i + 1 == t0.size()});
++    for (size_t i = 0; i < t1.size(); ++i) rows.push_back({t1[i], (llama_pos) i, 1, i + 1 == t1.size()});
++    if (!chain_decode(c, rows, out)) return false;
++    llama_pos p0 = (llama_pos) t0.size(), p1 = (llama_pos) t1.size();
++    for (int s = 0; s < n; ++s) {
++        l.push_back(out[0]); l.push_back(out[1]);
++        if (s + 1 == n) break;
++        rows = {{argmax(out[0]), p0++, 0, true}, {argmax(out[1]), p1++, 1, true}};
++        if (!chain_decode(c, rows, out)) return false;
++    }
++    return true;
++}
++
++// Reuse a sequence ID after removing its state. The replacement prompt
++// must match a run started with empty memory.
++static bool run_reuse(Chain & c, const std::vector<llama_token> & A, const std::vector<llama_token> & B, int n, Logs & l, size_t & i_b) {
++    reset_chain(c);
++    if (!gen_seq(c, A, 0, n, l)) return false;
++    if (!seq_rm_chain(c, 0)) { fprintf(stderr, "seq_rm was rejected\n"); return false; }
++    i_b = l.size();
++    return gen_seq(c, B, 0, n, l);
++}
++
++// Recycle one sequence ID while keeping another sequence live. Batch the
++// new prompt with the surviving sequence to exercise isolation.
++static bool run_batched_reuse(Chain & c, const std::vector<llama_token> & A, const std::vector<llama_token> & B,
++                          const std::vector<llama_token> & C, int n, Logs & l) {
++    reset_chain(c);
++    std::vector<Row> rows; Logs out;
++    for (size_t i = 0; i < A.size(); ++i) rows.push_back({A[i], (llama_pos) i, 0, i + 1 == A.size()});
++    for (size_t i = 0; i < C.size(); ++i) rows.push_back({C[i], (llama_pos) i, 1, i + 1 == C.size()});
++    if (!chain_decode(c, rows, out)) return false;
++    llama_pos p0 = (llama_pos) A.size(), p1 = (llama_pos) C.size();
++    for (int s = 0; s < n; ++s) {
++        l.push_back(out[0]); l.push_back(out[1]);
++        rows = {{argmax(out[0]), p0++, 0, true}, {argmax(out[1]), p1++, 1, true}};
++        if (s + 1 == n) break;
++        if (!chain_decode(c, rows, out)) return false;
++    }
++    const llama_token next_c = rows[1].tok;
++    if (!seq_rm_chain(c, 0)) { fprintf(stderr, "seq_rm was rejected\n"); return false; }
++    rows.clear();
++    for (size_t i = 0; i < B.size(); ++i) rows.push_back({B[i], (llama_pos) i, 0, i + 1 == B.size()});
++    rows.push_back({next_c, p1++, 1, true});
++    if (!chain_decode(c, rows, out)) return false;
++    p0 = (llama_pos) B.size();
++    for (int s = 0; s < n; ++s) {
++        l.push_back(out[0]); l.push_back(out[1]);
++        if (s + 1 == n) break;
++        rows = {{argmax(out[0]), p0++, 0, true}, {argmax(out[1]), p1++, 1, true}};
++        if (!chain_decode(c, rows, out)) return false;
++    }
++    return true;
++}
++
++// Prefill in chunks and request logits only at the final prompt row before decoding.
++static bool run_chunked(Chain & c, const std::vector<llama_token> & p, int blk, int n, Logs & l) {
++    reset_chain(c);
++    Logs out;
++    for (size_t a = 0; a < p.size(); a += blk) {
++        const size_t b = std::min(p.size(), a + (size_t) blk);
++        std::vector<Row> rows;
++        for (size_t i = a; i < b; ++i) rows.push_back({p[i], (llama_pos) i, 0, i + 1 == p.size()});
++        if (!chain_decode(c, rows, out)) return false;
++    }
++    llama_pos pos = (llama_pos) p.size();
++    for (int s = 0; s < n; ++s) {
++        l.push_back(out[0]);
++        if (s + 1 == n) break;
++        std::vector<Row> rows = {{argmax(out[0]), pos++, 0, true}};
++        if (!chain_decode(c, rows, out)) return false;
++    }
++    return true;
++}
++
++struct RecurrentReference {
++    std::vector<Logs> gen; std::vector<std::vector<int>> toks;
++    Logs batch, reuse, batched_reuse, fresh_b;
++    size_t i_b = 0;
++    std::vector<Logs> chunks; Logs full_prefill;
++};
++
++static const int PREFILL_CHUNKS[3] = {7, 16, 64};
++
++static bool recurrent_run(Chain & c, const std::vector<std::vector<llama_token>> & TT, const std::vector<llama_token> & long_prompt, int n, RecurrentReference & r) {
++    bool ok = true;
++    r.gen.resize(5); r.toks.resize(5);
++    for (int p = 0; p < 5; ++p) ok = ok && p_gen(c, TT[p], n, r.gen[p], &r.toks[p]);
++    ok = ok && run_batched(c, TT[1], TT[3], n, r.batch);
++    ok = ok && run_reuse(c, TT[1], TT[3], n, r.reuse, r.i_b);
++    ok = ok && p_gen(c, TT[3], n, r.fresh_b);
++    ok = ok && run_batched_reuse(c, TT[1], TT[3], TT[2], n, r.batched_reuse);
++    r.chunks.resize(3);
++    for (int i = 0; i < 3; ++i) ok = ok && run_chunked(c, long_prompt, PREFILL_CHUNKS[i], n, r.chunks[i]);
++    ok = ok && p_gen(c, long_prompt, n, r.full_prefill);
++    return ok;
++}
++
++// Return the number of steps whose logit vectors differ bit for bit.
++static int compare_logits(const char * what, const Logs & a, const Logs & b, size_t from = 0, size_t from_b = 0, bool info = false) {
++    int nd = 0; double md = 0; size_t n = 0;
++    const size_t na = a.size() - from, nb = b.size() - from_b;
++    if (na != nb) { printf("    %-58s FAIL: different lengths (%zu, %zu)\n", what, na, nb); return info ? 0 : 1; }
++    for (size_t i = 0; i < na; ++i, ++n) {
++        if (!bit_equal(a[from + i], b[from_b + i])) { nd++; md = std::max(md, max_abs_diff(a[from + i], b[from_b + i])); }
++    }
++    for (const auto & v : b) for (float x : v) if (!std::isfinite(x)) { printf("    %-58s FAIL: non-finite logits\n", what); return 1; }
++    if (info) printf("    %-58s (diagnostic): %d/%zu differ, maximum difference %.3g, first step %.3g\n", what, nd, n, md,
++                     na ? max_abs_diff(a[from], b[from_b]) : 0.0);
++    else      printf("    %-58s %s: %zu logit rows compared, %d differ, maximum difference %.3g\n", what, nd ? "FAIL" : "OK", n, nd, md);
++    return info ? 0 : nd;
++}
++
++static int recurrent_suite(const char * path, Chain & ref, int n_layer, const std::vector<int> & cuts, const std::vector<int> & three_stage_cuts, int n) {
++    int fails = 0;
++    std::vector<std::vector<llama_token>> TT(5);
++    for (int p = 0; p < 5; ++p) TT[p] = tok(ref.st[0].model, PROMPTS[p]);
++    // Put an end token between the prompts to reset the n-gram window within the long input.
++    std::vector<llama_token> long_prompt = TT[1];
++    const llama_token eos = llama_vocab_eos(llama_model_get_vocab(ref.st[0].model));
++    if (eos >= 0) long_prompt.push_back(eos);
++    long_prompt.insert(long_prompt.end(), TT[3].begin() + 1, TT[3].end());
++    long_prompt.insert(long_prompt.end(), TT[2].begin() + 1, TT[2].end());
++    printf("recurrent: %d steps per case, prompts of %zu, %zu, %zu, %zu, %zu tokens, long prompt of %zu tokens\n", n,
++           TT[0].size(), TT[1].size(), TT[2].size(), TT[3].size(), TT[4].size(), long_prompt.size());
++
++    // Generate the reference with the full layer range.
++    RecurrentReference R;
++    if (!recurrent_run(ref, TT, long_prompt, n, R)) { printf("recurrent: reference decode failed\n"); return 1; }
++    printf("  Reference tokens for prompt 0:");
++    for (int t : R.toks[0]) printf(" %d", t);
++    printf("\n");
++    {   int distinct = 0; std::vector<int> v;
++        for (auto & t : R.toks) v.insert(v.end(), t.begin(), t.end());
++        std::sort(v.begin(), v.end()); distinct = (int) (std::unique(v.begin(), v.end()) - v.begin());
++        printf("  Reference generated %d distinct tokens out of %zu\n", distinct, v.size()); }
++    printf("  Reference checks:\n");
++    fails += compare_logits("reused sequence B vs. B with an empty cache", R.fresh_b, R.reuse, 0, R.i_b) != 0;
++    for (int i = 0; i < 3; ++i) {
++        char w[96]; snprintf(w, sizeof w, "prefill in chunks of %d vs. a single batch", PREFILL_CHUNKS[i]);
++        compare_logits(w, R.full_prefill, R.chunks[i], 0, 0, true);
++    }
++    free_chain(ref);
++
++    // Run each split against the same reference.
++    std::vector<std::vector<int>> cfg;
++    for (int k : cuts) cfg.push_back({k});
++    if (three_stage_cuts.size() == 2) cfg.push_back(three_stage_cuts);
++    for (const auto & cuts : cfg) {
++        std::vector<int> b = {0}; b.insert(b.end(), cuts.begin(), cuts.end()); b.push_back(n_layer);
++        std::string name;
++        for (size_t i = 0; i + 1 < b.size(); ++i) { char t[32]; snprintf(t, sizeof t, "%s[%d,%d)", i ? "+" : "", b[i], b[i + 1]); name += t; }
++        printf("  Chain %s:\n", name.c_str());
++        Chain ch; ch.st.resize(b.size() - 1); ch.n_vocab = ref.n_vocab;
++        bool ok = true;
++        for (size_t i = 0; ok && i + 1 < b.size(); ++i) {
++            ok = load_stage(ch.st[i], path, b[i], b[i + 1], 2, true);
++            ch.st[i].tail = i + 2 == b.size();
++        }
++        if (!ok) { printf("    FAIL: could not load stage\n"); fails++; free_chain(ch); continue; }
++        RecurrentReference C;
++        if (!recurrent_run(ch, TT, long_prompt, n, C)) { printf("    FAIL: decode failed\n"); fails++; free_chain(ch); continue; }
++        int tok_div = 0, nd = 0;
++        for (int p = 0; p < 5; ++p) tok_div += R.toks[p] != C.toks[p];
++        Logs ga, gb;
++        for (int p = 0; p < 5; ++p) { ga.insert(ga.end(), R.gen[p].begin(), R.gen[p].end()); gb.insert(gb.end(), C.gen[p].begin(), C.gen[p].end()); }
++        nd += compare_logits("5 prompts, greedy sampling", ga, gb);
++        printf("    %-58s %s: %d/5 sequences differ in token IDs\n", "greedy token IDs", tok_div ? "FAIL" : "OK", tok_div);
++        nd += compare_logits("two sequences in one batch", R.batch, C.batch);
++        nd += compare_logits("remove and reuse a sequence", R.reuse, C.reuse);
++        nd += compare_logits("reused sequence B vs. B with an empty cache", C.fresh_b, C.reuse, 0, C.i_b);
++        nd += compare_logits("reuse one sequence alongside another in a batch", R.batched_reuse, C.batched_reuse);
++        for (int i = 0; i < 3; ++i) {
++            char w[96]; snprintf(w, sizeof w, "prefill in chunks of %d tokens", PREFILL_CHUNKS[i]);
++            nd += compare_logits(w, R.chunks[i], C.chunks[i]);
++        }
++        nd += compare_logits("long-prompt prefill in one batch", R.full_prefill, C.full_prefill);
++        fails += (nd != 0) + (tok_div != 0);
++        for (size_t i = 0; i < ch.st.size(); ++i) { char t[64]; snprintf(t, sizeof t, "stage %zu [%d,%d)", i, b[i], b[i + 1]); print_log(t, ch.st[i].log); }
++        free_chain(ch);
++    }
++    return fails;
++}
++
++static std::vector<int> parse_ints(const char * s) {
++    std::vector<int> v;
++    while (*s) { v.push_back(atoi(s)); while (*s && *s != ',') ++s; if (*s == ',') ++s; }
++    return v;
++}
++#endif
++
+ int main(int argc, char ** argv) {
+     if (argc < 3) {
+-        fprintf(stderr, "Usage: %s MODEL.gguf {full-range|split|memory|batch|all|dump FILE|compare FILE} [-t THREAD] [-n TOKEN] [-ngl N] [-ngl0 N] [-ngl1 N] [-v]\n", argv[0]);
++        fprintf(stderr, "Usage: %s MODEL.gguf {full-range|split|memory|batch|all|recurrent|dump FILE|compare FILE} [-t THREAD] [-n TOKEN] [-ngl N] [-ngl0 N] [-ngl1 N] "
++                        "[-cuts a,b,...] [-three a,b] [-v]\n", argv[0]);
+         return 2;
+     }
+     const char * path = argv[1];
+     std::string cmd = argv[2];
+     const char * file = nullptr;
+     int n_tok_t2 = 64;
++#ifndef STAGE_BASELINE
++    std::vector<int> cuts, three_stage_cuts;
++#endif
+     int ai = 3;
+     if ((cmd == "dump" || cmd == "compare") && argc > 3) file = argv[ai++];
+     for (; ai < argc; ++ai) {
+@@ -240,6 +480,10 @@ int main(int argc, char ** argv) {
+         else if (!strcmp(argv[ai], "-ngl") && ai + 1 < argc) g_ngl = atoi(argv[++ai]);
+         else if (!strcmp(argv[ai], "-ngl0") && ai + 1 < argc) g_ngl_st[0] = atoi(argv[++ai]);
+         else if (!strcmp(argv[ai], "-ngl1") && ai + 1 < argc) g_ngl_st[1] = atoi(argv[++ai]);
++#ifndef STAGE_BASELINE
++        else if (!strcmp(argv[ai], "-cuts") && ai + 1 < argc) cuts = parse_ints(argv[++ai]);
++        else if (!strcmp(argv[ai], "-three") && ai + 1 < argc) three_stage_cuts = parse_ints(argv[++ai]);
++#endif
+         else if (!strcmp(argv[ai], "-v")) g_verbose = true;
+     }
+     llama_log_set(log_cb, nullptr);
+@@ -275,6 +519,13 @@ int main(int argc, char ** argv) {
+     }
+ 
+ #ifndef STAGE_BASELINE
++    if (cmd == "recurrent") {
++        if (cuts.empty()) cuts = {n_layer / 2, 1, n_layer - 1};
++        fails = recurrent_suite(path, ref, n_layer, cuts, three_stage_cuts, std::min(n_tok_t2, 32));
++        llama_backend_free();
++        printf("%s\n", fails ? "FAIL" : "PASS");
++        return fails ? 1 : 0;
++    }
+     const bool all = cmd == "all";
+     // Free the reference before loading the split model so both copies
+     // do not compete for GPU memory.

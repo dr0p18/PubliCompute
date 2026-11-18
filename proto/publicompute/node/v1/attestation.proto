@@ -1,0 +1,57 @@
+// Boot attestation ties a session to a TPM identity and a measured system state.
+// The identity key is bound to a PCR policy. A fresh TPM quote gives the
+// coordinator the measurements behind that policy decision. The nonce binds
+// the quote to one challenge so it cannot authorize another session.
+syntax = "proto3";
+
+package publicompute.node.v1;
+
+import "google/protobuf/timestamp.proto";
+import "publicompute/common/v1/common.proto";
+
+option go_package = "publicompute/proto/gen/go/publicompute/node/v1;nodev1";
+
+enum TpmHashAlgorithm {
+  TPM_HASH_ALGORITHM_UNSPECIFIED = 0;
+  TPM_HASH_ALGORITHM_SHA256 = 1;
+  TPM_HASH_ALGORITHM_SHA384 = 2;
+}
+
+message PcrSelection {
+  TpmHashAlgorithm hash = 1;
+  repeated uint32 pcrs = 2;
+}
+
+message AttestationChallenge {
+  // At least 32 random bytes. The quote places them in TPMS_ATTEST.extraData.
+  bytes nonce = 1;
+  repeated PcrSelection selections = 2;
+}
+
+message AttestationQuote {
+  bytes nonce = 1;
+  // Serialized TPMS_ATTEST signed by the attestation key registered at enrollment.
+  bytes quoted = 2;
+  bytes signature = 3;
+  repeated PcrBank pcr_values = 4;
+  // Binary event log used to reconstruct PCR values for comparison with the quote.
+  bytes event_log = 5;
+  // Selects the reference measurements used to check the quote.
+  string image_version = 6;
+}
+
+message PcrBank {
+  TpmHashAlgorithm hash = 1;
+  map<uint32, bytes> values = 2;
+}
+
+message AttestationResult {
+  bool accepted = 1;
+  publicompute.common.v1.TrustTier granted_tier = 2;
+  // The node returns to the base tier at this time unless it attests again.
+  google.protobuf.Timestamp valid_until = 3;
+  // Intended for diagnostics on the node.
+  string reason = 5;
+  reserved 4;
+  reserved "weights_keys";
+}

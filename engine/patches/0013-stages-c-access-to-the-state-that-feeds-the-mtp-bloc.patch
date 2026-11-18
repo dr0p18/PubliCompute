@@ -1,0 +1,42 @@
+diff --git a/include/llama.h b/include/llama.h
+index 42d6c1e4687a843d7990f615cf7b829eded9d0d7..f3e595da64bbaf0fc567d737eb848fa4395faf43 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1186,6 +1186,17 @@ extern "C" {
+     // otherwise: float[n_embd] (1-dimensional)
+     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
+ 
++    // Expose the auxiliary prediction state through the C API so a tail can
++    // pass states from its main context into the draft context. Enable it to
++    // retain one row of llama_model_n_embd_out() values per decoded input.
++    // With masking enabled, keep only rows that return logits and use the
++    // same output indices as llama_get_logits_ith(). Without masking, retain
++    // every row and use its original batch position.
++
++    LLAMA_API void    llama_stage_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
++    // Return the requested state from the last decode, or NULL when unavailable.
++    LLAMA_API float * llama_stage_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
++
+     //
+     // backend sampling API [EXPERIMENTAL]
+     // note: use only if the llama_context was created with at least one llama_sampler_seq_config
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 3639524eb49e5847253158b50000bc590f68c6ef..34abf9ca75a8c615cdc8e5e7de095b88b0d57abe 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -4564,6 +4564,15 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
+     return ctx->get_embeddings_nextn_ith(i);
+ }
+ 
++
++void llama_stage_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
++    llama_set_embeddings_nextn(ctx, value, masked);
++}
++
++float * llama_stage_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
++    return llama_get_embeddings_nextn_ith(ctx, i);
++}
++
+ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
+     ctx->synchronize();
+ 

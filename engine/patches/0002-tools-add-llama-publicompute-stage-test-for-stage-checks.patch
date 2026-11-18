@@ -1,0 +1,368 @@
+diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
+index 6a6592c7bff38e52c8dfefc9dd36d9ef2a18da87..8dbc1ad4752b292c78bb10099f0df52369440162 100644
+--- a/tools/CMakeLists.txt
++++ b/tools/CMakeLists.txt
+@@ -27,6 +27,7 @@ else()
+         add_subdirectory(server)
+     endif()
+     add_subdirectory(tokenize)
++    add_subdirectory(publicompute-stage-test)
+     add_subdirectory(tts)
+     add_subdirectory(mtmd)
+     if (GGML_RPC)
+diff --git a/tools/publicompute-stage-test/CMakeLists.txt b/tools/publicompute-stage-test/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..c94b496a6c992587535c814f0649113411f85a67
+--- /dev/null
++++ b/tools/publicompute-stage-test/CMakeLists.txt
+@@ -0,0 +1,4 @@
++set(TARGET llama-publicompute-stage-test)
++add_executable(${TARGET} stage-test.cpp)
++target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
+diff --git a/tools/publicompute-stage-test/stage-test.cpp b/tools/publicompute-stage-test/stage-test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a3ec20cb7fb986bfd9e8962f3abf9ba55e26efc
+--- /dev/null
++++ b/tools/publicompute-stage-test/stage-test.cpp
+@@ -0,0 +1,340 @@
++// Compare a full GGUF with execution across half-open layer ranges.
++//
++//   full-range checks that explicit bounds produce the default logits.
++//   Build with -DSTAGE_BASELINE to dump logits for a separate comparison.
++//   split compares tokens and logits across two stages using FP32 and FP16.
++//   memory compares weight and cache allocations from the startup log.
++//   batch checks shared batches across two stages.
++#include "llama.h"
++#include "ggml.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++static std::vector<std::string> g_log;      // Capture startup messages used to estimate layer and cache allocation.
++static bool g_verbose = false;
++
++static void log_cb(enum ggml_log_level level, const char * text, void *) {
++    std::string s(text);
++    if (s.find("- layer") == std::string::npos &&
++        (s.find("model buffer size") != std::string::npos || s.find("KV buffer size") != std::string::npos ||
++         s.find("stage:") != std::string::npos || s.find("kv_cache: size") != std::string::npos ||
++         s.find("tensors used") != std::string::npos || s.find("partial load") != std::string::npos)) {
++        while (!s.empty() && s.back() == '\n') s.pop_back();
++        g_log.push_back(s);
++    }
++    if (g_verbose || level >= GGML_LOG_LEVEL_ERROR) fputs(text, stderr);
++}
++
++struct Stage {
++    llama_model * model = nullptr;
++    llama_context * ctx = nullptr;
++    int n_embd = 0;
++    bool tail = true;
++    std::vector<std::string> log;
++};
++
++struct Chain {
++    std::vector<Stage> st;
++    bool fp16 = false; // Round boundary activations through FP16 to exercise the reduced-precision wire representation.
++    int n_vocab = 0;
++};
++
++static int g_threads = 6;
++
++#ifndef STAGE_BASELINE
++static bool load_stage(Stage & s, const char * path, int a, int b, int n_seq_max, bool set_range) {
++    llama_model_params mp = llama_model_default_params();
++    mp.n_gpu_layers = 0;
++    if (set_range) { mp.layer_start = a; mp.layer_end = b; }
++#else
++static bool load_stage(Stage & s, const char * path, int, int, int n_seq_max, bool) {
++    llama_model_params mp = llama_model_default_params();
++    mp.n_gpu_layers = 0;
++#endif
++    g_log.clear();
++    s.model = llama_model_load_from_file(path, mp);
++    if (!s.model) return false;
++    llama_context_params cp = llama_context_default_params();
++    cp.n_ctx = 1024; cp.n_batch = 512; cp.n_ubatch = 512; cp.n_seq_max = n_seq_max;
++    cp.n_threads = g_threads; cp.n_threads_batch = g_threads;
++    s.ctx = llama_init_from_model(s.model, cp);
++    if (!s.ctx) return false;
++    s.n_embd = llama_model_n_embd(s.model);
++    s.log = g_log;
++    return true;
++}
++
++static void free_chain(Chain & c) {
++    for (auto & s : c.st) { if (s.ctx) llama_free(s.ctx); if (s.model) llama_model_free(s.model); }
++    c.st.clear();
++}
++
++static void reset_chain(Chain & c) {
++    for (auto & s : c.st) llama_memory_clear(llama_get_memory(s.ctx), true);
++}
++
++// Decode the batch through each stage and return vocabulary logits for the requested rows.
++struct Row { llama_token tok; llama_pos pos; llama_seq_id seq; bool want; };
++
++static bool chain_decode(Chain & c, const std::vector<Row> & rows, std::vector<std::vector<float>> & out) {
++    const int n = (int) rows.size();
++    std::vector<float> hidden;
++    for (size_t k = 0; k < c.st.size(); ++k) {
++        Stage & s = c.st[k];
++        const bool first = k == 0;
++        llama_batch b = llama_batch_init(n, first ? 0 : s.n_embd, 1);
++        b.n_tokens = n;
++        for (int i = 0; i < n; ++i) {
++            if (first) b.token[i] = rows[i].tok;
++            else memcpy(b.embd + (size_t) i * s.n_embd, hidden.data() + (size_t) i * s.n_embd, s.n_embd * sizeof(float));
++            b.pos[i] = rows[i].pos; b.n_seq_id[i] = 1; b.seq_id[i][0] = rows[i].seq;
++            b.logits[i] = s.tail ? rows[i].want : 1; // A downstream stage needs the boundary state of every row, regardless of the logits mask.
++        }
++        const int rc = llama_decode(s.ctx, b);
++        llama_batch_free(b);
++        if (rc != 0) { fprintf(stderr, "llama_decode returned %d at stage %zu\n", rc, k); return false; }
++        if (s.tail) {
++            out.clear();
++            for (int i = 0; i < n; ++i) {
++                if (!rows[i].want) continue;
++                const float * l = llama_get_logits_ith(s.ctx, i);
++                if (!l) { fprintf(stderr, "missing logits at row %d\n", i); return false; }
++                out.emplace_back(l, l + c.n_vocab);
++            }
++        } else {
++            hidden.resize((size_t) n * s.n_embd);
++            for (int i = 0; i < n; ++i) {
++                const float * e = llama_get_embeddings_ith(s.ctx, i);
++                if (!e) { fprintf(stderr, "missing state at row %d\n", i); return false; }
++                memcpy(hidden.data() + (size_t) i * s.n_embd, e, s.n_embd * sizeof(float));
++            }
++            if (c.fp16) { // Round through FP16 at the stage boundary.
++                std::vector<ggml_fp16_t> h16(hidden.size());
++                ggml_fp32_to_fp16_row(hidden.data(), h16.data(), (int64_t) hidden.size());
++                ggml_fp16_to_fp32_row(h16.data(), hidden.data(), (int64_t) hidden.size());
++            }
++        }
++    }
++    return true;
++}
++
++static int argmax(const std::vector<float> & l) { return (int) (std::max_element(l.begin(), l.end()) - l.begin()); }
++
++struct Run { std::vector<int> toks; std::vector<std::vector<float>> logits; };
++
++// Prefill and decode greedily, or supply reference tokens to hold both paths to the same prefix.
++static bool generate(Chain & c, const std::vector<llama_token> & prompt, int n_steps, const std::vector<int> * force, Run & r) {
++    reset_chain(c);
++    r.toks.clear(); r.logits.clear();
++    std::vector<Row> rows;
++    for (size_t i = 0; i < prompt.size(); ++i) rows.push_back({prompt[i], (llama_pos) i, 0, i + 1 == prompt.size()});
++    std::vector<std::vector<float>> out;
++    if (!chain_decode(c, rows, out)) return false;
++    llama_pos pos = (llama_pos) prompt.size();
++    for (int s = 0; s < n_steps; ++s) {
++        r.logits.push_back(out[0]);
++        const int t = force ? (*force)[s] : argmax(out[0]);
++        r.toks.push_back(argmax(out[0])); // Greedy reference token for the first decode step.
++        if (s + 1 == n_steps) break;
++        rows = {{t, pos++, 0, true}};
++        if (!chain_decode(c, rows, out)) return false;
++    }
++    return true;
++}
++
++static std::vector<llama_token> tok(const llama_model * m, const char * text) {
++    const llama_vocab * v = llama_model_get_vocab(m);
++    std::vector<llama_token> t(256);
++    int n = llama_tokenize(v, text, (int) strlen(text), t.data(), (int) t.size(), true, false);
++    if (n < 0) { t.resize(-n); n = llama_tokenize(v, text, (int) strlen(text), t.data(), (int) t.size(), true, false); }
++    t.resize(n);
++    return t;
++}
++
++static const char * PROMPTS[5] = {
++    "The capital of France is",
++    "Write a short sentence about the sea and the mountains, then explain why the sky is blue.",
++    "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n",
++    "Rome is the capital of Italy. List three famous monuments in the city and describe them:",
++    "1, 1, 2, 3, 5, 8, 13, 21,",
++};
++
++static double max_abs_diff(const std::vector<float> & a, const std::vector<float> & b) {
++    double m = 0;
++    for (size_t i = 0; i < a.size(); ++i) m = std::max(m, (double) std::fabs(a[i] - b[i]));
++    return m;
++}
++
++static bool bit_equal(const std::vector<float> & a, const std::vector<float> & b) {
++    return a.size() == b.size() && memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
++}
++
++// Sum logged weight and KV allocation sizes in MiB and print the source records.
++static void print_log(const char * title, const std::vector<std::string> & l, bool lines = false) {
++    double w = 0, kv = 0;
++    for (auto & s : l) {
++        const size_t p = s.find("buffer size =");
++        if (p == std::string::npos) continue;
++        const double v = atof(s.c_str() + p + 13);
++        if (s.find("model buffer size") != std::string::npos) w += v;
++        if (s.find("KV buffer size") != std::string::npos) kv += v;
++    }
++    printf("  [%s] weight buffers = %.1f MiB, KV cache = %.1f MiB\n", title, w, kv);
++    if (lines) for (auto & s : l) if (s.find("stage:") != std::string::npos || s.find("kv_cache: size") != std::string::npos) printf("    %s\n", s.c_str());
++}
++
++int main(int argc, char ** argv) {
++    if (argc < 3) {
++        fprintf(stderr, "Usage: %s MODEL.gguf {full-range|split|memory|batch|all|dump FILE|compare FILE} [-t THREAD] [-n TOKEN] [-v]\n", argv[0]);
++        return 2;
++    }
++    const char * path = argv[1];
++    std::string cmd = argv[2];
++    const char * file = nullptr;
++    int n_tok_t2 = 64;
++    int ai = 3;
++    if ((cmd == "dump" || cmd == "compare") && argc > 3) file = argv[ai++];
++    for (; ai < argc; ++ai) {
++        if (!strcmp(argv[ai], "-t") && ai + 1 < argc) g_threads = atoi(argv[++ai]);
++        else if (!strcmp(argv[ai], "-n") && ai + 1 < argc) n_tok_t2 = atoi(argv[++ai]);
++        else if (!strcmp(argv[ai], "-v")) g_verbose = true;
++    }
++    llama_log_set(log_cb, nullptr);
++    llama_backend_init();
++    int fails = 0;
++    const int N1 = 33; // Capture the first output after prefill and the next 32 decode steps.
++
++    // Establish the reference with a full layer range.
++    Chain ref; ref.st.resize(1);
++    if (!load_stage(ref.st[0], path, 0, -1, 2, false)) { fprintf(stderr, "could not load the model\n"); return 1; }
++    ref.n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(ref.st[0].model));
++    const int n_layer = llama_model_n_layer(ref.st[0].model);
++    printf("model: %s\n  n_layer = %d, n_embd = %d, n_vocab = %d, threads = %d\n", path, n_layer, ref.st[0].n_embd, ref.n_vocab, g_threads);
++
++    if (cmd == "dump" || cmd == "compare") {
++        FILE * f = fopen(file, cmd == "dump" ? "wb" : "rb");
++        if (!f) { perror("file"); return 1; }
++        for (int p = 0; p < 3; ++p) {
++            Run r;
++            if (!generate(ref, tok(ref.st[0].model, PROMPTS[p]), N1, nullptr, r)) return 1;
++            for (int s = 0; s < N1; ++s) {
++                if (cmd == "dump") fwrite(r.logits[s].data(), sizeof(float), ref.n_vocab, f);
++                else {
++                    std::vector<float> o(ref.n_vocab);
++                    if (fread(o.data(), sizeof(float), ref.n_vocab, f) != (size_t) ref.n_vocab) { fprintf(stderr, "unexpected end of file\n"); return 1; }
++                    if (!bit_equal(o, r.logits[s])) { printf("DIFF prompt %d step %d (max difference %.3g)\n", p, s, max_abs_diff(o, r.logits[s])); fails++; }
++                }
++            }
++        }
++        fclose(f);
++        printf("%s %s: %s\n", cmd.c_str(), file, fails ? "FAIL" : "OK (bit-identical)");
++        return fails ? 1 : 0;
++    }
++
++#ifndef STAGE_BASELINE
++    const bool all = cmd == "all";
++    // Explicit full-range bounds should take the same path as the defaults.
++    if (all || cmd == "full-range") {
++        printf("Full range [0,%d) against default, 3 prompts, %d steps (first + 32 tokens)\n", n_layer, N1);
++        Chain full; full.st.resize(1);
++        if (!load_stage(full.st[0], path, 0, n_layer, 2, true)) return 1;
++        full.n_vocab = ref.n_vocab;
++        int diffs = 0, steps = 0;
++        for (int p = 0; p < 3; ++p) {
++            Run a, b;
++            auto t = tok(ref.st[0].model, PROMPTS[p]);
++            generate(ref, t, N1, nullptr, a); generate(full, t, N1, nullptr, b);
++            for (int s = 0; s < N1; ++s, ++steps) if (!bit_equal(a.logits[s], b.logits[s])) { diffs++; printf("  Logits differ at prompt %d step %d\n", p, s); }
++            if (a.toks != b.toks) { diffs++; printf("  Tokens differ for prompt %d\n", p); }
++        }
++        printf("  Full range %s: %d steps compared byte for byte, %d differ\n", diffs ? "FAIL" : "OK", steps, diffs);
++        fails += diffs != 0;
++        free_chain(full);
++    }
++
++    // Reuse the same two-stage setup for parity, memory and batching checks.
++    if (all || cmd == "split" || cmd == "memory" || cmd == "batch") {
++        const int k = n_layer / 2;
++        Chain two; two.st.resize(2);
++        if (!load_stage(two.st[0], path, 0, k, 2, true)) { fprintf(stderr, "failed to load stage 0\n"); return 1; }
++        two.st[0].tail = false;
++        if (!load_stage(two.st[1], path, k, n_layer, 2, true)) { fprintf(stderr, "failed to load stage 1\n"); return 1; }
++        two.n_vocab = ref.n_vocab;
++
++        if (all || cmd == "memory") {
++            printf("Memory usage from startup logs and llama_model_size\n");
++            print_log("single context", ref.st[0].log, true);
++            for (int i = 0; i < 2; ++i) {
++                char t[64]; snprintf(t, sizeof t, "stage %d [%d,%d)", i, i ? k : 0, i ? n_layer : k);
++                print_log(t, two.st[i].log, true);
++            }
++        }
++
++        if (all || cmd == "split") {
++            printf("Two stages [0,%d)+[%d,%d), 5 prompts, %d steps, FP32 and FP16 boundary state\n", k, k, n_layer, n_tok_t2);
++            for (int fp16 = 0; fp16 < 2; ++fp16) {
++                two.fp16 = fp16;
++                int tok_mismatch = 0, argmax_diff = 0, steps = 0; double maxd = 0, maxd_tf = 0;
++                int bitwise = 0;
++                for (int p = 0; p < 5; ++p) {
++                    Run a, b, c;
++                    auto t = tok(ref.st[0].model, PROMPTS[p]);
++                    generate(ref, t, n_tok_t2, nullptr, a);
++                    generate(two, t, n_tok_t2, nullptr, c);       // greedy libero a due stadi
++                    generate(two, t, n_tok_t2, &a.toks, b);       // teacher forcing: logit confrontabili passo per passo
++                    if (a.toks != c.toks) tok_mismatch++;
++                    for (int s = 0; s < n_tok_t2; ++s, ++steps) {
++                        const double d = max_abs_diff(a.logits[s], b.logits[s]);
++                        maxd = std::max(maxd, d);
++                        bitwise += bit_equal(a.logits[s], b.logits[s]);
++                        if (argmax(a.logits[s]) != argmax(b.logits[s])) argmax_diff++;
++                    }
++                    maxd_tf = maxd;
++                }
++                printf("  %s: %d/5 sequences differ from the reference tokens, %d/%d steps differ in argmax, "
++                       "maximum absolute logit difference %.3g, bit-identical steps %d/%d\n",
++                       fp16 ? "FP16" : "FP32", tok_mismatch, argmax_diff, steps, maxd_tf, bitwise, steps);
++                if (!fp16) fails += (tok_mismatch != 0 || argmax_diff != 0);
++            }
++            two.fp16 = false;
++        }
++
++        if (all || cmd == "batch") {
++            const int n4 = std::min(n_tok_t2, 32);
++            printf("Two sequences (IDs 0 and 1) in the same batch across both stages, %d steps\n", n4);
++            auto t0 = tok(ref.st[0].model, PROMPTS[1]), t1 = tok(ref.st[0].model, PROMPTS[3]);
++            Run r0, r1;
++            generate(ref, t0, n4, nullptr, r0); generate(ref, t1, n4, nullptr, r1);
++            reset_chain(two);
++            std::vector<Row> rows; std::vector<std::vector<float>> out;
++            for (size_t i = 0; i < t0.size(); ++i) rows.push_back({t0[i], (llama_pos) i, 0, i + 1 == t0.size()});
++            for (size_t i = 0; i < t1.size(); ++i) rows.push_back({t1[i], (llama_pos) i, 1, i + 1 == t1.size()});
++            bool ok = chain_decode(two, rows, out);
++            std::vector<int> g0, g1; double maxd = 0;
++            llama_pos p0 = (llama_pos) t0.size(), p1 = (llama_pos) t1.size();
++            for (int s = 0; ok && s < n4; ++s) {
++                g0.push_back(argmax(out[0])); g1.push_back(argmax(out[1]));
++                maxd = std::max({maxd, max_abs_diff(out[0], r0.logits[s]), max_abs_diff(out[1], r1.logits[s])});
++                if (s + 1 == n4) break;
++                rows = {{r0.toks[s], p0++, 0, true}, {r1.toks[s], p1++, 1, true}}; // token di riferimento (teacher forcing)
++                ok = chain_decode(two, rows, out);
++            }
++            const bool same = ok && g0 == r0.toks && g1 == r1.toks;
++            printf("  Batched %s: tokens for seq0 %s and seq1 %s the reference, maximum logit difference %.3g\n", same ? "OK" : "FAIL",
++                   g0 == r0.toks ? "match" : "differ from", g1 == r1.toks ? "match" : "differ from", maxd);
++            fails += !same;
++        }
++        free_chain(two);
++    }
++#endif
++    free_chain(ref);
++    llama_backend_free();
++    printf("%s\n", fails ? "FAIL" : "PASS");
++    return fails ? 1 : 0;
++}

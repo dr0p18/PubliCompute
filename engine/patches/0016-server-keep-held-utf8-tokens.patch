@@ -1,0 +1,267 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 48f1e93a21b3049f920d1d68f691cb9f7c979ee2..9033c62a68c80792ebd1ebaf6c033eba419f11b8 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -326,6 +326,7 @@ struct server_slot {
+     size_t n_sent_text = 0; // number of sent text character (i.e. handle partial UTF-8 on streaming)
+ 
+     std::vector<completion_token_output> generated_token_probs;
++    size_t n_pending_utf8 = 0; // Short suffix of probability records not yet streamed.
+ 
+     bool has_next_token = true;
+     bool has_new_line   = false;
+@@ -334,6 +335,7 @@ struct server_slot {
+     stop_type stop;
+ 
+     std::string stopping_word;
++    bool stop_text_withheld = false;
+ 
+     // state
+     slot_state state = SLOT_STATE_IDLE;
+@@ -430,6 +432,7 @@ struct server_slot {
+         truncated      = false;
+         stop           = STOP_TYPE_NONE;
+         stopping_word  = "";
++        stop_text_withheld = false;
+         n_sent_text    = 0;
+ 
+         if (can_speculate()) {
+@@ -439,6 +442,7 @@ struct server_slot {
+         }
+         generated_tokens.clear();
+         generated_token_probs.clear();
++        n_pending_utf8 = 0;
+         json_schema = json();
+ 
+         task_prev = std::move(task);
+@@ -2134,54 +2138,71 @@ private:
+         return true;
+     }
+ 
++    void flush_pending_utf8(server_slot & slot) {
++        if (slot.task->params.stream) {
++            const auto & records = slot.generated_token_probs;
++            for (size_t i = records.size() - slot.n_pending_utf8; i < records.size(); ++i) {
++                send_partial_response(slot, records[i], false);
++            }
++        }
++        slot.n_pending_utf8 = 0;
++    }
++
+     bool process_token(completion_token_output & result, server_slot & slot) {
+         // remember which tokens were sampled - used for repetition penalties during sampling
+         const std::string token_str = result.text_to_send;
++        const bool eog = llama_vocab_is_eog(vocab, result.tok);
+         slot.sampled = result.tok;
+ 
++        // A rendered EOG marker cannot complete the character.
++        if (eog && slot.n_pending_utf8 > 0 && !token_str.empty()) {
++            slot.generated.truncate(validate_utf8(slot.generated.text));
++        }
++
+         slot.generated.append(token_str, result.tok);
+         if (slot.task->params.return_tokens) {
+             slot.generated_tokens.push_back(result.tok);
+         }
+         slot.has_next_token = true;
+ 
+-        // check if there is incomplete UTF-8 character at the end
+-        bool incomplete = validate_utf8(slot.generated.text) < slot.generated.text.size();
++        const size_t valid_end = validate_utf8(slot.generated.text);
++        bool incomplete = valid_end < slot.generated.text.size();
++        result.text_to_send.clear();
+ 
+-        // search stop word and delete it
+-        if (!incomplete) {
+-            size_t pos = std::min(slot.n_sent_text, slot.generated.text.size());
++        if (!incomplete || !slot.task->params.antiprompt.empty()) {
++            size_t pos = std::min(slot.n_sent_text, valid_end);
++            const std::string str_test = slot.generated.text.substr(pos, valid_end - pos);
+ 
+-            const std::string str_test = slot.generated.text.substr(pos);
++            // A stop can start in bytes held back by an earlier token.
++            const size_t search_size = incomplete || slot.n_pending_utf8 > 0 ? str_test.size() : token_str.size();
++            size_t stop_pos = slot.find_stopping_strings(str_test, search_size, true);
+             bool send_text = true;
+-
+-            size_t stop_pos = slot.find_stopping_strings(str_test, token_str.size(), true);
+             if (stop_pos != std::string::npos) {
+                 slot.generated.truncate(pos + stop_pos);
+                 pos = std::min(slot.n_sent_text, slot.generated.text.size());
+-            } else if (slot.has_next_token && !llama_vocab_is_eog(vocab, result.tok) ) {
++                incomplete = false;
++            } else if (!incomplete && !eog) {
+                 stop_pos = slot.find_stopping_strings(str_test, token_str.size(), false);
+                 send_text = stop_pos == std::string::npos;
+             }
+ 
+-            // check if there is any token to predict
+-            if (send_text) {
+-                // no send the stop word in the response
+-                result.text_to_send = slot.generated.text.substr(pos, std::string::npos);
+-                slot.n_sent_text += result.text_to_send.size();
+-                // add the token to slot queue and cache
+-            } else {
+-                result.text_to_send = "";
++            if (!incomplete) {
++                slot.stop_text_withheld = stop_pos != std::string::npos;
+             }
+-
+-            slot.add_token(result);
+-            if (slot.task->params.stream) {
+-                send_partial_response(slot, result, false);
++            if (!incomplete && send_text) {
++                result.text_to_send = slot.generated.text.substr(pos);
++                slot.n_sent_text += result.text_to_send.size();
+             }
+         }
+ 
++        if (!incomplete) {
++            flush_pending_utf8(slot);
++        }
++        slot.add_token(result);
+         if (incomplete) {
+-            slot.has_next_token = true;
++            ++slot.n_pending_utf8;
++        } else if (slot.task->params.stream) {
++            send_partial_response(slot, result, false);
+         }
+ 
+         // if context shifting is disabled, make sure that we don't run out of context
+@@ -2251,7 +2272,7 @@ private:
+             }
+         }
+ 
+-        if (llama_vocab_is_eog(vocab, result.tok)) {
++        if (eog) {
+             slot.stop           = STOP_TYPE_EOS;
+             slot.has_next_token = false;
+ 
+@@ -2361,7 +2382,9 @@ private:
+         if (is_begin) {
+             res->is_begin = true;
+         } else {
+-            res->content = slot.generated.substr(slot.n_sent_text - tkn.text_to_send.size(), tkn.text_to_send.size());
++            if (!tkn.text_to_send.empty()) {
++                res->content = slot.generated.substr(slot.n_sent_text - tkn.text_to_send.size(), tkn.text_to_send.size());
++            }
+             res->tokens.assign(1, tkn.tok);
+         }
+ 
+@@ -2401,6 +2424,26 @@ private:
+     }
+ 
+     void send_final_response(server_slot & slot) {
++        if (slot.n_pending_utf8 > 0) {
++            slot.generated.truncate(validate_utf8(slot.generated.text));
++            const size_t pos = std::min(slot.n_sent_text, slot.generated.text.size());
++            const std::string unsent = slot.generated.text.substr(pos);
++            size_t stop_pos = slot.find_stopping_strings(unsent, unsent.size(), true);
++            if (stop_pos == std::string::npos) {
++                stop_pos = slot.find_stopping_strings(unsent, unsent.size(), false);
++            }
++            slot.stop_text_withheld = stop_pos != std::string::npos;
++            if (slot.stop_text_withheld) {
++                slot.generated.truncate(pos + stop_pos);
++            }
++
++            // The final held record carries any complete text that precedes the discarded suffix.
++            auto & last = slot.generated_token_probs.back();
++            last.text_to_send = slot.generated.text.substr(pos);
++            slot.n_sent_text += last.text_to_send.size();
++            flush_pending_utf8(slot);
++        }
++
+         auto res = std::make_unique<server_task_result_cmpl_final>();
+ 
+         res->id      = slot.task->id;
+@@ -2432,6 +2475,7 @@ private:
+         res->n_tokens_cached       = slot.prompt.n_tokens();
+         res->has_new_line          = slot.has_new_line;
+         res->stopping_word         = slot.stopping_word;
++        res->stop_text_withheld     = slot.stop_text_withheld;
+         res->stop                  = slot.stop;
+         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
+ 
+@@ -2444,7 +2488,10 @@ private:
+ 
+         // populate res.probs_output
+         if (slot.task->params.sampling.n_probs > 0) {
+-            if (!slot.task->params.stream && slot.stop == STOP_TYPE_WORD) {
++            // Native responses with token IDs also need the records for tokens hidden by the stop.
++            const bool return_token_records = slot.task->params.res_type == TASK_RESPONSE_TYPE_NONE &&
++                                             slot.task->params.return_tokens;
++            if (!slot.task->params.stream && slot.stop == STOP_TYPE_WORD && !return_token_records) {
+                 const llama_tokens stop_word_toks = common_tokenize(ctx_tgt, slot.stopping_word, false);
+ 
+                 size_t safe_offset = std::min(slot.generated_token_probs.size(), stop_word_toks.size());
+@@ -5024,16 +5071,13 @@ private:
+                 n_accepted_per_pos[i]++;
+             }
+ 
+-            // add accepted tokens to the prompt
++            // Advance the prompt one input at a time so stop checks see the context of each token.
+             slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
+-            slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
+-
+-            slot.sampled = ids.back(); // last accepted token
+-            SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
+-
+-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+-
+             for (size_t i = 0; i < ids.size(); ++i) {
++                if (i > 0) {
++                    slot.prompt.tokens.push_back(ids[i - 1]);
++                }
++
+                 completion_token_output result;
+ 
+                 result.tok          = ids[i];
+@@ -5048,6 +5092,13 @@ private:
+                 slot.stats.n_gen += 1;
+ 
+                 if (!process_token(result, slot)) {
++                    if (i + 1 < ids.size()) {
++                        // Resetting the cache is conservative for an EOG inside a speculative step.
++                        // A recurrent context may be unable to roll back the unused rows.
++                        slot.prompt_clear();
++                    } else {
++                        slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
++                    }
+                     slot.print_timings();
+                     send_final_response(slot);
+                     slot.release();
+@@ -5056,6 +5107,7 @@ private:
+                 }
+             }
+ 
++            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+             slot.print_timings_tg();
+ 
+             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 1a0d434a1f3169bd591a662874de5d8096fa94e3..95aaa34362d9dcc3df4bebdf6040a5938c7665a3 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -348,6 +348,9 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
+         {"tokens_cached",       n_tokens_cached},
+         {"timings",             stats.to_json()},
+     };
++    if (stream && generation_params.return_tokens) {
++        res["stop_text_withheld"] = stop_text_withheld;
++    }
+     if (!stream && !probs_output.empty()) {
+         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
+     }
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 21b649ac429a01b19ef3b52cab5a1fa0e3b99e82..d247e23b3d8ecade6c714483c1b9ede8cb49d0ef 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -419,6 +419,7 @@ struct server_task_result_cmpl_final : server_task_result {
+     int32_t n_tokens_cached;
+     bool has_new_line;
+     std::string stopping_word;
++    bool stop_text_withheld = false;
+     stop_type stop = STOP_TYPE_NONE;
+ 
+     bool post_sampling_probs;

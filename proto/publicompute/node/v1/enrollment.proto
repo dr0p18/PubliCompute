@@ -1,0 +1,91 @@
+// Enrollment runs on one bidirectional QUIC stream. The node authenticates
+// the coordinator before submitting its certificate request. The issued
+// certificate binds the node ID to its key for mutual TLS in later sessions.
+// A node seeking the attested tier also proves possession of its TPM keys.
+syntax = "proto3";
+
+package publicompute.node.v1;
+
+import "google/protobuf/timestamp.proto";
+import "publicompute/common/v1/common.proto";
+import "publicompute/node/v1/hardware.proto";
+
+option go_package = "publicompute/proto/gen/go/publicompute/node/v1;nodev1";
+
+message EnrollClientMessage {
+  oneof body {
+    EnrollBegin begin = 1;
+    EnrollProof proof = 2;
+  }
+}
+
+message EnrollServerMessage {
+  oneof body {
+    EnrollChallenge challenge = 1;
+    EnrollResult result = 2;
+    publicompute.common.v1.Error error = 3;
+  }
+}
+
+message EnrollBegin {
+  publicompute.common.v1.ProtocolVersion protocol_version = 1;
+  string agent_version = 2;
+  // DER-encoded PKCS#10 request with an Ed25519 or ECDSA P-256 key. For TPM
+  // enrollment, the TPM signs the request with the key in identity_key_public.
+  bytes csr_der = 3;
+  HardwareProfile hardware = 4;
+  // Salted SHA-256 of stable hardware identifiers. This is a correlation
+  // value for base-tier bans and carries no proof of key ownership.
+  bytes hardware_fingerprint = 5;
+  // Set when requesting TPM-backed enrollment.
+  TpmIdentity tpm = 6;
+  // Secret that associates the node with an owner. An empty token creates a
+  // separate anonymous owner. Keep the token out of logs.
+  string owner_token = 7;
+}
+
+message TpmIdentity {
+  // DER certificate for the TPM endorsement key.
+  bytes ek_certificate_der = 1;
+  // Serialized TPM2B_PUBLIC values for the endorsement and attestation keys.
+  bytes ek_public = 2;
+  bytes ak_public = 3;
+  // Non-exportable identity key, encoded as TPM2B_PUBLIC. Its PolicyAuthorize
+  // policy allows use only with approved boot measurements.
+  bytes identity_key_public = 4;
+  // TPM2_Certify attestation and signature from the attestation key. Enrollment
+  // checks these together with the credential challenge to bind the keys to one TPM.
+  bytes identity_key_certify_info = 5;
+  bytes identity_key_certify_signature = 6;
+}
+
+message EnrollChallenge {
+  bytes nonce = 1;
+  // Find a counter for which SHA-256(nonce || SHA-256(csr_der) || counter_be64)
+  // starts with difficulty_bits zero bits. A difficulty of zero waives the proof.
+  uint32 pow_difficulty_bits = 2;
+  // TPM2_MakeCredential output bound to the endorsement key and the attestation
+  // key name. The enrolling TPM recovers the secret with ActivateCredential.
+  TpmCredentialChallenge tpm = 3;
+}
+
+message TpmCredentialChallenge {
+  bytes credential_blob = 1;
+  bytes encrypted_secret = 2;
+}
+
+message EnrollProof {
+  uint64 pow_counter = 1;
+  // Recovered credential secret. Leave empty when enrolling without a TPM.
+  bytes activated_secret = 2;
+}
+
+message EnrollResult {
+  string node_id = 1;
+  // DER certificates in leaf-first order.
+  repeated bytes certificate_chain_der = 2;
+  google.protobuf.Timestamp certificate_expires_at = 3;
+  // A verified endorsement key lets the node request the attested tier when
+  // it opens a session and presents a fresh boot quote.
+  bool tpm_bound = 4;
+}

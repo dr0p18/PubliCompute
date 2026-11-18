@@ -1,0 +1,155 @@
+// Hardware capacity and host policy inform scheduling. Telemetry reports
+// the engine state within a session. The profile omits serial numbers,
+// device addresses, and host and account identifiers.
+syntax = "proto3";
+
+package publicompute.node.v1;
+
+import "google/protobuf/timestamp.proto";
+import "publicompute/common/v1/common.proto";
+
+option go_package = "publicompute/proto/gen/go/publicompute/node/v1;nodev1";
+
+message HardwareProfile {
+  OsInfo os = 1;
+  CpuInfo cpu = 2;
+  uint64 ram_bytes = 3;
+  repeated GpuInfo gpus = 4;
+  NetworkInfo network = 5;
+  repeated EngineInfo engines = 6;
+  HostPolicy policy = 7;
+  // Memory available within the agent's environment. Zero means unspecified.
+  uint64 usable_ram_bytes = 8;
+  // Free space available for storing weights, in bytes. Zero means unknown.
+  uint64 models_free_disk_bytes = 9;
+}
+
+enum OsFamily {
+  OS_FAMILY_UNSPECIFIED = 0;
+  OS_FAMILY_WINDOWS = 1;
+  // Boot environment eligible for the attested tier.
+  OS_FAMILY_LINUX_IMAGE = 2;
+  // Development environment ineligible for the attested tier.
+  OS_FAMILY_LINUX = 3;
+  OS_FAMILY_MACOS = 4;
+}
+
+message OsInfo {
+  OsFamily family = 1;
+  // Display string for the operating system release.
+  string version = 2;
+  string arch = 3; // Architecture name, such as "x86_64" or "aarch64".
+}
+
+message CpuInfo {
+  string model = 1;
+  uint32 physical_cores = 2;
+  uint32 logical_cores = 3;
+}
+
+enum GpuVendor {
+  GPU_VENDOR_UNSPECIFIED = 0;
+  GPU_VENDOR_NVIDIA = 1;
+  GPU_VENDOR_AMD = 2;
+  GPU_VENDOR_APPLE = 3;
+  GPU_VENDOR_INTEL = 4;
+}
+
+message GpuInfo {
+  GpuVendor vendor = 1;
+  string name = 2; // Display name reported by the driver.
+  uint64 vram_bytes = 3;
+  // True when the accelerator and CPU share a memory budget.
+  bool unified_memory = 4;
+  string driver_version = 5;
+  // Compute capability reported as major.minor. Empty when unavailable.
+  string compute_capability = 6;
+  uint32 tdp_watts = 7;
+  // Nominal memory bandwidth used to estimate throughput.
+  uint64 memory_bandwidth_bytes_per_sec = 8;
+}
+
+message NetworkInfo {
+  // Bandwidth measured locally.
+  uint64 upload_bits_per_sec = 1;
+  uint64 download_bits_per_sec = 2;
+  // Host-measured latency to relay endpoints. The coordinator can verify
+  // latency independently before using it to determine location.
+  repeated LatencySample latencies = 3;
+}
+
+message LatencySample {
+  string target_id = 1; 
+  uint32 rtt_micros = 2;
+  google.protobuf.Timestamp measured_at = 3;
+}
+
+message EngineInfo {
+  publicompute.common.v1.EngineKind kind = 1;
+  string version = 2;
+  // Backend name, such as "cuda", "metal", "rocm", or "cpu".
+  repeated string backends = 3;
+  // Build identifier reported by the engine. Empty means unknown. This field
+  // groups performance measurements and does not authenticate the engine.
+  string build = 4;
+  // Startup settings that affect performance and memory placement.
+  EngineSettings settings = 5;
+}
+
+// Host-reported startup mode used to group verification measurements.
+message EngineSettings {
+  // True when the agent started the engine and can report its settings.
+  // With an external engine the settings are left empty.
+  bool known = 1;
+  // GPU layer setting as passed on the command line: "auto", "all", or a count.
+  string gpu_layers = 2;
+  // Keep the first N mixture-of-experts layers on the CPU.
+  uint32 n_cpu_moe = 3;
+  // Keep all mixture-of-experts weights on the CPU.
+  bool cpu_moe = 4;
+  // Keep the attention cache on the CPU.
+  bool kv_offload_disabled = 5;
+  // Device selector. Empty uses the default devices and "none" disables offload.
+  string device = 6;
+}
+
+// Limits the scheduler considers when placing work and the agent enforces locally.
+message HostPolicy {
+  // Percentage of factory power. Range 30 to 100, default 70. Values above
+  // 70 require performance mode. The scheduler uses the setting to estimate
+  // throughput and energy use.
+  uint32 power_limit_percent = 1;
+  // Applies even in performance mode.
+  uint32 temperature_limit_celsius = 2;
+  // Electricity price per kWh, used to evaluate the cost of accepting work.
+  publicompute.common.v1.Money electricity_price_per_kwh = 3;
+  // Engine memory ceiling set by the host.
+  uint64 max_vram_bytes = 4;
+}
+
+message Telemetry {
+  repeated GpuTelemetry gpus = 1;
+  // Throughput on the most recent job, used for scheduling.
+  float recent_tokens_per_sec = 2;
+  // Host-reported health for diagnostic logs.
+  EngineHealth engine = 3;
+}
+
+// Counter lifetime is the agent process.
+message EngineHealth {
+  uint64 requests_completed = 1;
+  uint64 requests_failed = 2;
+  uint64 requests_cancelled = 3;
+  uint64 engine_restarts = 4;
+  uint64 probe_failures = 5;
+  // Zero when idle or when the engine has not reported progress.
+  uint32 seconds_since_progress = 6;
+}
+
+message GpuTelemetry {
+  uint32 index = 1; 
+  uint32 utilization_percent = 2;
+  uint32 temperature_celsius = 3;
+  uint32 power_watts = 4;
+  uint64 vram_used_bytes = 5;
+}

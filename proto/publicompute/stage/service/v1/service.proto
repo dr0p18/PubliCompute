@@ -1,0 +1,120 @@
+// Local TCP interface between the node agent and the head in service mode.
+// Each frame carries one message prefixed by its varint length. Requests
+// enter the head's admission queue and stream back recorded tokens until
+// Done. Losing the agent connection cancels the requests attached to it.
+syntax = "proto3";
+
+package publicompute.stage.service.v1;
+
+option go_package = "publicompute/proto/gen/go/publicompute/stage/service/v1;servicev1";
+
+enum Class {
+  CLASS_UNSPECIFIED = 0;
+  // Default class for interactive traffic.
+  CLASS_INTERACTIVE = 1;
+  CLASS_BATCH = 2;
+}
+
+message Sampling {
+  // Zero selects greedy sampling.
+  float temperature = 1;
+  // Zero asks the head to derive a seed from its own seed and the conversation ID.
+  uint64 seed = 2;
+  // Apply nucleus sampling after top_k and temperature scaling. Values at or
+  // below zero or at least one leave the distribution uncut.
+  float top_p = 3;
+  // Keep the highest top_k logits, breaking ties by lower index. Zero disables the limit.
+  uint32 top_k = 4;
+}
+
+message Message {
+  // Role is system, user, or assistant.
+  string role = 1;
+  string text = 2;
+}
+
+message Request {
+  // Nonzero ID chosen by the agent. Unique among open requests.
+  uint64 id = 1;
+  // If empty, tokenize the supplied text or messages.
+  repeated int32 prompt_token = 2;
+  // Plain user text to pass through the chat template.
+  string text = 3;
+  // Zero uses the head's configured response limit.
+  uint32 max_tokens = 4;
+  Sampling sampling = 5;
+  Class class = 6;
+  // When prompt_token is empty, conversation history takes precedence over
+  // text. The head trims the history if it exceeds the prompt budget.
+  repeated Message messages = 7;
+  // End at the first matching stop string and omit the match from the output.
+  // Empty stop strings have no effect.
+  repeated string stop = 8;
+}
+
+message Cancel {
+  uint64 id = 1;
+}
+
+// Sent only after the token has been recorded in the transcript.
+message OutputToken {
+  uint64 id = 1;
+  int32 token = 2;
+  // A UTF-8 character spanning tokens appears when its final byte arrives.
+  string text = 3;
+  // Log-softmax of the sampled token before sampling adjustments.
+  float logprob = 4;
+  uint32 step = 5;
+  // End-of-generation tokens carry no text.
+  bool eog = 6;
+}
+
+message Usage {
+  uint32 prompt_tokens = 1;
+  uint32 generated_tokens = 2;
+}
+
+message Timings {
+  // Time spent waiting for admission, in milliseconds.
+  double wait_ms = 1;
+  double ttft_ms = 2;
+  double total_ms = 3;
+}
+
+// Terminal response for the request ID.
+message Done {
+  uint64 id = 1;
+  // "eog", "stop", "max_token", "annullata", "fallita", or "errore".
+  string reason = 2;
+  Usage usage = 3;
+  Timings timings = 4;
+  // Set for pre-admission rejection, such as an empty or oversized prompt.
+  string error = 5;
+  // Final text buffered while checking stop strings or completing UTF-8 characters.
+  // Any incomplete UTF-8 at the end is rendered with replacement characters.
+  string remaining_text = 6;
+  // Prompt tokens after templating. The agent hashes these for verification.
+  repeated int32 prompt_token = 7;
+}
+
+// Report open requests and free slots on connect and whenever either count changes.
+message Status {
+  uint32 free_slots = 1;
+  // Includes accepted requests still waiting for admission.
+  uint32 pending = 2;
+}
+
+message FromAgent {
+  oneof body {
+    Request request = 1;
+    Cancel cancel = 2;
+  }
+}
+
+message FromHead {
+  oneof body {
+    OutputToken token = 1;
+    Done done = 2;
+    Status status = 3;
+  }
+}

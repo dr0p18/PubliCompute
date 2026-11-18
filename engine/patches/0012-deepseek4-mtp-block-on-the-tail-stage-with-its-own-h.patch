@@ -1,0 +1,165 @@
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 92a13e985875f26875461e1e4f44a59389982a09..9a3141baefada2cd60523592a2e1d7c26a9da4a0 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -736,6 +736,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_NEXTN_HC_HEAD_NORM,                     "blk.%d.nextn.hc_head_norm" },
+     { LLM_TENSOR_NEXTN_HC_HEAD_DOWN,                     "blk.%d.nextn.hc_head_down" },
+     { LLM_TENSOR_NEXTN_HC_HEAD_UP,                       "blk.%d.nextn.hc_head_up" },
++    { LLM_TENSOR_NEXTN_HC_HEAD_FN,                       "blk.%d.nextn.hc_head_fn" },
++    { LLM_TENSOR_NEXTN_HC_HEAD_SCALE,                    "blk.%d.nextn.hc_head_scale" },
++    { LLM_TENSOR_NEXTN_HC_HEAD_BASE,                     "blk.%d.nextn.hc_head_base" },
+     { LLM_TENSOR_ATTN_SUB_NORM,                          "blk.%d.attn_sub_norm" },
+     { LLM_TENSOR_FFN_SUB_NORM,                           "blk.%d.ffn_sub_norm" },
+     { LLM_TENSOR_DEC_OUTPUT_NORM,                        "dec.output_norm" },
+@@ -1191,6 +1194,9 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_NEXTN_HC_HEAD_NORM,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+     {LLM_TENSOR_NEXTN_HC_HEAD_DOWN,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_NEXTN_HC_HEAD_UP,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_NEXTN_HC_HEAD_FN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_NEXTN_HC_HEAD_SCALE,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
++    {LLM_TENSOR_NEXTN_HC_HEAD_BASE,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+     // Nemotron 3 Super
+     // latent projections feed ggml_mul_mat, the buft probe must use MUL_MAT to keep them on GPU
+     {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index f811607b63de992ca7c4d35537b7db3bd84d8f42..89274e1672630d1fddf423db40a215c13f38435e 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -850,6 +850,9 @@ enum llm_tensor {
+     LLM_TENSOR_NEXTN_HC_HEAD_NORM, // qwen4exp: the MTP block's own hyper-connection mixer
+     LLM_TENSOR_NEXTN_HC_HEAD_DOWN,
+     LLM_TENSOR_NEXTN_HC_HEAD_UP,
++    LLM_TENSOR_NEXTN_HC_HEAD_FN,    // Three tensors define the draft block's stream reduction.
++    LLM_TENSOR_NEXTN_HC_HEAD_SCALE,
++    LLM_TENSOR_NEXTN_HC_HEAD_BASE,
+     LLM_TENSOR_MASKED_EMBD_CENTROIDS,
+     LLM_TENSOR_MASKED_EMBD_ORDERING,
+     LLM_TENSOR_HRM_Z_L_INIT,
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index b17319295a71632ce44e86b62701a2cea66e0e45..aa475eb05ce88c085524b1fc83eda6989f478bac 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2488,8 +2488,11 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
+         // the blocks after the trunk (MTP / NextN) are never part of a stage
+         const bool is_nextn  = hparams.n_layer_nextn > 0 && tn.bid >= 0 && (uint32_t) tn.bid >= hparams.n_layer() &&
+                                (uint32_t) tn.bid < hparams.n_layer_all;
+-        if ((is_block && !stage_has_layer(tn.bid)) || (is_embd && !stage_head()) || (is_head && !stage_tail()) ||
+-            (is_ple && !stage_head()) || is_nextn) {
++        // deepseek4: the tail stage may load the MTP block (the loader refuses it for any other stage); the MTP step
++        // embeds the token it is given, so the tail then keeps the input embedding too
++        const bool tail_mtp  = arch == LLM_ARCH_DEEPSEEK4 && ml.load_mtp && stage_tail() && hparams.n_layer_nextn > 0;
++        if ((is_block && !stage_has_layer(tn.bid)) || (is_embd && !stage_head() && !tail_mtp) || (is_head && !stage_tail()) ||
++            (is_ple && !stage_head()) || (is_nextn && !tail_mtp)) {
+             flags |= TENSOR_SKIP | TENSOR_NOT_REQUIRED;
+         }
+     }
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 60b0183bd1a7453e0bb9505c0ce35cd11315744d..2b168ed1f020a1c70e4a76d145a483007d0f849c 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -242,6 +242,11 @@ struct llama_layer_nextn {
+     struct ggml_tensor * hc_head_norm          = nullptr;
+     struct ggml_tensor * hc_head_down          = nullptr;
+     struct ggml_tensor * hc_head_up            = nullptr;
++
++    // The optional draft projection has its own stream weights. The main projection supplies the fallback.
++    struct ggml_tensor * hc_head_fn            = nullptr;
++    struct ggml_tensor * hc_head_scale         = nullptr;
++    struct ggml_tensor * hc_head_base          = nullptr;
+ };
+ 
+ struct llama_layer_switch_lora {
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 1e4cd8a4080aceeb5f72b11a17fbd7f085c1eafa..490208a93240e0dc9463339917493ac191e9523e 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -91,7 +91,7 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
+ 
+     // a stage [layer_start, layer_end) loads only its own tensors (see llama_model_base::create_tensor):
+     //   head: token embeddings; tail: final hyper-connection head (output_hc_*), output norm and output head;
+-    //   the MTP block is never loaded
++    // The tail owns the draft block and retains token embeddings to run it.
+     if (stage_partial()) {
+         // the hash layers route the experts from the token ids (ffn_gate_tid2eid), which only the head has: they
+         // must all sit in the head stage, and a stage that is not the head cannot hold any of them
+@@ -102,8 +102,10 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
+                                                 hparams.dsv4_hash_layer_count - 1, layer_start, stage_end()));
+             }
+         }
+-        if (ml.load_mtp) {
+-            throw std::runtime_error("a layer range cannot load the MTP block");
++        if (ml.load_mtp && !(stage_tail() && hparams.n_layer_nextn > 0)) {
++            throw std::runtime_error(stage_tail() ?
++                "load_mtp: the file has no MTP block to load" :
++                "a layer range that is not the tail cannot load the MTP block");
+         }
+         if (!stage_head()) {
+             // the input of a stage that is not the head is the hc-wide residual of the previous stage (llama_batch.embd)
+@@ -192,6 +194,14 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
+             layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", i), {n_embd, n_vocab},    TENSOR_NOT_REQUIRED | flags);
+             layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), {n_embd, n_vocab},    TENSOR_NOT_REQUIRED | flags);
+             layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd},             TENSOR_NOT_REQUIRED | flags);
++            // Load a draft-specific stream reduction when present. The graph uses
++            // the main block's reduction if those tensors are absent.
++            layer.nextn.hc_head_fn    = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_FN,    "weight", i), {hc_dim, hc_mult}, TENSOR_NOT_REQUIRED | flags);
++            layer.nextn.hc_head_base  = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_BASE,  "weight", i), {hc_mult},         TENSOR_NOT_REQUIRED | flags);
++            layer.nextn.hc_head_scale = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_SCALE, "weight", i), {1},               TENSOR_NOT_REQUIRED | flags);
++            if (!layer.nextn.hc_head_fn != !layer.nextn.hc_head_base || !layer.nextn.hc_head_fn != !layer.nextn.hc_head_scale) {
++                throw std::runtime_error("the MTP block needs all of nextn.hc_head_{fn,scale,base} or none of them");
++            }
+         }
+     }
+ }
+@@ -1558,7 +1568,13 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
+ 
+     inpL = ggml_reshape_3d(ctx0, h_nextn, n_embd, hc, n_outputs);
+ 
+-    cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
++    // Reduce the draft residual streams with the draft block's own weights
++    // when available, or use the main block's weights.
++    const bool own_hc_head = layer.nextn.hc_head_fn && layer.nextn.hc_head_scale && layer.nextn.hc_head_base;
++    cur = build_hc_head(inpL,
++            own_hc_head ? layer.nextn.hc_head_fn    : model.hc_head_fn,
++            own_hc_head ? layer.nextn.hc_head_scale : model.hc_head_scale,
++            own_hc_head ? layer.nextn.hc_head_base  : model.hc_head_base);
+     cb(cur, "mtp_hc_head", -1);
+ 
+     ggml_tensor * head_norm_w = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;
+diff --git a/tools/publicompute-stage-test/stage-test.cpp b/tools/publicompute-stage-test/stage-test.cpp
+index 6be2fcf0eac880360b2ce26eaec97ce289a9edd2..f2109ff40339dff7ed44912b0c34c795bb7b6d93 100644
+--- a/tools/publicompute-stage-test/stage-test.cpp
++++ b/tools/publicompute-stage-test/stage-test.cpp
+@@ -14,6 +14,7 @@
+ //   rollback verifies a batched draft and rewinds it with seq_rm.
+ //   Compare recurrent state through subsequent steps on both layouts.
+ // invalid-ranges checks range and draft-weight validation.
++//   Only the tail may load draft weights, and the file must provide them.
+ //   Keep token-routed layers in the head, where token IDs are available.
+ //   -pad N repeats prompts to reach the requested token count.
+ //   Use long prompts to exercise 128:1 HCA compression and indexing.
+@@ -639,8 +640,12 @@ static int invalid_ranges_suite(const char * path, int n_layer, int n_nextn, int
+     if (n_nextn > 0) {
+         fails += prova("MTP with the full model (reference)", 0, -1, true, true);
+         fails += prova("MTP with head range [0,4)", 0, 4, true, false);
+-        fails += prova("MTP with tail range [4,n)", 4, n_layer, true, false);
++        // The tail owns the draft block because it consumes the main model's final state.
++        fails += prova("MTP with tail range [4,n)", 4, n_layer, true, n_hash > 0);
+         fails += prova("MTP with head range [0,n-1)", 0, n_layer - 1, true, false);
++        if (n_hash > 0) {
++            fails += prova("MTP with middle range [hash,n-1)", n_hash, n_layer - 1, true, false);
++        }
+     } else if (n_hash <= 0) {
+         printf("  No MTP block in this model. Skipping MTP range cases.\n");
+     }
+@@ -652,7 +657,9 @@ static int invalid_ranges_suite(const char * path, int n_layer, int n_nextn, int
+         fails += prova("non-head stage containing hash layers [1,n)", 1, n_layer, false, false);
+         fails += prova("non-head stage after all hash layers [hash,n)", n_hash, n_layer, false, true);
+         fails += prova("MTP with head range [0,hash) regardless of draft weights", 0, n_hash, true, false);
+-        fails += prova("MTP with tail range [hash,n) regardless of draft weights", n_hash, n_layer, true, false);
++        // Check that requesting the optional draft block fails when its weights are absent.
++        fails += prova(n_nextn > 0 ? "MTP with tail range [hash,n) and draft weights" : "MTP with tail range [hash,n) without draft weights",
++                       n_hash, n_layer, true, n_nextn > 0);
+     }
+     return fails;
+ }

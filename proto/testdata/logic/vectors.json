@@ -1,0 +1,450 @@
+[
+ {
+  "base64": "H4sIAAAAAAAC/2MWZmB97c3LLXmM8cv/j4JbmTzZVrCIMrI+lubmvcN4ewFnwT8F5iDmRyxGkhwMTAyMDAwKfgCpKMoZNAAAAA==",
+  "binary_hex": "03130005eb4b0d0b19c601f4fff111b5024906a804150105e31b0b0ddc01dba00970fe20035203e204321908000200010000204e",
+  "decoded": {
+   "content": [
+    {
+     "logprob": -0.012,
+     "token_id": 9707,
+     "top_logprobs": [
+      {
+       "logprob": -0.012,
+       "token_id": 9707
+      },
+      {
+       "logprob": -4.605,
+       "token_id": 13
+      },
+      {
+       "logprob": -5.298,
+       "token_id": 11
+      },
+      {
+       "logprob": -6.907,
+       "token_id": 25
+      },
+      {
+       "logprob": -8.099,
+       "token_id": 198
+      }
+     ]
+    },
+    {
+     "logprob": -1.2,
+     "token_id": 11,
+     "top_logprobs": [
+      {
+       "logprob": -0.4,
+       "token_id": 3555
+      },
+      {
+       "logprob": -1.2,
+       "token_id": 11
+      },
+      {
+       "logprob": -2.05,
+       "token_id": 13
+      },
+      {
+       "logprob": -3.3,
+       "token_id": 220
+      },
+      {
+       "logprob": -9.75,
+       "token_id": 151643
+      }
+     ]
+    },
+    {
+     "logprob": 0.0,
+     "token_id": 0,
+     "top_logprobs": [
+      {
+       "logprob": 0.0,
+       "token_id": 0
+      },
+      {
+       "logprob": -20.0,
+       "token_id": 1
+      }
+     ]
+    }
+   ]
+  },
+  "input": {
+   "content": [
+    {
+     "logprob": -0.0123,
+     "token_id": 9707,
+     "top_logprobs": [
+      {
+       "logprob": -0.0123,
+       "token_id": 9707
+      },
+      {
+       "logprob": -4.6051,
+       "token_id": 13
+      },
+      {
+       "logprob": -5.2983,
+       "token_id": 11
+      },
+      {
+       "logprob": -6.9077,
+       "token_id": 25
+      },
+      {
+       "logprob": -8.1,
+       "token_id": 198
+      }
+     ]
+    },
+    {
+     "logprob": -1.2,
+     "token_id": 11,
+     "top_logprobs": [
+      {
+       "logprob": -0.4,
+       "token_id": 3555
+      },
+      {
+       "logprob": -1.2,
+       "token_id": 11
+      },
+      {
+       "logprob": -2.05,
+       "token_id": 13
+      },
+      {
+       "logprob": -3.3,
+       "token_id": 220
+      },
+      {
+       "logprob": -9.75,
+       "token_id": 151643
+      }
+     ]
+    },
+    {
+     "logprob": -0.0,
+     "token_id": 0,
+     "top_logprobs": [
+      {
+       "logprob": -0.0,
+       "token_id": 0
+      },
+      {
+       "logprob": -20.0,
+       "token_id": 1
+      }
+     ]
+    }
+   ]
+  },
+  "name": "normale"
+ },
+ {
+  "base64": "H4sIAAAAAAAC/2MSZGBlZGJmYWUAAiYw5GZgZufgbP3PyJDADABkIdiYHwAAAA==",
+  "binary_hex": "021100050102030405000000000200020002000b000307080985ff01006003",
+  "decoded": {
+   "content": [
+    {
+     "logprob": 0.0,
+     "token_id": 1,
+     "top_logprobs": [
+      {
+       "logprob": 0.0,
+       "token_id": 1
+      },
+      {
+       "logprob": 0.0,
+       "token_id": 2
+      },
+      {
+       "logprob": -0.002,
+       "token_id": 3
+      },
+      {
+       "logprob": -0.004,
+       "token_id": 4
+      },
+      {
+       "logprob": -0.006,
+       "token_id": 5
+      }
+     ]
+    },
+    {
+     "logprob": -0.123,
+     "token_id": 7,
+     "top_logprobs": [
+      {
+       "logprob": -0.123,
+       "token_id": 7
+      },
+      {
+       "logprob": -0.124,
+       "token_id": 8
+      },
+      {
+       "logprob": -0.988,
+       "token_id": 9
+      }
+     ]
+    }
+   ]
+  },
+  "input": {
+   "content": [
+    {
+     "logprob": -0.0005,
+     "token_id": 1,
+     "top_logprobs": [
+      {
+       "logprob": -0.0005,
+       "token_id": 1
+      },
+      {
+       "logprob": -0.001,
+       "token_id": 2
+      },
+      {
+       "logprob": -0.0025,
+       "token_id": 3
+      },
+      {
+       "logprob": -0.004,
+       "token_id": 4
+      },
+      {
+       "logprob": -0.0055,
+       "token_id": 5
+      }
+     ]
+    },
+    {
+     "logprob": -0.1234567,
+     "token_id": 7,
+     "top_logprobs": [
+      {
+       "logprob": -0.1234567,
+       "token_id": 7
+      },
+      {
+       "logprob": -0.1239999,
+       "token_id": 8
+      },
+      {
+       "logprob": -0.9876543,
+       "token_id": 9
+      }
+     ]
+    }
+   ]
+  },
+  "name": "arrotondamento_al_pari"
+ },
+ {
+  "base64": "H4sIAAAAAAAC/2OUYWC7vYDz7gLO//UNDYz1DYw8/74wvmCGQAD1itGEHgAAAA==",
+  "binary_hex": "011c0006dba009dda009ff7f8080017f80010cfef401e803e803e803e803",
+  "decoded": {
+   "content": [
+    {
+     "logprob": -0.5,
+     "token_id": 151643,
+     "top_logprobs": [
+      {
+       "logprob": -0.5,
+       "token_id": 151643
+      },
+      {
+       "logprob": -1.0,
+       "token_id": 151645
+      },
+      {
+       "logprob": -2.0,
+       "token_id": 16383
+      },
+      {
+       "logprob": -3.0,
+       "token_id": 16384
+      },
+      {
+       "logprob": -4.0,
+       "token_id": 127
+      },
+      {
+       "logprob": -5.0,
+       "token_id": 128
+      }
+     ]
+    }
+   ]
+  },
+  "input": {
+   "content": [
+    {
+     "logprob": -0.5,
+     "token_id": 151643,
+     "top_logprobs": [
+      {
+       "logprob": -0.5,
+       "token_id": 151643
+      },
+      {
+       "logprob": -1.0,
+       "token_id": 151645
+      },
+      {
+       "logprob": -2.0,
+       "token_id": 16383
+      },
+      {
+       "logprob": -3.0,
+       "token_id": 16384
+      },
+      {
+       "logprob": -4.0,
+       "token_id": 127
+      },
+      {
+       "logprob": -5.0,
+       "token_id": 128
+      }
+     ]
+    }
+   ]
+  },
+  "name": "id_grandi"
+ },
+ {
+  "base64": "H4sIAAAAAAAC/2PkZmBmZGK+8k+EVYQVAFUYLtUNAAAA",
+  "binary_hex": "010b0003010203d4fe14051405",
+  "decoded": {
+   "content": [
+    {
+     "logprob": -0.3,
+     "token_id": 1,
+     "top_logprobs": [
+      {
+       "logprob": -0.3,
+       "token_id": 1
+      },
+      {
+       "logprob": -1.6,
+       "token_id": 2
+      },
+      {
+       "logprob": -2.9,
+       "token_id": 3
+      }
+     ]
+    }
+   ]
+  },
+  "input": {
+   "content": [
+    {
+     "logprob": -7.5,
+     "token_id": 4242,
+     "top_logprobs": [
+      {
+       "logprob": -0.3,
+       "token_id": 1
+      },
+      {
+       "logprob": -1.6,
+       "token_id": 2
+      },
+      {
+       "logprob": -2.9,
+       "token_id": 3
+      }
+     ]
+    }
+   ]
+  },
+  "name": "scelto_fuori_topk"
+ },
+ {
+  "error": "ValueError: Delta magnitude exceeds int16 bounds",
+  "input": {
+   "content": [
+    {
+     "logprob": -0.01,
+     "token_id": 1,
+     "top_logprobs": [
+      {
+       "logprob": -0.01,
+       "token_id": 1
+      },
+      {
+       "logprob": -40.0,
+       "token_id": 2
+      }
+     ]
+    }
+   ]
+  },
+  "name": "sotto_limite_int16"
+ },
+ {
+  "base64": "H4sIAAAAAAAC/2NiZWBknPMfSDJf+QcApYdNsA0AAAA=",
+  "binary_hex": "02050001019cff05000103d4fe",
+  "decoded": {
+   "content": [
+    {
+     "logprob": -0.1,
+     "token_id": 1,
+     "top_logprobs": [
+      {
+       "logprob": -0.1,
+       "token_id": 1
+      }
+     ]
+    },
+    {
+     "logprob": -0.3,
+     "token_id": 3,
+     "top_logprobs": [
+      {
+       "logprob": -0.3,
+       "token_id": 3
+      }
+     ]
+    }
+   ]
+  },
+  "input": {
+   "content": [
+    {
+     "logprob": -0.1,
+     "token_id": 1,
+     "top_logprobs": [
+      {
+       "logprob": -0.1,
+       "token_id": 1
+      }
+     ]
+    },
+    {
+     "logprob": -0.2,
+     "token_id": 2,
+     "top_logprobs": []
+    },
+    {
+     "logprob": -0.3,
+     "token_id": 3,
+     "top_logprobs": [
+      {
+       "logprob": -0.3,
+       "token_id": 3
+      }
+     ]
+    }
+   ]
+  },
+  "name": "posizione_vuota"
+ }
+]

@@ -1,0 +1,12 @@
+[package]
+name = "publicompute-llama-sys"
+version = "0.1.1"
+description = "Bindings for the dynamically linked llama.cpp engine"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+links = "llama"
+build = "build.rs"
+
+[build-dependencies]
+bindgen = "0.71"

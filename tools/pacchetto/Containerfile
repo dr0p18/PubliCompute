@@ -1,0 +1,15 @@
+# Use a glibc baseline that lets the packaged binaries run on supported Linux distributions.
+FROM docker.io/nvidia/cuda:12.8.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake ninja-build git ca-certificates curl pkg-config \
+        patchelf zstd libclang-dev clang protobuf-compiler \
+        libssl-dev libcurl4-openssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the workspace toolchain through rustup so compilation uses the required Rust version.
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.91.0
+
+WORKDIR /work

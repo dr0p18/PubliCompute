@@ -1,0 +1,55 @@
+[package]
+name = "publicompute-agent"
+version = "0.1.1"
+description = "Registers a node and runs inference assignments"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "publicompute-agent"
+path = "src/main.rs"
+
+# Standalone engine fixture for managed-mode tests. Keep it out of release packages.
+[[bin]]
+name = "fake-llama-server"
+path = "src/bin/fake_llama_server.rs"
+
+# Standalone stage fixture for process supervision tests. Keep it out of release packages.
+[[bin]]
+name = "fake-stage"
+path = "src/bin/fake_stage.rs"
+
+[dependencies]
+publicompute-proto = { path = "../proto/rust" }
+prost.workspace = true
+prost-types.workspace = true
+bytes.workspace = true
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "fs", "process", "net", "io-util"] }
+quinn = "0.11.9"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "logging"] }
+rcgen = "0.14.7"
+sha2 = "0.10.9"
+hex = "0.4.3"
+anyhow = "1.0.104"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+clap = { version = "4.5.61", features = ["derive", "env"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+reqwest = { version = "0.13.3", default-features = false, features = ["json"] }
+sysinfo = "0.36.1"
+rand = "0.9.5"
+flate2 = "1.1.10"
+# Chain links use a configured relay without discovery or a default relay.
+iroh = "1.4.1"
+
+# Process-group signals let the supervisor stop engine descendants on Unix.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Sign fixture capabilities with the same Ed25519 scheme used by stage authentication.
+ring = "0.17.14"
+# Run a relay in-process so bridge tests need no external service.
+iroh-relay = { version = "1.4.1", features = ["test-utils", "server"] }
