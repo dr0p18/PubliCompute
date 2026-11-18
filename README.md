@@ -116,10 +116,10 @@ to another account.
 
 ```sh
 publicompute status            # what your card is doing, credits, Chain
-publicompute use <model>       # pick the model you want to use for free
+publicompute use <model>       # pick the model you want to use
 publicompute farm              # FARM mode: the scheduler decides
-publicompute pause             # leave the network (gaming, night...)
-publicompute start             # come back
+publicompute pause             # leave the network
+publicompute start             # resume
 publicompute uninstall         # remove everything, keep or delete the models
 ```
 
