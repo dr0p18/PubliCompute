@@ -29,7 +29,7 @@ This project would not exist without **llama.cpp and GGML**: read the
 
 **Beta, by invitation.** Get your invite code by registering on
 [publicompute.com](https://publicompute.com). Things change fast, and the network is small: expect
-rough edges, and tell us about them.
+rough edges, and tell us about them in [GitHub issues](https://github.com/dr0p18/PubliCompute/issues).
 
 ## Supported hardware
 
