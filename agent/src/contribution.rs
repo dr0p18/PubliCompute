@@ -97,6 +97,18 @@ impl Contribution {
         self.tx.borrow().clone()
     }
 
+    /// Only one GGUF is installed. Carry a saved USE preference over to it
+    /// when an upgrade changes the model or its quantization.
+    pub fn align_model(&self, selected: ModelSelection) -> Result<()> {
+        let saved = self.preference();
+        if saved.modo == PreferenceMode::Usage && saved.model.as_ref() != Some(&selected) {
+            let preference = self.imposta(PreferenceMode::Usage, Some(selected.clone()))?;
+            tracing::info!(model = %selected.id, quantization = %selected.quant, revision = preference.revision,
+                "updated the saved contribution model");
+        }
+        Ok(())
+    }
+
     /// Subscribe to preference changes so the session can publish them.
     pub fn subscribe(&self) -> watch::Receiver<Preference> {
         self.tx.subscribe()
@@ -106,7 +118,8 @@ impl Contribution {
     pub fn imposta(&self, modo: PreferenceMode, model: Option<ModelSelection>) -> Result<Preference> {
         let model = if modo == PreferenceMode::Free { None } else { model };
         let previous = self.tx.borrow().revision;
-        let p = Preference { modo, model, revision: (previous + 1).max(unix_millis()) };
+        let revision = previous.checked_add(1).context("contribution revision exhausted")?.max(unix_millis());
+        let p = Preference { modo, model, revision };
         write(&self.file, &p)?;
         self.tx.send_replace(p.clone());
         Ok(p)
@@ -222,6 +235,32 @@ mod tests {
         let new = Contribution::open(&d, usage("qwen")).unwrap();
         assert!(new.preference().revision > ultima, "{} does not exceed {ultima}", new.preference().revision);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn aligns_saved_use_and_preserves_free() {
+        let d = temp_dir("align");
+        let c = Contribution::open(&d, usage("qwen-9b")).unwrap();
+        let old = c.preference();
+        let medium = ModelSelection { id: "qwen-medium".into(), quant: "Q4_K_M".into() };
+        c.align_model(medium.clone()).unwrap();
+        let aligned = c.preference();
+        assert_eq!(aligned.model.as_ref(), Some(&medium));
+        assert!(aligned.revision > old.revision);
+
+        let chosen = ModelSelection { quant: "Q8_0".into(), ..medium };
+        c.align_model(chosen.clone()).unwrap();
+        let reopened = Contribution::open(&d, usage("qwen-9b")).unwrap();
+        assert_eq!(reopened.preference().model.as_ref(), Some(&chosen));
+        assert!(reopened.preference().revision > aligned.revision);
+        let mut saved = reopened.preference();
+        reopened.align_model(chosen.clone()).unwrap();
+        assert_eq!(reopened.preference(), saved);
+
+        saved = reopened.imposta(PreferenceMode::Free, None).unwrap();
+        reopened.align_model(chosen).unwrap();
+        assert_eq!(reopened.preference(), saved);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

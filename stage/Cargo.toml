@@ -1,6 +1,6 @@
 [package]
 name = "publicompute-stage"
-version = "0.1.1"
+version = "0.1.2"
 description = "Runs one layer range in a distributed inference chain"
 edition.workspace = true
 license.workspace = true

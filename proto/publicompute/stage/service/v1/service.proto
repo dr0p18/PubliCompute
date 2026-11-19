@@ -1,4 +1,4 @@
-// Local TCP interface between the node agent and the head in service mode.
+// Local interface between the node agent and the head in service mode.
 // Each frame carries one message prefixed by its varint length. Requests
 // enter the head's admission queue and stream back recorded tokens until
 // Done. Losing the agent connection cancels the requests attached to it.
@@ -111,10 +111,13 @@ message FromAgent {
   }
 }
 
+message Ready {}
+
 message FromHead {
   oneof body {
     OutputToken token = 1;
     Done done = 2;
     Status status = 3;
+    Ready ready = 4;
   }
 }

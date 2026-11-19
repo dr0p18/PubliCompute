@@ -15,6 +15,7 @@ LoadCredential=owner-token:/etc/publicompute-agent/owner-token
 ExecStart=/opt/publicompute-agent/bin/publicompute-agent \
     --engine llama --llama-mode managed \
     --llama-bin /opt/publicompute-agent/bin/llama-server \
+    --stage-bin /opt/publicompute-agent/bin/publicompute-stage \
     --model-path ${MODEL_PATH} --model-id ${MODEL_ID} --quantization ${QUANTIZATION} \
     --coordinator ${COORDINATOR} --server-name ${SERVER_NAME} --ca /etc/publicompute-agent/ca.pem \
     --data-dir /var/lib/publicompute-agent --control-socket /run/publicompute-agent/agent.sock \

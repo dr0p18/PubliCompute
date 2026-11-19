@@ -10,9 +10,7 @@
 //!
 //! Reconnect a successor on a helper thread. Until the result arrives,
 //! forwarding fails promptly so the affected conversations can recover.
-//! Reader channels stay unbounded so each peer can drain its socket even
-//! when all compute threads are waiting for a writer. Outgoing queues
-//! have write deadlines.
+//! Ingress budgets bound how much data peers can queue while compute is busy.
 //!
 //! Control messages carry cumulative timings and faults. Keep the source
 //! stage when relaying a confirmation and stamp it with the upstream link
@@ -22,15 +20,15 @@ use crate::sampling::{campiona_tagli, Tagli};
 use crate::experts::{self, RecEsperti};
 use crate::draft::{piano_mtp, MtpPlan};
 use crate::engine::{Engine, Row, MtpRow};
-use crate::slot::{EventQueue, OpenOutcome, WorkOutcome, SystemClock, Slots, Prossimo, Deadlines};
-use crate::network::{self, encode_state, msg, validate_prefill_block, validate_step, Writer};
+use crate::slot::{OpenOutcome, WorkOutcome, SystemClock, Slots, Deadlines};
+use crate::network::{self, encode_state, msg, validate_prefill_block, validate_step, IngressBudget, IngressPermit, Writer};
 use publicompute_proto::stage::{self as pb, message::Body};
 use std::collections::HashMap;
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, Receiver, SendError, Sender};
 use crate::timings::StageTimings;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -54,6 +52,7 @@ pub struct StageOptions {
     /// Exit after this many seconds without prefill or generation streams from the predecessor. It can reconnect
     /// before then.
     pub grazia_s: u64,
+    pub ingress_max_mib: usize,
     /// Expert log file. Load the `Engine` with `experts`.
     pub experts: Option<String>,
     /// Top-k log file (20 highest log probabilities for each token the tail samples).
@@ -88,16 +87,161 @@ pub struct StageOptions {
 pub const TOP_K: usize = 20;
 
 enum Event {
-    Msg(pb::Stream, pb::Message),
-    Done(pb::Stream, Option<String>),
+    Work(u64, pb::Message, IngressPermit, QueuedWork),
+    Confirmation(u32, pb::Confirmation, IngressPermit),
+    Done(IngressPermit),
     /// Predecessor opened the control stream with the epoch declared in its `Hello`.
-    Control(Writer, u32),
+    Control(Writer, u64, u32, IngressPermit),
     /// Predecessor opened a prefill or generation stream.
     NuovoFlusso,
     /// Successor's control stream closed (given epoch).
     AvantiCaduto(u32),
-    /// Result of reconnecting the successor on a separate thread (given epoch).
-    Ricollegato(Result<Forward, String>, u32),
+    /// Result of reconnecting an outgoing link on a separate thread.
+    Ricollegato(Result<Downstream, String>, u32),
+}
+
+#[derive(Clone)]
+struct EventTx {
+    tx: Sender<Event>,
+    compute: std::thread::Thread,
+}
+
+impl EventTx {
+    fn channel() -> (Self, Receiver<Event>) {
+        let (tx, rx) = channel();
+        (Self { tx, compute: std::thread::current() }, rx)
+    }
+
+    fn send(&self, event: Event) -> Result<(), SendError<Event>> {
+        self.tx.send(event)?;
+        self.compute.unpark();
+        Ok(())
+    }
+}
+
+const INGRESS_WAIT: Duration = Duration::from_secs(15);
+const FORWARD_WAIT: Duration = Duration::from_millis(100);
+const MAX_DATA_EVENTS: usize = 1024;
+const MAX_DATA_READERS: usize = 8;
+
+type Attempts = Arc<Mutex<HashMap<(u64, u32), usize>>>;
+
+struct QueuedWork {
+    attempts: Attempts,
+    keys: Vec<(u64, u32)>,
+}
+
+impl QueuedWork {
+    fn new(attempts: &Attempts, message: &pb::Message) -> Self {
+        let keys: Vec<_> = match message.body.as_ref() {
+            Some(Body::Open(open)) => vec![(open.conversation_id, open.attempt_id)],
+            Some(Body::Block(block)) => vec![(block.conversation_id, block.attempt_id)],
+            Some(Body::Close(close)) => vec![(close.conversation_id, close.attempt_id)],
+            Some(Body::Step(step)) => step.rows.iter().map(|row| (row.conversation_id, row.attempt_id)).collect(),
+            _ => Vec::new(),
+        };
+        let mut pending = attempts.lock().unwrap();
+        for &key in &keys {
+            *pending.entry(key).or_default() += 1;
+        }
+        Self { attempts: attempts.clone(), keys }
+    }
+}
+
+impl Drop for QueuedWork {
+    fn drop(&mut self) {
+        let mut pending = self.attempts.lock().unwrap();
+        for &key in &self.keys {
+            let count = pending.get_mut(&key).unwrap();
+            *count -= 1;
+            if *count == 0 {
+                pending.remove(&key);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct Upstream {
+    ready: bool,
+    downstream_epoch: u32,
+    link: u64,
+    epoch: u32,
+    failed: bool,
+    draining: bool,
+    sockets: [Option<TcpStream>; 3],
+}
+
+impl Upstream {
+    fn close(&mut self) {
+        for socket in &mut self.sockets {
+            if let Some(socket) = socket.take() {
+                let _ = socket.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    fn attach(&mut self, kind: pb::Stream, epoch: u32, socket: &TcpStream) -> Result<u64, String> {
+        if !self.ready {
+            return Err("stage link is unavailable".into());
+        }
+        let no_data = self.sockets[..2].iter().all(Option::is_none);
+        // A restarted peer can start its wire epoch from one again.
+        if kind == pb::Stream::Prefill && (epoch > self.epoch || no_data) {
+            self.close();
+            self.link += 1;
+            self.epoch = epoch;
+            self.failed = false;
+            self.draining = false;
+        }
+        let dest = &mut self.sockets[kind as usize - 1];
+        if self.failed || self.draining || epoch != self.epoch || dest.is_some() {
+            return Err("stage stream already in use or retired".into());
+        }
+        *dest = Some(socket.try_clone().map_err(|e| e.to_string())?);
+        Ok(self.link)
+    }
+
+    fn active(&self, link: u64) -> bool {
+        self.can_drain(link) && !self.draining
+    }
+
+    fn can_drain(&self, link: u64) -> bool {
+        self.ready && !self.failed && self.link == link
+    }
+
+    fn data_eof(&mut self, kind: pb::Stream, link: u64) {
+        if !self.can_drain(link) {
+            return;
+        }
+        self.sockets[kind as usize - 1] = None;
+        self.draining = true;
+        // Wake the predecessor at once. Frames already sent on either data stream
+        // may still drain until this link is replaced, including final Closes.
+        if let Some(control) = self.sockets[pb::Stream::Control as usize - 1].take() {
+            let _ = control.shutdown(Shutdown::Both);
+        }
+    }
+
+    fn fail(&mut self, link: u64) {
+        if self.link == link {
+            self.failed = true;
+            self.close();
+        }
+    }
+
+    fn control_failed(&mut self, link: u64) {
+        if self.active(link) {
+            self.fail(link);
+        }
+    }
+
+    fn downstream_lost(&mut self, epoch: u32) {
+        if self.downstream_epoch == epoch {
+            self.ready = false;
+            self.fail(self.link);
+        }
+    }
 }
 
 /// Link to the successor (intermediate only).
@@ -105,29 +249,40 @@ struct Forward {
     prefill: Writer,
     gen: Writer,
     /// Keeps the write side of the control stream open.
-    _ctl: TcpStream,
+    ctl: TcpStream,
     /// The control reader sets this to `true` as soon as the successor drops.
     caduto: Arc<AtomicBool>,
     epoch: u32,
 }
 
-fn connect_forward(address: &str, timeout: Duration, tx: &Sender<Event>, epoch: u32) -> Result<Forward, String> {
-    let (lp, wp) = network::connect(address, pb::Stream::Prefill, timeout, epoch)?;
-    let (lg, wg) = network::connect(address, pb::Stream::Generation, timeout, epoch)?;
-    let (mut lc, wc) = network::connect(address, pb::Stream::Control, timeout, epoch)?;
+enum Downstream {
+    Forward(Forward),
+    Token(Writer),
+}
+
+fn connect_forward(address: &str, timeout: Duration, tx: &EventTx, epoch: &mut u32, control_budget: Arc<IngressBudget>, upstream: Arc<Mutex<Upstream>>) -> Result<Forward, String> {
+    let [(lp, wp), (lg, wg), (mut lc, wc)] = network::connect_forward(address, timeout, epoch)?;
+    let epoch = *epoch;
+    upstream.lock().unwrap().downstream_epoch = epoch;
     let caduto = Arc::new(AtomicBool::new(false));
     let (txc, cad) = (tx.clone(), caduto.clone());
     std::thread::spawn(move || {
-        while let Ok(Some(m)) = lc.read() {
-            if txc.send(Event::Msg(pb::Stream::Control, m)).is_err() {
+        while let Ok(Some((message, permit))) = lc.read_admitted(&control_budget, INGRESS_WAIT, pb::Stream::Control, 0) {
+            let Some(Body::Confirmation(c)) = message.body else { break };
+            if c.kind == pb::AckKind::Error as i32 && !c.ok && c.conversation_id == 0 {
+                eprintln!("[stage] next stage reported a chain fault: {}", c.error);
+                break;
+            }
+            if txc.send(Event::Confirmation(epoch, c, permit)).is_err() {
                 return;
             }
         }
         cad.store(true, Ordering::SeqCst);
+        upstream.lock().unwrap().downstream_lost(epoch);
         let _ = txc.send(Event::AvantiCaduto(epoch));
     });
     drop((lp, lg));
-    Ok(Forward { prefill: Writer::new(wp, "forward-prefill"), gen: Writer::new(wg, "forward-generation"), _ctl: wc, caduto, epoch })
+    Ok(Forward { prefill: Writer::new(wp, "forward-prefill"), gen: Writer::new(wg, "forward-generation"), ctl: wc, caduto, epoch })
 }
 
 
@@ -205,19 +360,22 @@ struct Stage {
     ctx_per_slot: u32,
     campion: HashMap<u64, (f32, u64, Tagli)>,
     conferme: Option<Writer>,
+    upstream: Arc<Mutex<Upstream>>,
     /// Predecessor's control stream epoch (from `Hello`), stamped on outgoing `Confirmation` messages.
     epoca_ingresso: u32,
+    link_ingresso: u64,
     /// Stage position in the chain (0 = unspecified).
     index: u32,
     next: Option<Forward>,
-    /// Successor address, link epoch and last failed reconnect attempt (intermediate only).
-    indirizzo_avanti: Option<String>,
+    /// Address and epoch of the outgoing link, to the successor or to the head.
+    indirizzo_avanti: String,
     epoca_avanti: u32,
     avanti_fallito: bool,
     /// A thread is already reconnecting the successor.
     ricollegando: bool,
     timeout: Duration,
-    tx: Sender<Event>,
+    tx: EventTx,
+    control_budget: Arc<IngressBudget>,
     token: Option<Writer>,
     esp: Vec<RecEsperti>,
     registra_top: bool,
@@ -243,44 +401,61 @@ struct Stage {
 /// Minimum interval between timing snapshots sent to the head while active.
 const TEMPI_OGNI: Duration = Duration::from_secs(1);
 
-fn accept_streams(l: std::net::TcpListener, tx: Sender<Event>) {
-    network::accept(l, move |f, mut lett, mut w| match f {
-        pb::Stream::Prefill | pb::Stream::Generation => {
-            if network::ack_ok(&mut w).is_err() {
-                return;
-            }
-            let _ = tx.send(Event::NuovoFlusso);
-            loop {
-                match lett.read() {
-                    Ok(Some(m)) => {
-                        if tx.send(Event::Msg(f, m)).is_err() {
+struct WorkIngress {
+    budget: Arc<IngressBudget>,
+    attempts: Attempts,
+    n_batch: usize,
+    wait: Duration,
+}
+
+fn accept_streams(
+    l: std::net::TcpListener, tx: EventTx, work_tx: EventTx,
+    upstream: Arc<Mutex<Upstream>>, work: WorkIngress,
+) {
+    let data_readers = IngressBudget::new(0, MAX_DATA_READERS);
+    let control_readers = IngressBudget::new(0, 4);
+    network::accept(l, move |f, mut lett, mut w| {
+        let epoch = lett.epoca_hello;
+        match f {
+            pb::Stream::Prefill | pb::Stream::Generation => {
+                let Ok(reader) = data_readers.reserve(0, Duration::ZERO) else { return };
+                let Ok(link) = upstream.lock().unwrap().attach(f, epoch, &w) else { return };
+                if network::ack_ok(&mut w).is_err() {
+                    upstream.lock().unwrap().fail(link);
+                    return;
+                }
+                let _ = tx.send(Event::NuovoFlusso);
+                loop {
+                    match lett.read_admitted(&work.budget, work.wait, f, work.n_batch) {
+                        Ok(Some((message, permit))) => {
+                            let work = QueuedWork::new(&work.attempts, &message);
+                            if work_tx.send(Event::Work(link, message, permit, work)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => {
+                            upstream.lock().unwrap().data_eof(f, link);
+                            break;
+                        }
+                        Err(error) => {
+                            upstream.lock().unwrap().fail(link);
+                            eprintln!("[stage] stream {} closed with error: {error}", network::stream_name(f));
                             break;
                         }
                     }
-                    Ok(None) => {
-                        let _ = tx.send(Event::Done(f, None));
-                        break;
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Event::Done(f, Some(e)));
-                        break;
-                    }
                 }
+                let _ = w.shutdown(Shutdown::Both);
+                // Start the reconnect grace after this reader's queued work drains.
+                let _ = work_tx.send(Event::Done(reader));
             }
+            pb::Stream::Control => {
+                let Ok(reader) = control_readers.reserve(0, Duration::ZERO) else { return };
+                let Ok(link) = upstream.lock().unwrap().attach(f, epoch, &w) else { return };
+                let _ = tx.send(Event::Control(Writer::new(w, "conferme"), link, epoch, reader));
+            }
+            altro => eprintln!("[stage] unexpected stream {} on this listener", network::stream_name(altro)),
         }
-        pb::Stream::Control => {
-            let Ok(w2) = w.try_clone() else { return };
-            let sc = Writer::new(w2, "conferme");
-            let _ = tx.send(Event::Control(sc, lett.epoca_hello));
-            let _ = network::ack_ok(&mut w);
-        }
-        altro => eprintln!("[stage] unexpected stream {} on this listener", network::stream_name(altro)),
     });
-}
-
-/// Send on the control stream if present. Return `Err` if missing or down.
-fn send_control(c: Option<&Writer>, m: &pb::Message) -> Result<(), String> {
-    c.ok_or_else(|| "control stream is disconnected".to_string())?.send(m)
 }
 
 impl Stage {
@@ -297,7 +472,8 @@ impl Stage {
             epoch: self.epoca_ingresso,
             ..Default::default()
         }));
-        if let Err(e) = send_control(self.conferme.as_ref(), &m) {
+        if let Err(e) = self.send_control(&m, FORWARD_WAIT) {
+            self.upstream.lock().unwrap().control_failed(self.link_ingresso);
             eprintln!("[stage] could not send Confirmation for conversation {conv}, attempt {att} (ok={ok}, error=\"{error}\"): {e}");
         }
     }
@@ -307,18 +483,31 @@ impl Stage {
         self.confirmation(pb::AckKind::Error, conv, att, false, &text);
     }
 
-    /// Chain fault: error `Confirmation` without a conversation. The head restarts all conversations.
-    fn errore_catena(&self, text: &str) {
-        eprintln!("[stage] chain fault: {text}");
-        self.confirmation(pb::AckKind::Error, 0, 0, false, text);
+    fn send_control(&self, m: &pb::Message, wait: Duration) -> Result<(), String> {
+        let upstream = self.upstream.lock().unwrap();
+        if !upstream.can_drain(self.link_ingresso) {
+            return Err("upstream link retired".into());
+        }
+        if upstream.draining {
+            return Ok(());
+        }
+        drop(upstream);
+        self.conferme.as_ref().ok_or("control stream is disconnected")?.send_with_wait(m, wait)
     }
 
-    /// Forward to the successor (intermediate only; the tail has none). Network wait is bounded by the
-    /// socket write timeout. If the link is missing or down, start a reconnect thread (`begin_reconnect`)
-    /// and fail immediately, so the caller can return a clean error to affected conversations
-    /// without blocking compute for `timeout`.
+    fn send_token(&self, token: pb::Token) -> Result<(), String> {
+        let writer = self.token.as_ref().ok_or("no connection to the head")?;
+        if let Err(e) = writer.send_with_wait(&msg(Body::Token(token)), FORWARD_WAIT) {
+            writer.abort();
+            self.upstream.lock().unwrap().downstream_lost(self.epoca_avanti);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Queue output to the successor while leaving compute time for control and slot expiry.
     fn forward(&mut self, gen: bool, m: pb::Message) -> Result<(), String> {
-        if self.indirizzo_avanti.is_none() {
+        if self.role == Role::Tail {
             return Ok(());
         }
         if self.next.as_ref().map_or(true, |a| a.caduto.load(Ordering::SeqCst)) {
@@ -326,7 +515,7 @@ impl Stage {
             return Err("reconnecting to the next stage".into());
         }
         let a = self.next.as_ref().ok_or("no downstream connection")?;
-        match if gen { a.gen.send(&m) } else { a.prefill.send(&m) } {
+        match if gen { a.gen.send_with_wait(&m, FORWARD_WAIT) } else { a.prefill.send_with_wait(&m, FORWARD_WAIT) } {
             Ok(()) => Ok(()),
             Err(e) => {
                 a.caduto.store(true, Ordering::SeqCst);
@@ -344,39 +533,59 @@ impl Stage {
         self.forward(true, m)
     }
 
-    /// Start a thread to reconnect the successor if there is none. Its result arrives as
-    /// `Evento::Ricollegato`. The first attempt waits up to `timeout`. After a failure, try for only 2 s,
-    /// since each unsendable message would start a new attempt.
+    /// Reopen upstream handshakes only after the outgoing link is ready.
     fn begin_reconnect(&mut self) {
-        let Some(ind) = self.indirizzo_avanti.clone() else { return };
         if self.ricollegando {
             return;
         }
         self.ricollegando = true;
-        self.next = None; // The detached writers exit when their queues or sockets close.
+        self.upstream.lock().unwrap().downstream_lost(self.epoca_avanti);
+        if let Some(old) = self.next.take() {
+            let _ = old.ctl.shutdown(Shutdown::Both);
+            old.prefill.abort();
+            old.gen.abort();
+        }
+        if let Some(token) = self.token.take() {
+            token.abort();
+        }
+        let ind = self.indirizzo_avanti.clone();
         let timeout = if self.avanti_fallito { Duration::from_secs(2) } else { self.timeout };
-        eprintln!("[stage] reconnecting to stage {ind} in the background for up to {} s", timeout.as_secs());
+        eprintln!("[stage] reconnecting to {ind} in the background for up to {} s", timeout.as_secs());
         self.epoca_avanti += 1;
-        let (tx, epoch) = (self.tx.clone(), self.epoca_avanti);
+        let (tx, mut epoch) = (self.tx.clone(), self.epoca_avanti);
+        let control_budget = self.control_budget.clone();
+        let upstream = self.upstream.clone();
+        upstream.lock().unwrap().downstream_epoch = epoch;
+        let (role, mtp) = (self.role, self.m.ha_mtp());
         std::thread::spawn(move || {
-            let r = connect_forward(&ind, timeout, &tx, epoch);
+            let r = match role {
+                Role::Middle => connect_forward(&ind, timeout, &tx, &mut epoch, control_budget, upstream).map(Downstream::Forward),
+                Role::Tail => network::connect_tokens(&ind, timeout, epoch, mtp).map(|(_, w)| Downstream::Token(Writer::new(w, "token"))),
+            };
             let _ = tx.send(Event::Ricollegato(r, epoch));
         });
     }
 
-    fn ricollegato(&mut self, r: Result<Forward, String>, epoch: u32) {
+    fn ricollegato(&mut self, r: Result<Downstream, String>, epoch: u32) {
         self.ricollegando = false;
+        self.epoca_avanti = epoch;
         match r {
-            Ok(a) => {
+            Ok(Downstream::Forward(a)) => {
+                self.upstream.lock().unwrap().ready = !a.caduto.load(Ordering::SeqCst);
                 self.next = Some(a);
-                self.avanti_fallito = false;
-                eprintln!("[stage] reconnected to the next stage (epoch {epoch})");
+            }
+            Ok(Downstream::Token(writer)) => {
+                self.token = Some(writer);
+                self.upstream.lock().unwrap().ready = true;
             }
             Err(e) => {
                 self.avanti_fallito = true;
-                self.errore_catena(&format!("next stage unreachable: {e}"));
+                eprintln!("[stage] outgoing link unreachable: {e}");
+                return;
             }
         }
+        self.avanti_fallito = false;
+        eprintln!("[stage] reconnected outgoing link (epoch {epoch})");
     }
 
     /// Send timing snapshot to the head. Use `forza` at end of run. Otherwise send at most once per second and
@@ -397,16 +606,13 @@ impl Stage {
             ..Default::default()
         }));
         // Best effort: if control is missing, the next cumulative snapshot catches up.
-        let _ = send_control(self.conferme.as_ref(), &m);
+        let _ = self.send_control(&m, Duration::ZERO);
     }
 
     /// Empty reply for a round with no computation. The head still expects a reply for the round.
     fn giro_vuoto(&mut self, p: &pb::Step) {
         let r = if self.role == Role::Tail {
-            match &self.token {
-                Some(t) => t.send(&msg(Body::Token(pb::Token { group_id: p.group_id, group_round: p.group_round, prefill: false, rows: vec![], stage: self.index }))),
-                None => Err("no connection to the head".into()),
-            }
+            self.send_token(pb::Token { group_id: p.group_id, group_round: p.group_round, prefill: false, rows: vec![], stage: self.index })
         } else {
             self.forward_generation(msg(Body::Step(pb::Step { rows: vec![], state: vec![], ..p.clone() })))
         };
@@ -495,7 +701,7 @@ impl Stage {
     }
 
     /// A `PrefillBlock` error fails only its conversation (error `Confirmation`), so the stage stays up.
-    fn block(&mut self, b: pb::PrefillBlock) -> Result<(), String> {
+    fn block(&mut self, mut b: pb::PrefillBlock) -> Result<(), String> {
         let (conv, att) = (b.conversation_id, b.attempt_id);
         // Check shape before touching the slot so a malformed block cannot advance the expected position.
         let formato_ok = match self.formato_conv.get(&conv) {
@@ -520,13 +726,14 @@ impl Stage {
                 return Ok(());
             }
         }
-        if let Err(e) = self.blocco_calcola(&b, state) {
+        b.state = Vec::new();
+        if let Err(e) = self.blocco_calcola(b, state) {
             self.error(conv, att, e);
         }
         Ok(())
     }
 
-    fn blocco_calcola(&mut self, b: &pb::PrefillBlock, state: Vec<f32>) -> Result<(), String> {
+    fn blocco_calcola(&mut self, b: pb::PrefillBlock, state: Vec<f32>) -> Result<(), String> {
         let n = b.n_token as usize;
         let seq = self.slots.slot(b.conversation_id).map(|p| p.1).ok_or("slot disappeared")?;
         let tail = self.role == Role::Tail;
@@ -535,12 +742,8 @@ impl Stage {
         let out = self.m.run(&rows, Some(&state))?;
         match (self.role, out) {
             (Role::Middle, Some(s)) => {
-                let mut f = b.clone();
-                f.state = encode_state(&s, self.m.n_embd, self.m.stream_count, self.state_format);
-                f.n_embd = self.m.n_embd as u32;
-                f.stream_count = network::declared_stream_count(self.state_format, self.m.stream_count);
-                f.format = self.state_format as i32;
-                self.forward_prefill(msg(Body::Block(f)))?;
+                let block = network::with_prefill_state(b, &s, self.m.n_embd, self.m.stream_count, self.state_format);
+                self.forward_prefill(msg(Body::Block(block)))?;
             }
             (Role::Tail, None) => {
                 if b.last {
@@ -559,7 +762,7 @@ impl Stage {
                     }
                     // Put the verified prompt rows into the draft context. On the final block
                     // also use the first sampled token to propose its continuation.
-                    let draft = self.mtp_blocco(b, seq, Some(t as i32));
+                    let draft = self.mtp_blocco(&b, seq, Some(t as i32));
                     let tok = pb::Token {
                         group_id: b.group_id,
                         group_round: 0,
@@ -567,9 +770,9 @@ impl Stage {
                         rows: vec![pb::TokenRow { conversation_id: b.conversation_id, attempt_id: b.attempt_id, conversation_step: b.first_token_step, token: t as i32, logprob: lp, draft }],
                         stage: self.index,
                     };
-                    self.token.as_ref().ok_or("no connection to the head")?.send(&msg(Body::Token(tok)))?;
+                    self.send_token(tok)?;
                 } else {
-                    self.mtp_blocco(b, seq, None);
+                    self.mtp_blocco(&b, seq, None);
                 }
             }
             _ => return Err("engine output does not match the stage role; check the layer range".into()),
@@ -695,10 +898,9 @@ impl Stage {
             }
             (Role::Tail, None) => {
                 let out_righe = self.sample_step(&kept);
-                let invio = match &self.token {
-                    Some(t) => t.send(&msg(Body::Token(pb::Token { group_id: p.group_id, group_round: p.group_round, prefill: false, rows: out_righe, stage: self.index }))),
-                    None => Err("no connection to the head".to_string()),
-                };
+                let invio = self.send_token(pb::Token {
+                    group_id: p.group_id, group_round: p.group_round, prefill: false, rows: out_righe, stage: self.index,
+                });
                 if let Err(e) = invio {
                     for r in &kept {
                         self.error(r.conversation_id, r.attempt_id, format!("could not send tokens: {e}"));
@@ -1082,28 +1284,25 @@ impl Stage {
         Ok(())
     }
 
-    fn evento(&mut self, f: pb::Stream, m: pb::Message) -> Result<(), String> {
+    fn evento(&mut self, m: pb::Message) -> Result<(), String> {
         match m.body {
             Some(Body::Open(a)) => self.open(a),
             Some(Body::Block(b)) => self.block(b),
             Some(Body::Step(p)) => self.step(p),
             Some(Body::Close(c)) => self.close(c),
-            Some(Body::Confirmation(c)) => {
-                // Relay from successor to predecessor using our incoming control epoch, which the head
-                // knows, and the source index. Log if sending fails.
-                let mut c = c;
-                c.epoch = self.epoca_ingresso;
-                let (conv, att, da) = (c.conversation_id, c.attempt_id, c.stage);
-                if let Err(e) = send_control(self.conferme.as_ref(), &msg(Body::Confirmation(c))) {
-                    eprintln!("[stage] could not forward Confirmation from stage {da} for conversation {conv}, attempt {att}: {e}");
-                }
-                Ok(())
+            _ => Ok(()),
+        }
+    }
+
+    fn relay(&self, mut c: pb::Confirmation) {
+        c.epoch = self.epoca_ingresso;
+        let (conv, att, da) = (c.conversation_id, c.attempt_id, c.stage);
+        let wait = if c.kind == pb::AckKind::Timings as i32 { Duration::ZERO } else { FORWARD_WAIT };
+        if let Err(e) = self.send_control(&msg(Body::Confirmation(c)), wait) {
+            if !wait.is_zero() {
+                self.upstream.lock().unwrap().control_failed(self.link_ingresso);
             }
-            altro => {
-                // An unrelated message does not stop the stage.
-                eprintln!("[stage] ignoring unexpected message on stream {}: {altro:?}", network::stream_name(f));
-                Ok(())
-            }
+            eprintln!("[stage] could not forward Confirmation from stage {da} for conversation {conv}, attempt {att}: {e}");
         }
     }
 }
@@ -1116,21 +1315,32 @@ pub fn run(m: Engine, o: &StageOptions) -> Result<(), String> {
     }
     let timeout = Duration::from_secs(o.attesa_s);
     let listener = network::listen(&o.listen)?;
-    let (tx, rx) = channel::<Event>();
+    let (tx, rx) = EventTx::channel();
+    let (work_tx, work_rx) = EventTx::channel();
+    let upstream = Arc::new(Mutex::new(Upstream { downstream_epoch: 1, ..Default::default() }));
+    let ingress_bytes = o.ingress_max_mib.checked_mul(1 << 20).filter(|&bytes| bytes > 0).ok_or("invalid --ingress-max-mib")?;
+    let budget = IngressBudget::new(ingress_bytes, MAX_DATA_EVENTS);
+    let control_budget = IngressBudget::new(network::CONTROL_INGRESS_BYTES, 128);
+    let attempts = Attempts::default();
 
     let mut next = None;
     let mut token = None;
+    let mut epoca_avanti = 1;
+    let address;
     match o.role {
         Role::Middle => {
-            let a = o.next.as_ref().ok_or("middle stage requires --next")?;
-            next = Some(connect_forward(a, timeout, &tx, 1)?);
+            address = o.next.as_ref().ok_or("middle stage requires --next")?;
+            let forward = connect_forward(address, timeout, &tx, &mut epoca_avanti, control_budget.clone(), upstream.clone())?;
+            upstream.lock().unwrap().ready = !forward.caduto.load(Ordering::SeqCst);
+            next = Some(forward);
         }
         Role::Tail => {
-            let t = o.testa_token.as_ref().ok_or("tail requires --head-token")?;
+            address = o.testa_token.as_ref().ok_or("tail requires --head-token")?;
             // Advertise draft support during the token handshake so the head can reject
             // a tail that cannot provide the configured draft source.
-            let (_l, w) = network::connect_tokens(t, timeout, 1, m.ha_mtp())?;
+            let (_l, w) = network::connect_tokens(address, timeout, 1, m.ha_mtp())?;
             token = Some(Writer::new(w, "token"));
+            upstream.lock().unwrap().ready = true;
         }
     }
     if m.ha_mtp() && o.role != Role::Tail {
@@ -1142,7 +1352,9 @@ pub fn run(m: Engine, o: &StageOptions) -> Result<(), String> {
         (None, _) => None,
     };
     let txa = tx.clone();
-    std::thread::spawn(move || accept_streams(listener, txa));
+    let reader_upstream = upstream.clone();
+    let ingress = WorkIngress { budget, attempts: attempts.clone(), n_batch: m.n_batch, wait: INGRESS_WAIT };
+    std::thread::spawn(move || accept_streams(listener, txa, work_tx, reader_upstream, ingress));
 
     let mut s = Stage {
         m,
@@ -1152,15 +1364,18 @@ pub fn run(m: Engine, o: &StageOptions) -> Result<(), String> {
         ctx_per_slot: o.ctx_per_slot,
         campion: HashMap::new(),
         conferme: None,
+        upstream,
         epoca_ingresso: 0,
+        link_ingresso: 0,
         index: o.index,
         next,
-        indirizzo_avanti: if o.role == Role::Middle { o.next.clone() } else { None },
-        epoca_avanti: 1,
+        indirizzo_avanti: address.clone(),
+        epoca_avanti,
         avanti_fallito: false,
         ricollegando: false,
         timeout,
         tx,
+        control_budget,
         token,
         esp: Vec::new(),
         registra_top: o.top.is_some(),
@@ -1185,74 +1400,112 @@ pub fn run(m: Engine, o: &StageOptions) -> Result<(), String> {
     // Open prefill/generation streams from the predecessor, and when the last one closed after seeing any.
     let (mut vivi, mut visti, mut senza_flussi_da): (i64, u64, Option<Instant>) = (0, 0, None);
     let grazia = Duration::from_secs(o.grazia_s);
-    let mut coda_ev = EventQueue::new(rx);
-    // Wait since the last work message, summing 500 ms timeouts. This includes the wait for the next step.
+    let mut last_expiry = Instant::now();
+    let mut last_reconnect = Instant::now();
+    // Wait since the last work message, including the wait for the next step.
     let mut attesa_acc = Duration::ZERO;
     let esito: Result<(), String> = loop {
         let t_att = Instant::now();
-        let r = coda_ev.prossimo(Duration::from_millis(500));
+        let next_event = || rx.try_recv().or_else(|_| work_rx.try_recv()).ok();
+        let r = next_event().or_else(|| {
+            std::thread::park_timeout(Duration::from_millis(100));
+            next_event()
+        });
         crate::timings::aggiungi(crate::timings::Fase::Attesa, t_att.elapsed());
         attesa_acc += t_att.elapsed();
         match r {
-            Prossimo::Event(Event::Control(sc, epoch)) => {
-                s.conferme = Some(sc);
-                s.epoca_ingresso = epoch;
+            Some(Event::Control(sc, link, epoch, _permit)) => {
+                if s.upstream.lock().unwrap().active(link) {
+                    s.link_ingresso = link;
+                    s.epoca_ingresso = epoch;
+                    // Install the epoch before the writer can acknowledge it to the predecessor.
+                    let ack = msg(Body::Ack(pb::HelloAck { ok: true, error: String::new() }));
+                    if sc.send_with_wait(&ack, Duration::ZERO).is_ok() {
+                        s.conferme = Some(sc);
+                    } else {
+                        s.upstream.lock().unwrap().control_failed(link);
+                    }
+                }
             }
-            Prossimo::Event(Event::NuovoFlusso) => {
+            Some(Event::NuovoFlusso) => {
                 vivi += 1;
                 visti += 1;
                 senza_flussi_da = None;
             }
-            Prossimo::Event(Event::AvantiCaduto(ep)) => {
+            Some(Event::AvantiCaduto(ep)) => {
                 if s.next.as_ref().is_some_and(|a| a.epoch == ep) {
-                    s.errore_catena("next stage closed its control stream");
+                    eprintln!("[stage] next stage closed its control stream");
                     s.begin_reconnect();
                 }
             }
-            Prossimo::Event(Event::Ricollegato(r, ep)) => s.ricollegato(r, ep),
-            Prossimo::Event(Event::Msg(f, m)) => {
-                let t0 = Instant::now();
-                let (rows, lavoro) = match &m.body {
-                    Some(Body::Step(p)) => (p.rows.len() as u32, true),
-                    Some(Body::Open(_) | Body::Block(_) | Body::Close(_)) => (0, true),
-                    _ => (0, false),
-                };
-                let step = matches!(m.body, Some(Body::Step(_)));
-                if let Err(e) = s.evento(f, m) {
-                    break Err(e);
+            Some(Event::Ricollegato(r, ep)) => {
+                if r.is_ok() && senza_flussi_da.is_some() {
+                    senza_flussi_da = Some(Instant::now());
                 }
-                if step && rows > 0 {
-                    s.timings.step(rows, attesa_acc, t0);
-                } else if lavoro {
-                    s.timings.lavoro(t0);
+                s.ricollegato(r, ep);
+            }
+            Some(Event::Confirmation(ep, c, _permit)) => {
+                if s.next.as_ref().is_some_and(|a| a.epoch == ep && !a.caduto.load(Ordering::SeqCst)) {
+                    s.relay(c);
                 }
-                if lavoro {
+            }
+            Some(Event::Work(link, m, _permit, _work)) => {
+                if s.link_ingresso != link || !s.upstream.lock().unwrap().can_drain(link) {
+                    drop((_permit, _work));
+                } else {
+                    let t0 = Instant::now();
+                    let rows = match &m.body {
+                        Some(Body::Step(p)) => p.rows.len() as u32,
+                        _ => 0,
+                    };
+                    if let Err(e) = s.evento(m) {
+                        break Err(e);
+                    }
+                    if rows > 0 {
+                        s.timings.step(rows, attesa_acc, t0);
+                    } else {
+                        s.timings.lavoro(t0);
+                    }
                     s.tempi_sporchi = true;
                     attesa_acc = Duration::ZERO;
                 }
             }
-            Prossimo::Event(Event::Done(f, err)) => {
-                if let Some(e) = err {
-                    eprintln!("[stage] stream {} closed with error: {e}", network::stream_name(f));
-                }
+            Some(Event::Done(_reader)) => {
                 vivi -= 1;
                 if vivi <= 0 && visti >= 2 {
                     senza_flussi_da.get_or_insert_with(Instant::now);
                 }
             }
-            Prossimo::Vuoto => s.send_timings(true), // Idle is a chance to publish final timings before the upstream link closes.
-            Prossimo::Chiuso => break Ok(()),
+            None if attesa_acc >= Duration::from_millis(500) => s.send_timings(true),
+            None => {}
+        }
+        let token_lost = s.token.as_ref().is_some_and(|writer| writer.failed() || !s.upstream.lock().unwrap().ready);
+        if token_lost || s.next.as_ref().is_some_and(|a| a.caduto.load(Ordering::SeqCst) || a.prefill.failed() || a.gen.failed()) {
+            s.begin_reconnect();
+        }
+        if s.avanti_fallito && last_reconnect.elapsed() >= Duration::from_millis(200) {
+            s.begin_reconnect();
+            last_reconnect = Instant::now();
+        }
+        if s.conferme.as_ref().is_some_and(Writer::failed) {
+            s.upstream.lock().unwrap().control_failed(s.link_ingresso);
+            s.conferme = None;
         }
         s.send_timings(false);
-        if senza_flussi_da.is_some_and(|t| t.elapsed() >= grazia) {
+        let grace = if s.ricollegando || s.avanti_fallito { grazia.max(timeout) } else { grazia };
+        if senza_flussi_da.is_some_and(|t| t.elapsed() >= grace) {
             break Ok(());
         }
-        // Check expiry only when the queue is empty, so a `PrefillBlock` that arrived during computation can
-        // renew its slot first (see `EventQueue`).
-        if !coda_ev.nessuno_in_attesa() {
+        if last_expiry.elapsed() < Duration::from_millis(100) {
             continue;
         }
-        for sc in s.slots.scadenze() {
+        last_expiry = Instant::now();
+        let expired = {
+            let pending = attempts.lock().unwrap();
+            s.slots.expire_except(|id, attempt| pending.contains_key(&(id, attempt)))
+        };
+        s.slots.pulisci();
+        for sc in expired {
             s.m.svuota_posto(sc.liberato.seq);
             s.m.mtp_svuota_posto(sc.liberato.seq);
             s.mtp.remove(&sc.conversation_id);
@@ -1288,6 +1541,7 @@ pub fn run(m: Engine, o: &StageOptions) -> Result<(), String> {
         s.timings.json(s.index, if s.role == Role::Tail { "tail" } else { "middle" })
     );
     if let Some(a) = s.next.take() {
+        let _ = a.ctl.shutdown(Shutdown::Both);
         a.prefill.terminate();
         a.gen.terminate();
     }
@@ -1333,9 +1587,123 @@ mod test {
     }
 
     #[test]
-    fn confirmation_without_control_stream_returns_error() {
-        let m = msg(Body::Confirmation(pb::Confirmation { kind: pb::AckKind::Error as i32, conversation_id: 1, attempt_id: 1, ok: false, error: "x".into(), ..Default::default() }));
-        let e = send_control(None, &m).unwrap_err();
-        assert!(e.contains("control"), "{e}");
+    fn saturated_reader_closes_control_while_work_is_still_queued() {
+        check_data_loss(false);
+    }
+
+    #[test]
+    fn data_eof_retires_control_and_preserves_queued_work() {
+        check_data_loss(true);
+    }
+
+    fn check_data_loss(eof: bool) {
+        let listener = network::listen("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = EventTx::channel();
+        let (work_tx, work_rx) = EventTx::channel();
+        let upstream = Arc::new(Mutex::new(Upstream { ready: true, ..Default::default() }));
+        let ingress = WorkIngress {
+            budget: IngressBudget::new(1024, 1),
+            attempts: Attempts::default(),
+            n_batch: 4,
+            wait: Duration::from_millis(20),
+        };
+        let reader_upstream = upstream.clone();
+        std::thread::spawn(move || accept_streams(listener, tx, work_tx, reader_upstream, ingress));
+
+        let timeout = Duration::from_secs(2);
+        let (_read, mut prefill) = network::connect(&address, pb::Stream::Prefill, timeout, 1).unwrap();
+        let _generation = network::connect(&address, pb::Stream::Generation, timeout, 1).unwrap();
+        let mut control = TcpStream::connect(&address).unwrap();
+        network::write_sync(&mut control, &msg(Body::Hello(pb::Hello {
+            protocol_major: network::WIRE_VERSION.0,
+            protocol_minor: network::WIRE_VERSION.1,
+            stream: pb::Stream::Control as i32,
+            epoch: 1,
+            mtp: false,
+        }))).unwrap();
+        loop {
+            if let Event::Control(writer, link, _, _) = rx.recv_timeout(timeout).unwrap() {
+                writer.send_with_wait(&msg(Body::Ack(pb::HelloAck { ok: true, error: String::new() })), Duration::ZERO).unwrap();
+                let raw = control.try_clone().unwrap();
+                let mut reader = network::Reader::new(control);
+                raw.set_read_timeout(Some(timeout)).unwrap();
+                assert!(matches!(reader.read().unwrap().unwrap().body, Some(Body::Ack(_))));
+
+                let open = msg(Body::Open(pb::Open { conversation_id: 1, attempt_id: 1, ..Default::default() }));
+                network::write_sync(&mut prefill, &open).unwrap();
+                if eof {
+                    prefill.shutdown(Shutdown::Write).unwrap();
+                } else {
+                    network::write_sync(&mut prefill, &open).unwrap();
+                }
+                assert!(reader.read().unwrap().is_none());
+                {
+                    let upstream = upstream.lock().unwrap();
+                    assert!(!upstream.active(link));
+                    assert_eq!(upstream.can_drain(link), eof);
+                }
+                assert!(matches!(work_rx.try_recv().unwrap(), Event::Work(_, _, _, _)));
+                if eof {
+                    assert!(matches!(work_rx.recv_timeout(timeout).unwrap(), Event::Done(_)));
+                }
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn reconnect_retries_all_streams_after_a_partial_handshake() {
+        let listener = network::listen("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let peer = std::thread::spawn(move || {
+            let mut upstream = Upstream { ready: true, ..Default::default() };
+            let accept = || network::read_hello(listener.accept().unwrap().0).unwrap();
+            let (stream, reader, mut socket) = accept();
+            assert_eq!(stream, pb::Stream::Prefill);
+            let old = upstream.attach(stream, reader.epoca_hello, &socket).unwrap();
+            network::ack_ok(&mut socket).unwrap();
+
+            let (stream, reader, socket) = accept();
+            assert_eq!(stream, pb::Stream::Generation);
+            assert_eq!(reader.epoca_hello, 1);
+            upstream.fail(old);
+            socket.shutdown(Shutdown::Both).unwrap();
+
+            for expected in [pb::Stream::Prefill, pb::Stream::Generation, pb::Stream::Control] {
+                let (stream, reader, mut socket) = accept();
+                assert_eq!(stream, expected);
+                assert_eq!(reader.epoca_hello, 2);
+                assert_ne!(upstream.attach(stream, reader.epoca_hello, &socket).unwrap(), old);
+                network::ack_ok(&mut socket).unwrap();
+            }
+        });
+        let mut epoch = 1;
+        let _streams = network::connect_forward(&address, Duration::from_secs(2), &mut epoch).unwrap();
+        assert_eq!(epoch, 2);
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn retired_data_stream_cannot_close_new_control_stream() {
+        let listener = network::listen("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = TcpStream::connect(address).unwrap();
+        let (control, _) = listener.accept().unwrap();
+        let mut upstream = Upstream { ready: true, downstream_epoch: 7, ..Default::default() };
+        let old = upstream.attach(pb::Stream::Prefill, 2, &control).unwrap();
+        upstream.data_eof(pb::Stream::Prefill, old);
+        let new = upstream.attach(pb::Stream::Prefill, 1, &control).unwrap();
+        upstream.attach(pb::Stream::Control, 1, &control).unwrap();
+        assert_ne!(old, new);
+        upstream.data_eof(pb::Stream::Prefill, old);
+        upstream.fail(old);
+        upstream.downstream_lost(6);
+        assert!(upstream.active(new));
+        upstream.downstream_lost(7);
+        assert!(!upstream.active(new));
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(std::io::Read::read(&mut &peer, &mut [0]).unwrap(), 0);
+        assert!(upstream.attach(pb::Stream::Prefill, 2, &control).is_err());
     }
 }

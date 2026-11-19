@@ -15,7 +15,7 @@ use prost_types::Timestamp;
 use publicompute_proto::{
     common::ModelRef,
     node::{
-        coordinator_message, lease_update, node_message, work_offer, work_stream_coordinator_message, work_stream_node_message, request_result,
+        coordinator_message, lease_update, node_message, stage_status::State as StageState, work_offer, work_stream_coordinator_message, work_stream_node_message, request_result,
         AgentFeature, Availability, AvailabilityUpdate, Completion, ContributionStatus, ContributionSummary, CoordinatorMessage,
         GoodbyeReason, Heartbeat, Hello, InstalledModel, LeaseAccept, Leaving, ModelDirective, ModelDirectiveStatus, RejectReason,
         LeaseComplete, LeaseProgress, LeaseReject, LeaseRejectReason, LeaseRelease, LeaseReleaseReason, LeaseRevokeReason, LogicCommitment,
@@ -33,7 +33,9 @@ use crate::{
     economics::{self, HostCosts},
     engine::{
         classify,
+        output::{wait_for_saturation, OutputStalled},
         progress::{Phase, Progress},
+        stages::delta_channel,
         supervisor::{EngineState, LeaseGuard, LeaseOutcome, Supervisor},
         Engine, ErrorClass,
     },
@@ -51,6 +53,8 @@ pub struct NodeConfig {
     pub sup: Arc<Supervisor>,
     /// Stage process manager, when this agent runs a stage.
     pub stages: Option<Arc<crate::stages::Stages>>,
+    /// The second engine on a node that can switch from managed llama-server.
+    pub stage_engine: Option<Arc<Engine>>,
     /// Region hint sent in the handshake. An empty value leaves it unset.
     pub region: String,
     /// Measured NAT classification sent in the handshake.
@@ -102,12 +106,27 @@ fn inventory(cfg: &NodeConfig, engine: &Engine) -> ModelInventory {
         models: vec![InstalledModel {
             model: Some(cfg.model.clone()),
             status: ModelStatus::Ready as i32,
-            loaded: true,
+            loaded: !matches!(engine, Engine::Stages(_)) && single_loaded(cfg),
             size_bytes: dimensione_modello(&cfg.model_path),
             slots: capacita(cfg, engine) as u32,
             downloaded_bytes: 0,
         }],
     }
+}
+
+fn single_loaded(cfg: &NodeConfig) -> bool {
+    !cfg.gpu.unavailable() && matches!(cfg.sup.state(), EngineState::Ready | EngineState::Busy | EngineState::Settling)
+}
+
+fn features(cfg: &NodeConfig) -> Vec<i32> {
+    let mut features = vec![AgentFeature::Contribution as i32];
+    if cfg.stages.is_some() {
+        features.push(AgentFeature::Stages as i32);
+    }
+    if cfg.stage_engine.is_some() {
+        features.push(AgentFeature::EngineSwitch as i32);
+    }
+    features
 }
 
 #[derive(Debug)]
@@ -135,6 +154,7 @@ struct LeaseCounters {
 
 struct ActiveLease {
     id: String,
+    stage: bool,
     progress: Arc<Mutex<LeaseCounters>>,
     /// Concurrent chats have independent progress. A lease without its own
     /// counter uses the engine's shared counter.
@@ -246,10 +266,12 @@ async fn run_inner(
     let inv_iniziale = inventory(cfg, &engine);
     let mut gpu_rx = cfg.gpu.device_rx();
     let mut loss_generation = gpu_rx.borrow_and_update().loss_generation;
+    // A reconnect can follow a release while the single engine is still settling.
+    let mut waiting_for_single = cfg.stage_engine.is_some();
     let mut last_avail = if cfg.gpu_profile_missing() {
         Availability::PausedByHost
     } else {
-        availability_now(cfg.sup.state(), &cfg.live, &cfg.gpu)
+        session_availability(cfg, cfg.sup.state(), waiting_for_single)
     };
     out.send(node_message::Body::Hello(Hello {
         protocol_version: Some(PROTOCOL_VERSION),
@@ -261,7 +283,7 @@ async fn run_inner(
         nat_class: cfg.nat_class.clone(),
         iroh_node_id: cfg.iroh_node_id.clone(),
         contribution: Some(cfg.contribution.to_proto(&modelli_di(&inv_iniziale))),
-        features: vec![AgentFeature::Contribution as i32],
+        features: features(cfg),
     }))
     .await?;
 
@@ -333,181 +355,239 @@ async fn run_inner(
     if let Some(s) = &cfg.stages {
         s.connect_peer(stage_tx);
     }
-
-    let result = loop {
-        let generation = gpu_rx.borrow_and_update().loss_generation;
-        let released = gpu_loss_leases(generation, &mut loss_generation, &mut lease, &cfg.live);
-        if cfg.gpu_profile_missing() {
-            if cfg.sup.state() == EngineState::Ready {
-                // Reconnect to refresh the coordinator inventory because the hardware profile is sent in Hello.
-                break Ok(SessionEnd::GpuReady);
+    // Keep cleanup outside this block so control-stream errors also stop the stage.
+    let result = async {
+        loop {
+            let generation = gpu_rx.borrow_and_update().loss_generation;
+            if let Some(s) = &cfg.stages {
+                if generation != loss_generation {
+                    s.release_current("selected GPU unavailable");
+                } else if cfg.live.is_paused() {
+                    s.release_current("agent paused by host");
+                }
             }
-        } else {
-            sync_availability(&out, &cfg.sup, &cfg.live, &cfg.gpu, &mut last_avail).await?;
-        }
-        send_releases(&out, released, LeaseReleaseReason::EngineFailure).await?;
-        let scadenza_uscita = output
-            .map(|t| tokio::time::Instant::from_std(t + ATTESA_USCITA))
-            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
-        tokio::select! {
-            m = in_rx.recv() => {
-                let Some(m) = m else { break Err(anyhow::anyhow!("control stream closed")) };
-                match m.body {
-                    Some(coordinator_message::Body::WorkOffer(offer)) => {
-                        handle_offer(conn, cfg, &engine, &shared, &out, &done_tx, &mut lease, draining || output.is_some(), offer).await?;
-                        cfg.live.set_leases(lease.attive() as u32);
-                    }
-                    Some(coordinator_message::Body::LeaseUpdate(u)) => {
-                        let Some(l) = lease.map.get_mut(&u.lease_id) else { continue };
-                        match u.status {
-                            Some(lease_update::Status::RenewedUntil(_)) => {
-                                if let Some(c) = l.confirm.take() {
-                                    let _ = c.send(());
+            let released = gpu_loss_leases(generation, &mut loss_generation, &mut lease, &cfg.live);
+            let inv = inventory(cfg, &engine);
+            if inv != ultimo_inventario {
+                out.send(node_message::Body::ModelInventory(inv.clone())).await?;
+                ultimo_inventario = inv;
+            }
+            if cfg.gpu_profile_missing() {
+                if cfg.sup.state() == EngineState::Ready {
+                    // Reconnect to refresh the coordinator inventory because the hardware profile is sent in Hello.
+                    break Ok(SessionEnd::GpuReady);
+                }
+            } else {
+                // Let a terminal StageStatus reach the scheduler before the
+                // availability change can dissolve the chain on its own.
+                let state = match (cfg.stages.as_ref().and_then(|s| s.switch_state()), cfg.sup.state()) {
+                    (Some(EngineState::Parked), _) => EngineState::Parked,
+                    (Some(EngineState::Recovering), EngineState::Ready) => EngineState::Recovering,
+                    (_, state) => state,
+                };
+                let availability = session_availability(cfg, state, waiting_for_single);
+                send_availability(&out, availability, &mut last_avail).await?;
+                if availability == Availability::Idle {
+                    waiting_for_single = false;
+                }
+            }
+            send_releases(&out, released, LeaseReleaseReason::EngineFailure).await?;
+            if draining && lease.is_empty() {
+                out.send(goodbye(GoodbyeReason::HostStopped)).await?;
+                break Ok(SessionEnd::Shutdown);
+            }
+            let scadenza_uscita = output
+                .map(|t| tokio::time::Instant::from_std(t + ATTESA_USCITA))
+                .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
+            tokio::select! {
+                m = in_rx.recv() => {
+                    let Some(m) = m else { break Err(anyhow::anyhow!("control stream closed")) };
+                    match m.body {
+                        Some(coordinator_message::Body::WorkOffer(offer)) => {
+                            let engine = if cfg.stages.as_ref().and_then(|s| s.switch_state()) == Some(EngineState::Parked) {
+                                cfg.stage_engine.as_ref().unwrap_or(&engine)
+                            } else {
+                                &engine
+                            };
+                            handle_offer(conn, cfg, engine, &shared, &out, &done_tx, &mut lease, draining || output.is_some() || waiting_for_single, offer).await?;
+                            cfg.live.set_leases(lease.attive() as u32);
+                        }
+                        Some(coordinator_message::Body::LeaseUpdate(u)) => {
+                            let Some(l) = lease.map.get_mut(&u.lease_id) else { continue };
+                            match u.status {
+                                Some(lease_update::Status::RenewedUntil(_)) => {
+                                    if let Some(c) = l.confirm.take() {
+                                        let _ = c.send(());
+                                    }
+                                }
+                                Some(lease_update::Status::Revoked(r)) => {
+                                    warn!(lease = %l.id, reason = r, "lease revoked");
+                                    on_revoked(cfg, &mut lease, &u.lease_id, r);
+                                }
+                                None => {}
+                            }
+                        }
+                        Some(coordinator_message::Body::StageAssign(a)) => match &cfg.stages {
+                            Some(s) if cfg.stage_engine.is_some() => {
+                                let allow_new = !(cfg.live.is_paused() || cfg.gpu.unavailable() || draining || output.is_some());
+                                match s.queue_switch(a, &cfg.sup, allow_new) {
+                                    Ok(()) => cfg.live.set_chain(s.serving_chain()),
+                                    Err(status) => out.send(node_message::Body::StageStatus(status)).await?,
                                 }
                             }
-                            Some(lease_update::Status::Revoked(r)) => {
-                                warn!(lease = %l.id, reason = r, "lease revoked");
-                                on_revoked(cfg, &mut lease, &u.lease_id, r);
+                            Some(_) if cfg.live.is_paused() => {
+                                out.send(node_message::Body::StageStatus(StageStatus {
+                                    chain_id: a.chain_id,
+                                    assign_epoch: a.assign_epoch,
+                                    state: StageState::Failed as i32,
+                                    error: "agent paused by host".into(),
+                                    ..Default::default()
+                                })).await?;
                             }
-                            None => {}
+                            Some(s) => s.queue_assignment(a),
+                            None => {
+                                warn!(chain = %a.chain_id, "StageAssign requires --stage-bin");
+                                out.send(node_message::Body::StageStatus(StageStatus {
+                                    chain_id: a.chain_id,
+                                    assign_epoch: a.assign_epoch,
+                                    state: StageState::Failed as i32,
+                                    error: "start the agent with --stage-bin to run stages".into(),
+                                    ..Default::default()
+                                }))
+                                .await?;
+                            }
+                        },
+                        Some(coordinator_message::Body::StageRelease(r)) => {
+                            if let Some(s) = &cfg.stages {
+                                let closing = s.queue_release(r);
+                                if cfg.stage_engine.is_some() && (closing || s.switch_state().is_none()) {
+                                    // Even a refused assignment needs a fresh IDLE after release.
+                                    waiting_for_single = true;
+                                    send_availability(&out, availability_now(EngineState::Recovering, &cfg.live, &cfg.gpu), &mut last_avail).await?;
+                                }
+                                if closing {
+                                    cfg.live.set_chain(None);
+                                    send_releases(&out, abort_stage_leases(&mut lease), LeaseReleaseReason::Unspecified).await?;
+                                    cfg.live.set_leases(lease.attive() as u32);
+                                }
+                            }
                         }
-                    }
-                    Some(coordinator_message::Body::StageAssign(a)) => match &cfg.stages {
-                        Some(s) => s.queue_assignment(a),
-                        None => {
-                            warn!(chain = %a.chain_id, "StageAssign requires --engine stages");
-                            out.send(node_message::Body::StageStatus(StageStatus {
-                                chain_id: a.chain_id,
-                                assign_epoch: a.assign_epoch,
-                                state: publicompute_proto::node::stage_status::State::Failed as i32,
-                                error: "start the agent with --engine stages to run stages".into(),
-                                ..Default::default()
-                            }))
-                            .await?;
+                        Some(coordinator_message::Body::MeasurementPing(p)) => {
+                            out.send(node_message::Body::MeasurementPong(MeasurementPong { probe_id: p.probe_id, nonce: p.nonce })).await?;
                         }
-                    },
-                    Some(coordinator_message::Body::StageRelease(r)) => {
-                        if let Some(s) = &cfg.stages {
-                            s.queue_release(r);
+                        Some(coordinator_message::Body::Drain(d)) => {
+                            info!(reason = %d.reason, "coordinator requested shutdown");
+                            draining = true;
                         }
+                        Some(coordinator_message::Body::Error(e)) => warn!(code = ?e.code(), msg = %e.message, seq = e.in_reply_to_seq, "coordinator error"),
+                        Some(coordinator_message::Body::ContributionStatus(st)) => {
+                            let new = cfg.contribution.receive_status(st.clone());
+                            if new {
+                                cfg.live.notify();
+                            }
+                            if new && ultimo_stato.as_ref() != Some(&st) {
+                                info!(
+                                    modo = ?st.effective_mode(), model = %st.serving.as_ref().map(|m| m.model_id.as_str()).unwrap_or(""),
+                                    in_catena = st.in_chain, posto_gratuito = st.free_seat, reason = ?st.reason(), revision = st.revision,
+                                    "contribution status"
+                                );
+                                ultimo_stato = Some(st);
+                            }
+                        }
+                        Some(coordinator_message::Body::ContributionSummary(r)) => {
+                            if ultimo_riepilogo.as_ref() != Some(&r) {
+                                info!(
+                                    giorni = r.days, chat_gratuite = r.free_chats, valore_gratuito_mc = r.free_value_mc, guadagnati_mc = r.earned_mc,
+                                    saldo_mc = r.balance_mc, "contribution summary"
+                                );
+                                ultimo_riepilogo = Some(r.clone());
+                            }
+                            cfg.contribution.receive_summary(r);
+                            cfg.live.notify();
+                        }
+                        Some(coordinator_message::Body::ModelDirective(d)) => {
+                            let st = rispondi_direttiva(cfg, &shared, d);
+                            out.send(node_message::Body::ModelDirectiveStatus(st)).await?;
+                        }
+                        Some(coordinator_message::Body::LeaveOk(l)) => {
+                            info!(interrupted_leases = l.lease_interrotte, "coordinator confirmed departure");
+                            ferma_subito(&out, &mut lease).await?;
+                            break Ok(SessionEnd::Shutdown);
+                        }
+                        Some(other) => debug!(?other, "unhandled message"),
+                        None => {}
                     }
-                    Some(coordinator_message::Body::MeasurementPing(p)) => {
-                        out.send(node_message::Body::MeasurementPong(MeasurementPong { probe_id: p.probe_id, nonce: p.nonce })).await?;
+                }
+                _ = heartbeat.tick() => {
+                    out.send(node_message::Body::Heartbeat(heartbeat_msg(&lease, cfg, &shared))).await?;
+                }
+                _ = pref_rx.changed() => {
+                    if minor2 {
+                        let p = cfg.contribution.to_proto(&modelli_di(&ultimo_inventario));
+                        info!(modo = ?p.mode(), revision = p.revision, "contribution preference changed");
+                        out.send(node_message::Body::Contribution(p)).await?;
+                    } else {
+                        debug!("coordinator accepts preferences only in Hello; skipping live update");
                     }
-                    Some(coordinator_message::Body::Drain(d)) => {
-                        info!(reason = %d.reason, "coordinator requested shutdown");
-                        draining = true;
-                        if lease.is_empty() {
-                            out.send(goodbye(GoodbyeReason::HostStopped)).await?;
+                }
+                r = uscita_rx.changed(), if !uscita_chiusa && output.is_none() => {
+                    match r {
+                        Err(_) => uscita_chiusa = true,
+                        Ok(()) if !*uscita_rx.borrow() => {}
+                        Ok(()) if minor2 => {
+                            warn!("shutting down within {GRAZIA_USCITA_S} s; press Ctrl-C again to exit now");
+                            output = Some(Instant::now());
+                            conto.reset();
+                            out.send(node_message::Body::Leaving(Leaving { grazia_s: GRAZIA_USCITA_S })).await?;
+                        }
+                        Ok(()) => {
+                            // If the peer cannot acknowledge departure, take the immediate shutdown path.
+                            ferma_subito(&out, &mut lease).await?;
                             break Ok(SessionEnd::Shutdown);
                         }
                     }
-                    Some(coordinator_message::Body::Error(e)) => warn!(code = ?e.code(), msg = %e.message, seq = e.in_reply_to_seq, "coordinator error"),
-                    Some(coordinator_message::Body::ContributionStatus(st)) => {
-                        let new = cfg.contribution.receive_status(st.clone());
-                        if new {
-                            cfg.live.notify();
+                }
+                _ = conto.tick(), if output.is_some() => {
+                    let trascorsi = output.map(|t| t.elapsed()).unwrap_or_default();
+                    let rimasti = ATTESA_USCITA.saturating_sub(trascorsi).as_secs().min(u64::from(GRAZIA_USCITA_S));
+                    info!(seconds = rimasti, lease = lease.map.len(), "shutting down in {rimasti} s");
+                }
+                _ = tokio::time::sleep_until(scadenza_uscita), if output.is_some() => {
+                    warn!("departure acknowledgment timed out; exiting");
+                    ferma_subito(&out, &mut lease).await?;
+                    break Ok(SessionEnd::Shutdown);
+                }
+                _ = state_rx.changed() => {}
+                _ = pause_rx.changed() => {}
+                _ = gpu_rx.changed() => {}
+                Some(st) = stage_rx.recv(), if cfg.stages.is_some() => {
+                    let terminal = matches!(st.state(), StageState::Stopped | StageState::Failed);
+                    let current = cfg.stage_engine.is_none()
+                        || cfg.stages.as_ref().is_some_and(|s| s.stage_status_current(&st));
+                    if current {
+                        cfg.live.set_chain((!terminal).then(|| st.chain_id.clone()));
+                    }
+                    out.send(node_message::Body::StageStatus(st)).await?;
+                    if current && terminal {
+                        if cfg.stage_engine.is_some() && !waiting_for_single {
+                            waiting_for_single = true;
+                            send_availability(&out, availability_now(EngineState::Recovering, &cfg.live, &cfg.gpu), &mut last_avail).await?;
                         }
-                        if new && ultimo_stato.as_ref() != Some(&st) {
-                            info!(
-                                modo = ?st.effective_mode(), model = %st.serving.as_ref().map(|m| m.model_id.as_str()).unwrap_or(""),
-                                in_catena = st.in_chain, posto_gratuito = st.free_seat, reason = ?st.reason(), revision = st.revision,
-                                "contribution status"
-                            );
-                            ultimo_stato = Some(st);
-                        }
-                    }
-                    Some(coordinator_message::Body::ContributionSummary(r)) => {
-                        if ultimo_riepilogo.as_ref() != Some(&r) {
-                            info!(
-                                giorni = r.days, chat_gratuite = r.free_chats, valore_gratuito_mc = r.free_value_mc, guadagnati_mc = r.earned_mc,
-                                saldo_mc = r.balance_mc, "contribution summary"
-                            );
-                            ultimo_riepilogo = Some(r.clone());
-                        }
-                        cfg.contribution.receive_summary(r);
-                        cfg.live.notify();
-                    }
-                    Some(coordinator_message::Body::ModelDirective(d)) => {
-                        let st = rispondi_direttiva(cfg, &shared, d);
-                        out.send(node_message::Body::ModelDirectiveStatus(st)).await?;
-                    }
-                    Some(coordinator_message::Body::LeaveOk(l)) => {
-                        info!(interrupted_leases = l.lease_interrotte, "coordinator confirmed departure");
-                        ferma_subito(&out, &mut lease).await?;
-                        break Ok(SessionEnd::Shutdown);
-                    }
-                    Some(other) => debug!(?other, "unhandled message"),
-                    None => {}
-                }
-            }
-            _ = heartbeat.tick() => {
-                out.send(node_message::Body::Heartbeat(heartbeat_msg(&lease, cfg, &shared))).await?;
-                // Publish a new inventory when measured size or capacity changes.
-                let inv = inventory(cfg, &engine);
-                if inv != ultimo_inventario {
-                    out.send(node_message::Body::ModelInventory(inv.clone())).await?;
-                    ultimo_inventario = inv;
-                }
-            }
-            _ = pref_rx.changed() => {
-                if minor2 {
-                    let p = cfg.contribution.to_proto(&modelli_di(&ultimo_inventario));
-                    info!(modo = ?p.mode(), revision = p.revision, "contribution preference changed");
-                    out.send(node_message::Body::Contribution(p)).await?;
-                } else {
-                    debug!("coordinator accepts preferences only in Hello; skipping live update");
-                }
-            }
-            r = uscita_rx.changed(), if !uscita_chiusa && output.is_none() => {
-                match r {
-                    Err(_) => uscita_chiusa = true,
-                    Ok(()) if !*uscita_rx.borrow() => {}
-                    Ok(()) if minor2 => {
-                        warn!("shutting down within {GRAZIA_USCITA_S} s; press Ctrl-C again to exit now");
-                        output = Some(Instant::now());
-                        conto.reset();
-                        out.send(node_message::Body::Leaving(Leaving { grazia_s: GRAZIA_USCITA_S })).await?;
-                    }
-                    Ok(()) => {
-                        // If the peer cannot acknowledge departure, take the immediate shutdown path.
-                        ferma_subito(&out, &mut lease).await?;
-                        break Ok(SessionEnd::Shutdown);
+                        send_releases(&out, abort_stage_leases(&mut lease), LeaseReleaseReason::Unspecified).await?;
+                        cfg.live.set_leases(lease.attive() as u32);
                     }
                 }
-            }
-            _ = conto.tick(), if output.is_some() => {
-                let trascorsi = output.map(|t| t.elapsed()).unwrap_or_default();
-                let rimasti = ATTESA_USCITA.saturating_sub(trascorsi).as_secs().min(u64::from(GRAZIA_USCITA_S));
-                info!(seconds = rimasti, lease = lease.map.len(), "shutting down in {rimasti} s");
-            }
-            _ = tokio::time::sleep_until(scadenza_uscita), if output.is_some() => {
-                warn!("departure acknowledgment timed out; exiting");
-                ferma_subito(&out, &mut lease).await?;
-                break Ok(SessionEnd::Shutdown);
-            }
-            _ = state_rx.changed() => {}
-            _ = pause_rx.changed() => {}
-            _ = gpu_rx.changed() => {}
-            Some(st) = stage_rx.recv(), if cfg.stages.is_some() => {
-                let attivo = !matches!(st.state(), publicompute_proto::node::stage_status::State::Stopped | publicompute_proto::node::stage_status::State::Failed);
-                cfg.live.set_chain(attivo.then(|| st.chain_id.clone()));
-                out.send(node_message::Body::StageStatus(st)).await?;
-            }
-            Some(done) = done_rx.recv() => {
-                on_lease_done(cfg, &shared, &out, &mut last_avail, &mut lease, done).await?;
-                cfg.live.set_leases(lease.attive() as u32);
-                if draining {
-                    out.send(goodbye(GoodbyeReason::HostStopped)).await?;
+                Some(done) = done_rx.recv() => {
+                    on_lease_done(cfg, &shared, &out, &mut last_avail, &mut lease, done, waiting_for_single).await?;
+                    cfg.live.set_leases(lease.attive() as u32);
+                }
+                _ = shutdown.changed() => {
+                    ferma_subito(&out, &mut lease).await?;
                     break Ok(SessionEnd::Shutdown);
                 }
             }
-            _ = shutdown.changed() => {
-                ferma_subito(&out, &mut lease).await?;
-                break Ok(SessionEnd::Shutdown);
-            }
         }
-    };
+    }.await;
     cfg.live.set_connected(false);
     cfg.live.set_leases(0);
     cfg.live.set_chain(None);
@@ -516,12 +596,22 @@ async fn run_inner(
     for l in lease.map.values() {
         l.task.abort();
     }
-    // Stop the stage when its assignment's session ends. Report STOPPED if
-    // the stream still works and let the next assignment determine what starts.
+    drop(lease);
+    // Drain stage updates while stopping so a full reporting queue can't
+    // prevent the worker from reaping the stage on disconnect.
     if let Some(s) = &cfg.stages {
-        s.stop_all().await;
+        let stop = s.stop_all();
+        tokio::pin!(stop);
+        loop {
+            tokio::select! {
+                _ = &mut stop => break,
+                Some(st) = stage_rx.recv() => {
+                    let _ = out.0.try_send(node_message::Body::StageStatus(st));
+                }
+            }
+        }
         while let Ok(st) = stage_rx.try_recv() {
-            let _ = out.send(node_message::Body::StageStatus(st)).await;
+            let _ = out.0.try_send(node_message::Body::StageStatus(st));
         }
     }
     drop(out);
@@ -574,6 +664,18 @@ fn abort_leases(lease: &mut Leases, outcome: LeaseOutcome) -> Vec<String> {
     active.into_keys().collect()
 }
 
+fn abort_stage_leases(lease: &mut Leases) -> Vec<String> {
+    let mut released = Vec::new();
+    lease.map.retain(|id, active| {
+        if active.stage {
+            active.task.abort();
+            released.push(id.clone());
+        }
+        !active.stage
+    });
+    released
+}
+
 async fn send_releases(out: &Out, released: Vec<String>, reason: LeaseReleaseReason) -> Result<()> {
     for lease_id in released {
         out.send(node_message::Body::LeaseRelease(LeaseRelease { lease_id, reason: reason as i32 })).await?;
@@ -604,6 +706,16 @@ pub fn rispondi_direttiva(cfg: &NodeConfig, shared: &Shared, d: ModelDirective) 
     });
     let ruolo_singolo = matches!(d.role(), ModelRole::Unspecified | ModelRole::Single);
     if stesso && ruolo_singolo {
+        let reject = if cfg.sup.state() == EngineState::Parked {
+            Some(RejectReason::InChain)
+        } else if !single_loaded(cfg) || matches!(&*cfg.sup.engine, Engine::Stages(_)) {
+            Some(RejectReason::Busy)
+        } else {
+            None
+        };
+        if let Some(reject) = reject {
+            return ModelDirectiveStatus { state: State::Rejected as i32, reject: reject as i32, ..base };
+        }
         info!(epoch = d.epoch, reason = %d.reason, "requested model is already loaded");
         ModelDirectiveStatus { state: State::Serving as i32, ..base }
     } else {
@@ -649,7 +761,7 @@ impl std::error::Error for VersioneTroppoVecchia {}
 fn availability_of(s: EngineState) -> Availability {
     match s {
         // Settling delays new work without making a temporary cancellation look like a fault.
-        EngineState::Ready | EngineState::Busy | EngineState::Settling => Availability::Idle,
+        EngineState::Ready | EngineState::Busy | EngineState::Settling | EngineState::Parked => Availability::Idle,
         EngineState::Starting | EngineState::Recovering => Availability::EngineRecovering,
         EngineState::Quarantined => Availability::EngineQuarantined,
     }
@@ -664,8 +776,19 @@ fn availability_now(state: EngineState, live: &crate::control::Live, gpu: &Telem
     }
 }
 
+fn session_availability(cfg: &NodeConfig, state: EngineState, waiting_for_single: bool) -> Availability {
+    match availability_now(state, &cfg.live, &cfg.gpu) {
+        Availability::Idle if waiting_for_single && state != EngineState::Ready => Availability::EngineRecovering,
+        availability => availability,
+    }
+}
+
+#[cfg(test)]
 async fn sync_availability(out: &Out, sup: &Supervisor, live: &crate::control::Live, gpu: &Telemetria, last: &mut Availability) -> Result<()> {
-    let a = availability_now(sup.state(), live, gpu);
+    send_availability(out, availability_now(sup.state(), live, gpu), last).await
+}
+
+async fn send_availability(out: &Out, a: Availability, last: &mut Availability) -> Result<()> {
     if a != *last {
         info!(availability = ?a, "availability changed");
         *last = a;
@@ -715,6 +838,9 @@ fn on_revoked(cfg: &NodeConfig, leases: &mut Leases, id: &str, reason: i32) {
     // Aborting a stage task drops the cancellation sender. The head receives
     // a cancel for that request and can release its slot independently.
     l.task.abort();
+    if l.stage {
+        return;
+    }
     let outcome = if reason == LeaseRevokeReason::NoProgress as i32 {
         LeaseOutcome::Fault(crate::engine::FaultCause::NoProgress)
     } else {
@@ -744,20 +870,17 @@ async fn on_lease_done(
     last_avail: &mut Availability,
     lease: &mut Leases,
     done: LeaseDone,
+    waiting_for_single: bool,
 ) -> Result<()> {
     // A queued result can arrive after cancellation removed its lease.
     let Some(mut own) = lease.map.remove(&done.id) else { return Ok(()) };
     let suspicious = own.progress.lock().unwrap().unclassified_failure;
     let mut guard = own.guard.take();
     // Keep the shared guard until the final lease finishes, unless an engine fault requires immediate recovery.
-    let comune = guard.is_none() && lease.comune.is_some();
+    let comune = !own.stage && guard.is_none() && lease.comune.is_some();
     if comune {
         lease.sospetto |= suspicious;
-        if done.result.is_ok() {
-            if lease.is_empty() {
-                guard = lease.comune.take();
-            }
-        } else {
+        if lease.is_empty() || done.result.as_ref().is_err_and(|error| matches!(classify(error), ErrorClass::Fault(_))) {
             guard = lease.comune.take();
         }
     }
@@ -783,8 +906,16 @@ async fn on_lease_done(
             if let Some(g) = guard {
                 g.finish(outcome);
             }
-            sync_availability(out, &cfg.sup, &cfg.live, &cfg.gpu, last_avail).await?;
-            out.send(node_message::Body::LeaseRelease(LeaseRelease { lease_id: done.id, reason: LeaseReleaseReason::EngineFailure as i32 })).await?;
+            if !own.stage {
+                let availability = session_availability(cfg, cfg.sup.state(), waiting_for_single);
+                send_availability(out, availability, last_avail).await?;
+            }
+            let reason = if e.is::<OutputStalled>() || e.is::<framed::ChatStreamError>() {
+                LeaseReleaseReason::Unspecified
+            } else {
+                LeaseReleaseReason::EngineFailure
+            };
+            out.send(node_message::Body::LeaseRelease(LeaseRelease { lease_id: done.id, reason: reason as i32 })).await?;
         }
     }
     Ok(())
@@ -810,6 +941,7 @@ async fn handle_offer(
     if cfg.live.is_paused() || cfg.gpu.unavailable() || cfg.gpu_profile_missing() {
         return out.send(reject(LeaseRejectReason::HostBusy, "host unavailable")).await;
     }
+    let stage = matches!(&**engine, Engine::Stages(_));
     let capacity = capacita(cfg, engine);
     let attive = lease.attive();
     if attive >= capacity || draining {
@@ -827,9 +959,19 @@ async fn handle_offer(
     // An active group of chats already owns the guard. Only a lease that
     // needs a new reservation checks the supervisor's idle availability.
     let condiviso = attive > 0 && lease.comune.is_some();
-    if !condiviso {
+    if !stage && !condiviso {
         if let Err(r) = cfg.sup.check_ready() {
-            return out.send(reject(r.reason, r.detail)).await;
+            // A parked or recovering engine still has the GGUF on disk.
+            let reason = match r.reason {
+                LeaseRejectReason::ModelNotReady => LeaseRejectReason::HostBusy,
+                reason => reason,
+            };
+            return out.send(reject(reason, r.detail)).await;
+        }
+    }
+    if let Engine::Stages(e) = &**engine {
+        if !e.pronto() {
+            return out.send(reject(LeaseRejectReason::HostBusy, "chain not ready; no head in service")).await;
         }
     }
     if offer.model.as_ref() != Some(&cfg.model) {
@@ -840,13 +982,7 @@ async fn handle_offer(
         return out.send(reject(LeaseRejectReason::HostBusy, "unsupported LOGIC format")).await;
     }
     match (&offer.task, &**engine) {
-        // Stage chats require a connected head.
-        (Some(work_offer::Task::Chat(_)), Engine::Stages(e)) => {
-            if !e.pronto() {
-                return out.send(reject(LeaseRejectReason::ModelNotReady, "chain not ready; no head in service")).await;
-            }
-        }
-        (Some(work_offer::Task::Chat(_)), Engine::Llama(_) | Engine::Mock(_)) => {}
+        (Some(work_offer::Task::Chat(_)), _) => {}
         (Some(work_offer::Task::Batch(_) | work_offer::Task::Verify(_)), Engine::Stages(_)) => {
             return out.send(reject(LeaseRejectReason::HostBusy, "a stage node can only serve chat for its own chain")).await;
         }
@@ -858,12 +994,12 @@ async fn handle_offer(
         return out.send(reject(LeaseRejectReason::Unprofitable, "payment does not cover electricity")).await;
     }
     // Validate the offer before reserving the engine so earlier exits need no guard cleanup.
-    let guard = if condiviso {
+    let guard = if stage || condiviso {
         None
     } else {
         match cfg.sup.try_begin() {
             Ok(g) => Some(g),
-            Err(r) => return out.send(reject(r.reason, r.detail)).await,
+            Err(r) => return out.send(reject(LeaseRejectReason::HostBusy, r.detail)).await,
         }
     };
 
@@ -891,7 +1027,7 @@ async fn handle_offer(
         lease.comune = comune;
         lease.sospetto = false;
     }
-    lease.map.insert(lease_id.clone(), ActiveLease { id: lease_id, progress, own, confirm: Some(confirm_tx), task, guard: guard_propria });
+    lease.map.insert(lease_id.clone(), ActiveLease { id: lease_id, stage, progress, own, confirm: Some(confirm_tx), task, guard: guard_propria });
     Ok(())
 }
 
@@ -913,12 +1049,22 @@ async fn run_lease(
 
     let (mut send, recv) = conn.open_bi().await?;
     let mut r = FrameReader::new(recv);
-    framed::write(
-        &mut send,
-        &WorkStreamNodeMessage { body: Some(work_stream_node_message::Body::Open(WorkStreamOpen { lease_id: lease_id.to_string() })) },
-    )
-    .await?;
-    let batch = match offer.task {
+    let open = WorkStreamNodeMessage { body: Some(work_stream_node_message::Body::Open(WorkStreamOpen { lease_id: lease_id.to_string() })) };
+    let task = match offer.task {
+        Some(work_offer::Task::Chat(chat)) => {
+            let mut send = framed::ChatWriter::new(send);
+            send.write(&open).await?;
+            let result = run_chat(&mut send, &mut r, &engine, &sup, &progress, own.as_ref(), lease_id, chat, &logic_params).await?;
+            progress.lock().unwrap().completing = true;
+            send.write(&lease_complete(lease_id)).await?;
+            send.finish()?;
+            let _ = tokio::time::timeout(Duration::from_secs(5), r.read::<WorkStreamCoordinatorMessage>()).await;
+            return Ok(result);
+        }
+        task => task,
+    };
+    framed::write(&mut send, &open).await?;
+    let batch = match task {
         Some(work_offer::Task::Batch(b)) => b,
         Some(work_offer::Task::Verify(v)) => {
             run_verify(&mut send, &mut r, &engine, &sup, v).await?;
@@ -926,16 +1072,6 @@ async fn run_lease(
             sup.progress.set_phase(Phase::Finishing);
             finish_lease(&mut send, &mut r, lease_id).await?;
             return Ok((0, Duration::ZERO));
-        }
-        Some(work_offer::Task::Chat(c)) => {
-            let esito = run_chat(&mut send, &mut r, &engine, &sup, &progress, own.as_ref(), lease_id, c, &logic_params).await?;
-            progress.lock().unwrap().completing = true;
-            sup.progress.set_phase(Phase::Finishing);
-            if let Some(o) = &own {
-                o.set_phase(Phase::Finishing);
-            }
-            finish_lease(&mut send, &mut r, lease_id).await?;
-            return Ok(esito);
         }
         _ => bail!("unsupported task"),
     };
@@ -1031,7 +1167,7 @@ fn completion_result(request_id: &str, g: crate::engine::Generation, logic_param
 /// propagate cancellation from the coordinator and send the final request result.
 #[allow(clippy::too_many_arguments)]
 async fn run_chat(
-    send: &mut quinn::SendStream,
+    send: &mut framed::ChatWriter,
     r: &mut FrameReader,
     engine: &Arc<Engine>,
     sup: &Supervisor,
@@ -1043,79 +1179,55 @@ async fn run_chat(
 ) -> Result<(u64, Duration)> {
     let req = chat.request.context("chat is missing its request")?;
     let t0 = Instant::now();
-    let (dtx, mut drx) = mpsc::unbounded_channel();
+    let (dtx, mut drx, mut saturated) = delta_channel();
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
     let mut cancel_tx = Some(cancel_tx);
     let lp: Arc<Progress> = own.cloned().unwrap_or_else(|| sup.progress.clone());
-    let (e2, req2, lp2) = (engine.clone(), req.clone(), lp.clone());
+    let (e2, lp2) = (engine.clone(), lp.clone());
+    let request_id = req.request_id.clone();
     let top_k = logic_params.top_k;
-    let gen = tokio::spawn(async move { e2.chat_lease(&req2, top_k, &lp2, Some(dtx), Some(cancel_rx)).await });
-    loop {
-        tokio::select! {
-            d = drx.recv() => match d {
-                Some(d) => {
-                    framed::write(send, &WorkStreamNodeMessage {
-                        body: Some(work_stream_node_message::Body::TokenDelta(TokenDelta {
-                            request_id: req.request_id.clone(), index: d.index, text: d.text, token_ids: d.token_ids,
-                        })),
-                    }).await?;
-                }
-                // The closed delta channel ends streaming. The task result supplies the final outcome.
-                None => break,
-            },
-            m = r.read::<WorkStreamCoordinatorMessage>() => match m? {
-                Some(m) => {
-                    if let Some(work_stream_coordinator_message::Body::CancelRequest(c)) = m.body {
-                        if c.request_id == req.request_id {
-                            info!(lease = lease_id, request = %c.request_id, "coordinator cancelled the chat");
-                            if let Some(t) = cancel_tx.take() {
-                                let _ = t.send(());
-                            }
+    let gen = tokio::spawn(async move { e2.chat_lease(&req, top_k, &lp2, Some(dtx), Some(cancel_rx)).await });
+    let (n, gen_time) = {
+        let write_reply = async {
+            while let Some(queued) = drx.recv().await {
+                let delta = queued.item;
+                send.write(&WorkStreamNodeMessage {
+                    body: Some(work_stream_node_message::Body::TokenDelta(TokenDelta {
+                        request_id: request_id.clone(), index: delta.index, text: delta.text, token_ids: delta.token_ids,
+                    })),
+                }).await?;
+            }
+            if !matches!(&**engine, Engine::Stages(_)) {
+                sup.progress.set_phase(Phase::Finishing);
+            }
+            lp.set_phase(Phase::Finishing);
+            let generation = gen.await.context("chat task")?;
+            let (result, count, elapsed) = chat_result(generation, &request_id, logic_params, sup, progress, t0)?;
+            send.write(&WorkStreamNodeMessage { body: Some(work_stream_node_message::Body::RequestResult(result)) }).await?;
+            Ok::<_, anyhow::Error>((count, elapsed))
+        };
+        let read_commands = async {
+            loop {
+                let message = read_chat_command(r).await?;
+                if let Some(work_stream_coordinator_message::Body::CancelRequest(cancel)) = message.body {
+                    if cancel.request_id == request_id {
+                        info!(lease = lease_id, request = %cancel.request_id, "coordinator cancelled the chat");
+                        if let Some(sender) = cancel_tx.take() {
+                            let _ = sender.send(());
                         }
                     }
                 }
-                None => {
-                    // Dropping the stage request cancels work after the coordinator closes its stream.
-                    cancel_tx.take();
-                    bail!("coordinator closed the work stream");
-                }
-            },
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = wait_for_saturation(&mut saturated) => Err(OutputStalled.into()),
+            result = write_reply => result,
+            result = read_commands => result,
         }
-    }
-    sup.progress.set_phase(Phase::Finishing);
-    lp.set_phase(Phase::Finishing);
-    let esito = gen.await.context("chat task")?;
-    let (result, n, gen_time) = match esito {
-        Ok(g) => {
-            sup.stats.request_completed(t0.elapsed());
-            completion_result(&req.request_id, g, logic_params)?
-        }
-        Err(e) => match classify(&e) {
-            ErrorClass::Fault(c) => {
-                sup.stats.request_failed(c.as_str());
-                return Err(e.context(format!("request {}", req.request_id)));
-            }
-            ErrorClass::Request(code) => {
-                warn!(request = %req.request_id, ?code, "chat failed: {e:#}");
-                sup.stats.request_failed(&format!("{code:?}"));
-                (RequestResult { request_id: req.request_id.clone(), outcome: Some(request_result::Outcome::Failure(RequestFailure { code: code as i32, detail: format!("{e:#}") })) }, 0, Duration::ZERO)
-            }
-            ErrorClass::Other => {
-                progress.lock().unwrap().unclassified_failure = true;
-                (
-                    RequestResult {
-                        request_id: req.request_id.clone(),
-                        outcome: Some(request_result::Outcome::Failure(RequestFailure { code: RequestFailureCode::EngineError as i32, detail: format!("{e:#}") })),
-                    },
-                    0,
-                    Duration::ZERO,
-                )
-            }
-        },
-    };
-    framed::write(send, &WorkStreamNodeMessage { body: Some(work_stream_node_message::Body::RequestResult(result)) }).await?;
+    }?;
     loop {
-        let m: WorkStreamCoordinatorMessage = r.read().await?.context("coordinator closed the work stream")?;
+        let m = read_chat_command(r).await?;
         if let Some(work_stream_coordinator_message::Body::ResultAck(a)) = m.body {
             if !a.accepted {
                 warn!(request = %a.request_id, reason = %a.reason, "result rejected");
@@ -1123,7 +1235,9 @@ async fn run_chat(
             break;
         }
     }
-    sup.progress.tick();
+    if !matches!(&**engine, Engine::Stages(_)) {
+        sup.progress.tick();
+    }
     if !Arc::ptr_eq(&lp, &sup.progress) {
         lp.tick();
     }
@@ -1135,14 +1249,55 @@ async fn run_chat(
     Ok((u64::from(n), gen_time))
 }
 
-async fn finish_lease(send: &mut quinn::SendStream, r: &mut FrameReader, lease_id: &str) -> Result<()> {
-    framed::write(
-        send,
-        &WorkStreamNodeMessage {
-            body: Some(work_stream_node_message::Body::LeaseComplete(LeaseComplete { lease_id: lease_id.to_string() })),
+async fn read_chat_command(reader: &mut FrameReader) -> Result<WorkStreamCoordinatorMessage> {
+    reader.read().await.and_then(|message| message.context("coordinator closed the work stream")).context(framed::ChatStreamError)
+}
+
+fn chat_result(
+    generation: Result<crate::engine::Generation>,
+    request_id: &str,
+    logic_params: &publicompute_proto::node::LogicParams,
+    sup: &Supervisor,
+    progress: &Mutex<LeaseCounters>,
+    started: Instant,
+) -> Result<(RequestResult, u32, Duration)> {
+    Ok(match generation {
+        Ok(g) => {
+            sup.stats.request_completed(started.elapsed());
+            completion_result(request_id, g, logic_params)?
+        }
+        Err(e) if e.is::<OutputStalled>() => return Err(e),
+        Err(e) => match classify(&e) {
+            ErrorClass::Fault(c) => {
+                sup.stats.request_failed(c.as_str());
+                return Err(e.context(format!("request {request_id}")));
+            }
+            ErrorClass::Request(code) => {
+                warn!(request = %request_id, ?code, "chat failed: {e:#}");
+                sup.stats.request_failed(&format!("{code:?}"));
+                (RequestResult { request_id: request_id.to_string(), outcome: Some(request_result::Outcome::Failure(RequestFailure { code: code as i32, detail: format!("{e:#}") })) }, 0, Duration::ZERO)
+            }
+            ErrorClass::Other => {
+                progress.lock().unwrap().unclassified_failure = true;
+                (
+                    RequestResult {
+                        request_id: request_id.to_string(),
+                        outcome: Some(request_result::Outcome::Failure(RequestFailure { code: RequestFailureCode::EngineError as i32, detail: format!("{e:#}") })),
+                    },
+                    0,
+                    Duration::ZERO,
+                )
+            }
         },
-    )
-    .await?;
+    })
+}
+
+fn lease_complete(lease_id: &str) -> WorkStreamNodeMessage {
+    WorkStreamNodeMessage { body: Some(work_stream_node_message::Body::LeaseComplete(LeaseComplete { lease_id: lease_id.to_string() })) }
+}
+
+async fn finish_lease(send: &mut quinn::SendStream, r: &mut FrameReader, lease_id: &str) -> Result<()> {
+    framed::write(send, &lease_complete(lease_id)).await?;
     send.finish()?;
     // Keep the work stream until the coordinator closes it after recording completion.
     let _ = tokio::time::timeout(Duration::from_secs(5), r.read::<WorkStreamCoordinatorMessage>()).await;
@@ -1246,13 +1401,14 @@ mod tests {
             progress,
         );
         sup.start().await.unwrap();
-        let cfg = NodeConfig { model: ModelRef::default(), costs: None, hardware: Default::default(), sup, stages: None, region: String::new(), nat_class: String::new(), iroh_node_id: String::new(), slots: 1, contribution: contributo_prova("nodo"), gpu: Default::default(), model_path: None, output: watch::channel(false).1, live: crate::control::Live::new() };
+        let cfg = NodeConfig { model: ModelRef::default(), costs: None, hardware: Default::default(), sup, stages: None, stage_engine: None, region: String::new(), nat_class: String::new(), iroh_node_id: String::new(), slots: 1, contribution: contributo_prova("nodo"), gpu: Default::default(), model_path: None, output: watch::channel(false).1, live: crate::control::Live::new() };
         (f, cfg)
     }
 
     fn active(cfg: &NodeConfig, id: &str) -> ActiveLease {
         ActiveLease {
             id: id.into(),
+            stage: false,
             progress: Arc::new(Mutex::new(LeaseCounters::default())),
             own: None,
             confirm: None,
@@ -1326,7 +1482,7 @@ mod tests {
         let out = Out(tx);
         let mut last = Availability::Idle;
         let shared = Shared::default();
-        on_lease_done(&cfg, &shared, &out, &mut last, &mut lease, LeaseDone { id: "L1".into(), result: Err(err) }).await.unwrap();
+        on_lease_done(&cfg, &shared, &out, &mut last, &mut lease, LeaseDone { id: "L1".into(), result: Err(err) }, false).await.unwrap();
         let msgs = drain(&mut rx);
         match msgs.as_slice() {
             [node_message::Body::Availability(a), node_message::Body::LeaseRelease(r)] => {
@@ -1358,6 +1514,7 @@ mod tests {
             &mut last,
             &mut lease,
             LeaseDone { id: "L1".into(), result: Err(anyhow::anyhow!("work stream closed")) },
+            false,
         )
         .await
         .unwrap();
@@ -1427,6 +1584,10 @@ mod tests {
 
     /// Open a local QUIC connection pair using fixture certificates.
     async fn loopback() -> (quinn::Connection, quinn::Connection) {
+        loopback_with_window(None).await
+    }
+
+    async fn loopback_with_window(window: Option<u32>) -> (quinn::Connection, quinn::Connection) {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert = ck.cert.der().clone();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der());
@@ -1437,7 +1598,12 @@ mod tests {
             .with_single_cert(vec![cert.clone()], key.into())
             .unwrap();
         tls.alpn_protocols = vec![transport::ALPN.to_vec()];
-        let sc = quinn::ServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap()));
+        let mut sc = quinn::ServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap()));
+        if let Some(window) = window {
+            let mut transport = quinn::TransportConfig::default();
+            transport.stream_receive_window(window.into());
+            sc.transport_config(Arc::new(transport));
+        }
         let ep = quinn::Endpoint::server(sc, "127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = ep.local_addr().unwrap();
         let server = tokio::spawn(async move { ep.accept().await.unwrap().await.unwrap() });
@@ -1486,7 +1652,7 @@ mod tests {
         );
         sup.start().await.unwrap();
         let model = ModelRef { model_id: "m".into(), quantization: "q".into(), weights_sha256: vec![7; 32] };
-        (NodeConfig { model, costs: None, hardware: Default::default(), sup, stages: Some(stages.clone()), region: String::new(), nat_class: String::new(), iroh_node_id: String::new(), slots: 1, contribution: contributo_prova(name), gpu: Default::default(), model_path: None, output: watch::channel(false).1, live: crate::control::Live::new() }, engine, stages)
+        (NodeConfig { model, costs: None, hardware: Default::default(), sup, stages: Some(stages.clone()), stage_engine: None, region: String::new(), nat_class: String::new(), iroh_node_id: String::new(), slots: 1, contribution: contributo_prova(name), gpu: Default::default(), model_path: None, output: watch::channel(false).1, live: crate::control::Live::new() }, engine, stages)
     }
 
     fn offerta_chat(cfg: &NodeConfig, request_id: &str, text: &str, max_tokens: u32) -> WorkOffer {
@@ -1543,6 +1709,7 @@ mod tests {
     #[tokio::test]
     async fn chain_head_chat_streams_deltas_and_result() {
         let (cfg, engine, stages) = nodo_testa("chat-lease", vec![]).await;
+        assert_eq!(features(&cfg), vec![AgentFeature::Contribution as i32, AgentFeature::Stages as i32]);
         let (client, server) = loopback().await;
         let coord = tokio::spawn(coordinatore(server, "r1".into(), None));
         let offerta = offerta_chat(&cfg, "r1", "ciao", 50);
@@ -1700,11 +1867,12 @@ mod tests {
         let rifiutate: Vec<_> = msgs.iter().filter_map(|m| if let node_message::Body::LeaseReject(r) = m { Some((r.lease_id.clone(), r.reason())) } else { None }).collect();
         assert_eq!(accettate, 4);
         assert_eq!(rifiutate, vec![("L4".to_string(), LeaseRejectReason::HostBusy)]);
-        assert_eq!(cfg.sup.state(), EngineState::Busy);
+        assert_eq!(cfg.sup.state(), EngineState::Ready);
+        assert!(lease.comune.is_none());
         assert_eq!(heartbeat_msg(&lease, &cfg, &Shared::default()).leases.len(), 4);
         for i in 0..3 {
             on_revoked(&cfg, &mut lease, &format!("L{i}"), LeaseRevokeReason::Cancelled as i32);
-            assert_eq!(cfg.sup.state(), EngineState::Busy, "one lease is still active");
+            assert_eq!(cfg.sup.state(), EngineState::Ready, "stage leases do not reserve the supervisor");
         }
         on_revoked(&cfg, &mut lease, "L3", LeaseRevokeReason::Cancelled as i32);
         wait_ready(&cfg).await;
@@ -1716,6 +1884,136 @@ mod tests {
     fn annulli_ricevuti(name: &str) -> usize {
         let log = std::env::temp_dir().join(format!("publicompute-stadi-{name}-{}", std::process::id())).join("log/stage-catena-x-1.log");
         std::fs::read_to_string(log).unwrap_or_default().lines().filter(|r| r.contains("Cancel received for request")).count()
+    }
+
+    async fn accept_partial_chat(server: &quinn::Connection) -> (quinn::SendStream, quinn::RecvStream) {
+        let (send, mut recv) = server.accept_bi().await.unwrap();
+        let mut byte = [0];
+        recv.read_exact(&mut byte).await.unwrap();
+        assert!((1..128).contains(&byte[0]));
+        let mut payload = vec![0; byte[0] as usize];
+        recv.read_exact(&mut payload).await.unwrap();
+        let open = <WnMsg as prost::Message>::decode(payload.as_slice()).unwrap();
+        assert!(matches!(open.body, Some(wn::Body::Open(_))));
+        recv.read_exact(&mut byte).await.unwrap();
+        assert_ne!(byte[0] & 0x80, 0, "expected the start of a large delta");
+        (send, recv)
+    }
+
+    fn start_chat_task(client: quinn::Connection, cfg: &NodeConfig, engine: Arc<Engine>, request_id: &str, text: &str) -> tokio::task::JoinHandle<Result<(u64, Duration)>> {
+        let sup = cfg.sup.clone();
+        let offer = offerta_chat(cfg, request_id, text, 50);
+        tokio::spawn(async move {
+            let (tx, rx) = oneshot::channel();
+            tx.send(()).unwrap();
+            run_lease(client, "L-chat", offer, engine, sup, rx, Arc::new(Mutex::new(LeaseCounters::default())), None).await
+        })
+    }
+
+    async fn wait_for_head_cancel(name: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while annulli_ricevuti(name) == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("the head did not receive Cancel");
+    }
+
+    async fn assert_chat_reset(mut recv: quinn::RecvStream) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut buf = [0; 4096];
+            loop {
+                match recv.read(&mut buf).await {
+                    Ok(Some(_)) => {}
+                    Err(quinn::ReadError::Reset(code)) => {
+                        assert_eq!(code, 1u32.into());
+                        break;
+                    }
+                    other => panic!("expected a reset, got {other:?}"),
+                }
+            }
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_chat_reads_cancel_while_another_chat_completes() {
+        let name = "chat-stream-stalled";
+        let (cfg, engine, stages) = nodo_testa(name, vec![]).await;
+        let (client, server) = loopback_with_window(Some(1024)).await;
+        let stalled = start_chat_task(client.clone(), &cfg, engine.clone(), "stalled", "stall-chat-output");
+        let (mut commands, blocked) = tokio::time::timeout(Duration::from_secs(5), accept_partial_chat(&server)).await.unwrap();
+        framed::write(&mut commands, &WcMsg { body: Some(wc::Body::CancelRequest(CancelRequest { request_id: "stalled".into() })) }).await.unwrap();
+        wait_for_head_cancel(name).await;
+
+        let peer = tokio::spawn(coordinatore(server.clone(), "healthy".into(), None));
+        let healthy = start_chat_task(client.clone(), &cfg, engine.clone(), "healthy", "ciao");
+        assert_eq!(tokio::time::timeout(Duration::from_secs(5), healthy).await.unwrap().unwrap().unwrap().0, 5);
+        assert_eq!(peer.await.unwrap().0.len(), 4);
+        assert!(!stalled.is_finished());
+        stalled.abort();
+        assert!(stalled.await.unwrap_err().is_cancelled());
+        assert_chat_reset(blocked).await;
+        assert_healthy_chat(&client, &server, &cfg, engine).await;
+        stages.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn saturated_chat_cancels_generation_and_resets_the_stream() {
+        let name = "chat-stream-saturated";
+        let (cfg, engine, stages) = nodo_testa(name, vec![]).await;
+        let (client, server) = loopback_with_window(Some(1024)).await;
+        let stalled = start_chat_task(client.clone(), &cfg, engine.clone(), "stalled", "flood-chat-output");
+        let (_commands, blocked) = tokio::time::timeout(Duration::from_secs(5), accept_partial_chat(&server)).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), stalled).await.unwrap().unwrap().unwrap_err();
+        assert!(error.is::<OutputStalled>(), "{error:#}");
+        wait_for_head_cancel(name).await;
+        assert_chat_reset(blocked).await;
+        assert_healthy_chat(&client, &server, &cfg, engine).await;
+        stages.stop_all().await;
+    }
+
+    async fn assert_healthy_chat(client: &quinn::Connection, server: &quinn::Connection, cfg: &NodeConfig, engine: Arc<Engine>) {
+        let peer = tokio::spawn(coordinatore(server.clone(), "after-reset".into(), None));
+        let chat = start_chat_task(client.clone(), cfg, engine, "after-reset", "ciao");
+        assert_eq!(tokio::time::timeout(Duration::from_secs(5), chat).await.unwrap().unwrap().unwrap().0, 5);
+        assert_eq!(peer.await.unwrap().0.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn saturated_deltas_cancel_only_their_head_request() {
+        let name = "head-deltas-saturated";
+        let (cfg, engine, stages) = nodo_testa(name, vec![]).await;
+        let Engine::Stages(engine) = &*engine else { unreachable!() };
+        let request = |id, prompt| {
+            let Some(work_offer::Task::Chat(chat)) = offerta_chat(&cfg, id, prompt, 50).task else { unreachable!() };
+            chat.request.unwrap()
+        };
+        let stalled = request("stalled", "stall-chat-output");
+        let healthy = request("healthy", "ciao");
+        let (deltas, _unread, full) = crate::engine::output::channel(2, 256 << 10);
+        let (first, second) = tokio::join!(engine.chat(&stalled, Some(deltas), None), engine.chat(&healthy, None, None));
+        assert!(first.unwrap_err().is::<OutputStalled>());
+        assert!(*full.borrow());
+        assert_eq!(second.unwrap().token_ids.len(), 5);
+        wait_for_head_cancel(name).await;
+        stages.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn partial_chat_frame_timeout_resets_the_stream() {
+        let (client, server) = loopback_with_window(Some(1024)).await;
+        let (send, _recv) = client.open_bi().await.unwrap();
+        let task = tokio::spawn(async move {
+            let mut writer = framed::ChatWriter::new(send);
+            writer.write_with_timeout(&WnMsg { body: Some(wn::Body::TokenDelta(TokenDelta {
+                text: "x".repeat(512 << 10), ..Default::default()
+            })) }, Duration::from_secs(1)).await.unwrap_err()
+        });
+        let (_commands, mut blocked) = tokio::time::timeout(Duration::from_secs(5), server.accept_bi()).await.unwrap().unwrap();
+        blocked.read_exact(&mut [0; 1]).await.unwrap();
+        let error = task.await.unwrap();
+        assert!(error.is::<framed::ChatStreamError>());
+        assert!(format!("{error:#}").contains("chat frame write timed out"), "{error:#}");
+        assert_chat_reset(blocked).await;
     }
 
     /// A single lease revocation reaches the corresponding head request and
@@ -1778,7 +2076,7 @@ mod tests {
         batch.task = Some(work_offer::Task::Batch(publicompute_proto::node::BatchTask { requests: vec![] }));
         assert_eq!(esito_offerta(&cfg, &engine, &client, batch).await, Some(LeaseRejectReason::HostBusy));
         stages.stop_all().await;
-        assert_eq!(esito_offerta(&cfg, &engine, &client, offerta_chat(&cfg, "r", "x", 5)).await, Some(LeaseRejectReason::ModelNotReady));
+        assert_eq!(esito_offerta(&cfg, &engine, &client, offerta_chat(&cfg, "r", "x", 5)).await, Some(LeaseRejectReason::HostBusy));
         let (_f, single) = node(400).await;
         let engine1 = single.sup.engine.clone();
         let mut single = single;
@@ -1894,6 +2192,7 @@ mod tests {
         let (pa, pb) = (Arc::new(Progress::default()), Arc::new(Progress::default()));
         let mk = |id: &str, own: &Arc<Progress>| ActiveLease {
             id: id.into(),
+            stage: false,
             progress: Arc::new(Mutex::new(LeaseCounters::default())),
             own: Some(own.clone()),
             confirm: None,
@@ -2025,6 +2324,293 @@ mod tests {
         }
     }
 
+    async fn dual_node(name: &str, stage_env: &[(&str, &str)], llama_args: &[&str]) -> (NodeConfig, std::path::PathBuf, u16) {
+        let dir = tempdir(name);
+        let config = cfg_test(&dir);
+        let model_path = config.model_path.clone();
+        let stages = Stages::new(StagesConfig {
+            env: stage_env.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect(),
+            ..config
+        });
+        let progress = Arc::new(Progress::default());
+        let limits = Limits {
+            prefill_stall: Duration::from_secs(4),
+            decode_stall: Duration::from_secs(4),
+            request_max: Duration::from_secs(10),
+            call_timeout: Duration::from_secs(3),
+            step_timeout: Duration::from_secs(3),
+            probe_timeout: Duration::from_secs(2),
+        };
+        let stage_engine = Arc::new(Engine::Stages(StadiEngine {
+            stages: stages.clone(), attive: Default::default(), limits: limits.clone(), progress: Default::default(),
+        }));
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let bin = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("fake-llama-server");
+        let llama = Arc::new(Engine::Llama(LlamaEngine::new(format!("http://127.0.0.1:{port}"), limits, progress.clone(), true).unwrap()));
+        let gpu = Arc::new(Telemetria::default());
+        gpu.set_device_for_test(crate::gpu::Device::Ready("GPU-test".into()));
+        let sup = Supervisor::with_state(
+            llama,
+            SupervisorCfg {
+                managed: Some(crate::engine::managed::ManagedCfg {
+                    bin, model_path: model_path.clone(), port, gpu_index: None,
+                    extra_args: llama_args.iter().map(|arg| arg.to_string()).collect(),
+                    log_path: dir.join("llama.log"), stop_grace: Duration::from_millis(600), kill_wait: Duration::from_secs(2),
+                }),
+                expected_model: Some(model_path.clone()),
+                probe_interval: Duration::from_secs(60),
+                settle: Duration::from_secs(2),
+                max_restarts: 3,
+                restart_window: Duration::from_secs(60),
+                backoff_base: Duration::from_millis(50),
+                backoff_max: Duration::from_millis(100),
+                recycle: Some(Duration::from_secs(2)),
+                start_timeout: Duration::from_secs(5),
+                maintenance_tick: Duration::from_millis(30),
+            },
+            Arc::new(Stats::new(None)), progress, watch::channel(EngineState::Starting).0, Some(gpu.clone()),
+        );
+        sup.start().await.unwrap();
+        let model = assignment("ad", 1, 1, 2, 0).model.unwrap();
+        let mut hardware = publicompute_proto::node::HardwareProfile::default();
+        hardware.gpus.push(Default::default());
+        (NodeConfig {
+            model, hardware, costs: None, sup, stages: Some(stages), stage_engine: Some(stage_engine), slots: 2,
+            region: "EU".into(), nat_class: String::new(), iroh_node_id: String::new(),
+            contribution: contributo_prova(name), gpu, model_path: Some(model_path), output: watch::channel(false).1,
+            live: crate::control::Live::new(),
+        }, dir, port)
+    }
+
+    impl Finta {
+        async fn stage(&mut self, want: State) -> StageStatus {
+            self.attendi(7000, |msg| match msg {
+                node_message::Body::StageStatus(status) if status.state() == want => Some(status.clone()),
+                _ => None,
+            }).await.unwrap_or_else(|| panic!("missing stage status {want:?}"))
+        }
+
+        async fn accept_chat(&mut self, offer: WorkOffer) {
+            let lease_id = offer.lease.as_ref().unwrap().lease_id.clone();
+            self.manda(coordinator_message::Body::WorkOffer(offer)).await;
+            self.attendi(3000, |msg| match msg {
+                node_message::Body::LeaseAccept(accept) if accept.lease_id == lease_id => Some(()),
+                node_message::Body::LeaseReject(reject) => panic!("chat rejected: {reject:?}"),
+                _ => None,
+            }).await.expect("chat offer accepted");
+        }
+
+        async fn update_lease(&mut self, status: lease_update::Status) {
+            self.manda(coordinator_message::Body::LeaseUpdate(publicompute_proto::node::LeaseUpdate {
+                lease_id: "L-chat".into(), status: Some(status),
+            })).await;
+        }
+
+        async fn availability(&mut self, want: Availability) {
+            self.attendi(5000, |msg| match msg {
+                node_message::Body::Availability(update) if update.availability() == want => Some(()),
+                _ => None,
+            }).await.unwrap_or_else(|| panic!("missing availability {want:?}"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dual_mode_switches_and_renews_an_active_chat() {
+        let (cfg, dir, _) = dual_node("dual-chat", &[("FAKE_STAGE_TOKEN_DELAY_MS", "350")], &["--fake-start-delay-ms", "250"]).await;
+        let initial = inventory(&cfg, &cfg.sup.engine).models.remove(0);
+        let offer = offerta_chat(&cfg, "chat", "ciao", 8);
+        let blocked = offerta_chat(&cfg, "blocked", "blocca", 8);
+        let sup = cfg.sup.clone();
+        let pid = sup.child_pid_for_test().await;
+        let stages = cfg.stages.clone().unwrap();
+        let (mut peer, _) = Finta::start(cfg, welcome(Some(2), "", 100)).await;
+        assert_eq!(peer.hello.features, vec![AgentFeature::Contribution as i32, AgentFeature::Stages as i32, AgentFeature::EngineSwitch as i32]);
+
+        let mut a = assignment("ad", 1, 1, 2, 0);
+        peer.accept_chat(offer.clone()).await;
+        peer.manda(coordinator_message::Body::StageAssign(a.clone())).await;
+        assert_eq!(peer.stage(State::Stopped).await.error, "busy");
+        assert_eq!(pid, sup.child_pid_for_test().await);
+        peer.manda(coordinator_message::Body::StageRelease(publicompute_proto::node::StageRelease {
+            chain_id: a.chain_id.clone(), assign_epoch: a.assign_epoch, reason: "busy".into(),
+        })).await;
+        peer.availability(Availability::EngineRecovering).await;
+        assert_eq!(sup.state(), EngineState::Busy);
+        peer.update_lease(lease_update::Status::Revoked(LeaseRevokeReason::Cancelled as i32)).await;
+        peer.availability(Availability::Idle).await;
+        assert_eq!(sup.state(), EngineState::Ready);
+
+        a.assign_epoch += 1;
+        peer.manda(coordinator_message::Body::StageAssign(a.clone())).await;
+        let installed = peer.attendi(5000, |msg| match msg {
+            node_message::Body::ModelInventory(inv) if !inv.models[0].loaded => Some(inv.models[0].clone()),
+            _ => None,
+        }).await.expect("unloaded model in inventory");
+        assert_eq!(installed, InstalledModel { loaded: false, ..initial.clone() });
+        peer.stage(State::Ready).await;
+        assert_eq!(sup.state(), EngineState::Parked);
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1, "llama-server still present");
+
+        peer.accept_chat(offer.clone()).await;
+        peer.update_lease(lease_update::Status::RenewedUntil(Timestamp::from(std::time::SystemTime::now()))).await;
+        let chat = tokio::spawn(coordinatore(peer._server.clone(), "chat".into(), None));
+        peer.stage(State::Running).await;
+        a.capability = vec![7, 8, 9];
+        peer.manda(coordinator_message::Body::StageAssign(a.clone())).await;
+        peer.stage(State::Running).await;
+        assert_eq!(std::fs::read(dir.join(format!("tls/capability-ad-{}.bin", a.assign_epoch))).unwrap(), a.capability);
+        let (_, result) = tokio::time::timeout(Duration::from_secs(7), chat).await.unwrap().unwrap();
+        let Some(request_result::Outcome::Completion(c)) = result.outcome else { panic!("{result:?}") };
+        assert_eq!(c.text, "Ciao è un test");
+        assert_eq!(sup.state(), EngineState::Parked);
+
+        peer.accept_chat(blocked).await;
+        peer.update_lease(lease_update::Status::RenewedUntil(Timestamp::from(std::time::SystemTime::now()))).await;
+        peer.stage(State::Running).await;
+        let (_commands, recv) = peer._server.accept_bi().await.unwrap();
+        let mut blocked_stream = FrameReader::new(recv);
+        assert!(matches!(blocked_stream.read::<WnMsg>().await.unwrap().unwrap().body, Some(wn::Body::Open(_))));
+        tokio::time::sleep(Duration::from_millis(850)).await;
+        assert_eq!(sup.stats.run().engine_restarts, 0, "parked engine must not recycle");
+        assert_eq!(sup.stats.run().probes_ok, 1, "parked engine must not probe");
+        peer.manda(coordinator_message::Body::StageRelease(publicompute_proto::node::StageRelease {
+            chain_id: a.chain_id.clone(), assign_epoch: a.assign_epoch, reason: "test release".into(),
+        })).await;
+        let mut in_transit = offer.clone();
+        in_transit.lease.as_mut().unwrap().lease_id = "in-transit".into();
+        peer.manda(coordinator_message::Body::WorkOffer(in_transit)).await;
+        peer.availability(Availability::EngineRecovering).await;
+        let released = peer.attendi(3000, |msg| match msg {
+            node_message::Body::LeaseRelease(release) => Some(release.clone()),
+            _ => None,
+        }).await.expect("chain lease released");
+        assert_eq!(released.lease_id, "L-chat");
+        assert!(blocked_stream.read::<WnMsg>().await.is_err(), "released chat stream should reset");
+        let rejected = peer.attendi(3000, |msg| match msg {
+            node_message::Body::LeaseReject(reject) => Some(reject.clone()),
+            _ => None,
+        }).await.expect("in-flight offer rejected");
+        assert_eq!((rejected.lease_id.as_str(), rejected.reason()), ("in-transit", LeaseRejectReason::HostBusy));
+        peer.stage(State::Stopped).await;
+        assert!(stages.head().is_none());
+        let installed = peer.attendi(5000, |msg| match msg {
+            node_message::Body::ModelInventory(inv) if inv.models[0].loaded => Some(inv.models[0].clone()),
+            _ => None,
+        }).await.expect("loaded model in inventory");
+        assert_eq!(installed, initial);
+        peer.availability(Availability::Idle).await;
+        assert_ne!(pid, sup.child_pid_for_test().await);
+        assert_eq!(sup.stats.run().engine_restarts, 0);
+
+        // An in-flight renewal of the closed epoch must leave Llama available.
+        peer.manda(coordinator_message::Body::StageAssign(a)).await;
+        peer.accept_chat(offer).await;
+        peer.update_lease(lease_update::Status::RenewedUntil(Timestamp::from(std::time::SystemTime::now()))).await;
+        let (_, result) = tokio::time::timeout(Duration::from_secs(7), coordinatore(peer._server.clone(), "chat".into(), None)).await.unwrap();
+        let Some(request_result::Outcome::Completion(c)) = result.outcome else { panic!("{result:?}") };
+        assert_ne!(c.text, "Ciao è un test");
+        peer.stop_tx.send(true).unwrap();
+        assert!(matches!(peer.done().await, SessionEnd::Shutdown));
+        sup.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dual_mode_resumes_after_stage_failure() {
+        let (cfg, _, _) = dual_node("dual-stage-failure", &[("FAKE_STAGE_EXIT_AFTER_MS", "500")], &[]).await;
+        let sup = cfg.sup.clone();
+        let pid = sup.child_pid_for_test().await;
+        let (mut peer, _) = Finta::start(cfg, welcome(Some(2), "", 100)).await;
+        peer.manda(coordinator_message::Body::StageAssign(assignment("ad", 1, 1, 2, 0))).await;
+        peer.stage(State::Ready).await;
+        peer.stage(State::Failed).await;
+        peer.availability(Availability::EngineRecovering).await;
+        peer.availability(Availability::Idle).await;
+        assert_ne!(pid, sup.child_pid_for_test().await);
+        peer.stop_tx.send(true).unwrap();
+        assert!(matches!(peer.done().await, SessionEnd::Shutdown));
+        sup.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dual_mode_stops_stage_on_gpu_loss_during_loading() {
+        use crate::gpu::{Device, ReadFailure};
+        let (cfg, _, port) = dual_node("dual-gpu-loss", &[("FAKE_STAGE_START_DELAY_MS", "2000")], &[]).await;
+        let (gpu, sup) = (cfg.gpu.clone(), cfg.sup.clone());
+        let (mut peer, _) = Finta::start(cfg, welcome(Some(2), "", 100)).await;
+        peer.manda(coordinator_message::Body::StageAssign(assignment("ad", 1, 1, 2, 0))).await;
+        peer.stage(State::Loading).await;
+        gpu.set_device_for_test(Device::Lost(ReadFailure::NoDevice));
+        peer.availability(Availability::PausedByHost).await;
+        peer.stage(State::Stopped).await;
+        assert_eq!(sup.state(), EngineState::Recovering);
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err());
+        assert_eq!(sup.stats.run().engine_restarts, 0);
+        gpu.set_device_for_test(Device::Ready("GPU-test".into()));
+        peer.availability(Availability::Idle).await;
+        peer.stop_tx.send(true).unwrap();
+        assert!(matches!(peer.done().await, SessionEnd::Shutdown));
+        sup.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dual_mode_control_eof_during_park_cancels_stage_start() {
+        let (cfg, dir, _) = dual_node("dual-eof", &[], &["--fake-ignore-term"]).await;
+        let sup = cfg.sup.clone();
+        let pid = sup.child_pid_for_test().await;
+        let (mut peer, _) = Finta::start(cfg, welcome(Some(2), "", 100)).await;
+        peer.manda(coordinator_message::Body::StageAssign(assignment("ad", 1, 1, 2, 0))).await;
+        let mut state = sup.subscribe();
+        tokio::time::timeout(Duration::from_secs(5), state.wait_for(|s| *s == EngineState::Parked)).await.unwrap().unwrap();
+        peer.send.finish().unwrap();
+        assert!(matches!(peer.done().await, SessionEnd::Lost(_)));
+        tokio::time::timeout(Duration::from_secs(7), state.wait_for(|s| *s == EngineState::Ready)).await.unwrap().unwrap();
+        assert!(!dir.join("log/stage-ad-1.log").exists());
+        assert_ne!(pid, sup.child_pid_for_test().await);
+        sup.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dual_mode_refuses_stage_if_single_exit_cannot_be_confirmed() {
+        let (cfg, dir, _) = dual_node("dual-stop-error", &[], &[]).await;
+        let stages = cfg.stages.as_ref().unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        stages.connect_peer(tx);
+        let pid = cfg.sup.child_pid_for_test().await as libc::pid_t;
+        // Consume the exit before the stage worker calls wait on the child.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) }, pid);
+        stages.queue_switch(assignment("ad", 1, 1, 2, 0), &cfg.sup, true).unwrap();
+        let status = prossimo(&mut rx).await;
+        assert_eq!(status.state(), State::Failed);
+        assert!(status.error.contains("could not stop llama-server"));
+        assert!(!dir.join("log/stage-ad-1.log").exists());
+        assert_ne!(cfg.sup.state(), EngineState::Ready);
+        cfg.sup.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dual_mode_does_not_use_another_server_on_the_llama_port() {
+        let (cfg, _, port) = dual_node("dual-busy-port", &[], &[]).await;
+        let sup = cfg.sup.clone();
+        let same_model = cfg.model_path.as_ref().unwrap().to_str().unwrap().to_owned();
+        let (mut peer, _) = Finta::start(cfg, welcome(Some(2), "", 100)).await;
+        peer.manda(coordinator_message::Body::StageAssign(assignment("ad", 1, 1, 2, 0))).await;
+        peer.stage(State::Ready).await;
+        let foreign = fake_llama::spawn(port, FakeState::new(&same_model)).await.unwrap();
+        peer.manda(coordinator_message::Body::StageRelease(publicompute_proto::node::StageRelease {
+            chain_id: "ad".into(), assign_epoch: 1, reason: "test release".into(),
+        })).await;
+        peer.availability(Availability::EngineRecovering).await;
+        peer.availability(Availability::EngineQuarantined).await;
+        assert_eq!(foreign.state.completions.load(Ordering::SeqCst), 0);
+        peer.stop_tx.send(true).unwrap();
+        assert!(matches!(peer.done().await, SessionEnd::Shutdown));
+        sup.shutdown().await;
+    }
+
     #[tokio::test]
     async fn hello_carries_preference() {
         let (_f, cfg) = nodo_con_modello("hello").await;
@@ -2034,7 +2620,7 @@ mod tests {
         assert_eq!(p.mode(), ContributionMode::Use);
         assert_eq!(p.model.as_ref().unwrap(), &modello_prova(), "model with the inventory fingerprint");
         assert_eq!(p.revision, rev);
-        assert!(fin.hello.features.contains(&(AgentFeature::Contribution as i32)));
+        assert_eq!(fin.hello.features, vec![AgentFeature::Contribution as i32]);
         assert_eq!(fin.hello.protocol_version.as_ref().unwrap().minor, 2);
         let _ = fin.stop_tx.send(true);
     }
@@ -2287,6 +2873,7 @@ mod tests {
         let abort = task.abort_handle();
         let mut leases = single_lease(ActiveLease {
             id: "L1".into(),
+            stage: false,
             progress: Default::default(),
             own: None,
             confirm: None,
@@ -2359,5 +2946,21 @@ mod tests {
         cfg.live.set_paused(false);
         sync_availability(&out, &cfg.sup, &cfg.live, &cfg.gpu, &mut last).await.unwrap();
         assert!(matches!(drain(&mut rx).as_slice(), [node_message::Body::Availability(a)] if a.availability == Availability::Idle as i32));
+    }
+
+    #[tokio::test]
+    async fn paused_session_rejects_a_stage_assignment_in_transit() {
+        let (cfg, _, stages) = nodo_testa("paused-stage-assign", vec![]).await;
+        stages.stop_all().await;
+        cfg.live.set_paused(true);
+        let (mut coordinator, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        coordinator.manda(coordinator_message::Body::StageAssign(assignment("paused-chain", 2, 1, 2, 0))).await;
+        let status = coordinator.attendi(2000, |body| match body {
+            node_message::Body::StageStatus(status) => Some(status.clone()),
+            _ => None,
+        }).await.unwrap();
+        assert_eq!((status.chain_id.as_str(), status.assign_epoch, status.state()), ("paused-chain", 2, State::Failed));
+        assert!(status.error.contains("paused"));
+        assert!(stages.head().is_none());
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "publicompute-agent"
-version = "0.1.1"
+version = "0.1.2"
 description = "Registers a node and runs inference assignments"
 edition.workspace = true
 license.workspace = true
@@ -47,6 +47,7 @@ iroh = "1.4.1"
 # Process-group signals let the supervisor stop engine descendants on Unix.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rustix = { version = "1.1", features = ["fs", "process"] }
 
 [dev-dependencies]
 # Sign fixture capabilities with the same Ed25519 scheme used by stage authentication.

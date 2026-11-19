@@ -94,7 +94,7 @@ echo "$VERSION" > "$PKG/VERSION"
 
 echo "== 5. archive"
 cd /work/tools/pacchetto/out
-rm -f "$NAME.tar.zst" SHA256SUMS
+rm -f "$NAME.tar.zst" SHA256SUMS SHA256SUMS.sig
 tar --transform "s,^publicompute,$NAME," -cf - publicompute | zstd -19 -T0 -q -o "$NAME.tar.zst"
 sha256sum "$NAME.tar.zst" > SHA256SUMS
 # Return ownership of the package outputs to the host user.

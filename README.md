@@ -42,12 +42,11 @@ rough edges, and tell us about them.
 ## Start here
 
 ```sh
-curl -fsSLO https://github.com/dr0p18/PubliCompute/releases/download/v0.1.1/install.sh
-sh install.sh
+curl -fsSL https://publicompute.com/install.sh -o install.sh && sh install.sh
 ```
 
 The installer asks for the **link code** that comes with your invitation,
-verifies the package against `SHA256SUMS`, installs the agent as a system
+verifies the signature of `SHA256SUMS` and the package against it, installs the agent as a system
 service and connects your card. Run it again with `--relink` to move the card
 to another account.
 
@@ -156,11 +155,6 @@ and the patches keep their MIT license.
 
 The idea for PubliCompute came from studying [DwarfStar](https://github.com/antirez/ds4), the inference engine by
 antirez. I’d like to thank him for his indirect contribution to the project.
-
-## Detailed guides
-
-*(to be written before the code is published)*: Install, The Chain, Credits,
-Verification, Privacy, Building from source.
 
 ## What is open source
 

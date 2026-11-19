@@ -53,7 +53,7 @@ Head and reference:
   --n-prompt N                  Number of prompts (default 4).
   --skip N                      Skip this many input prompts (default 0).
   --max-tokens N                Maximum new tokens per conversation (default 64).
-  --block N                     Tokens per prefill block (default 512).
+  --block N                     Tokens per prefill block (default up to 512, limited by batch and frame).
   --temperature X               Sampling temperature (default 0, greedy).
   --seed N                      Root sampling seed (default 1).
   --classes LIST                Comma-separated prompt classes: i or interactive, b or batch.
@@ -72,6 +72,7 @@ Head of a chain:
   --max-recoveries N            Maximum recoveries per conversation (default 3).
   --service ADDR                Accept requests from the agent on a loopback address,
                                 instead of reading --prompt. Open only once the chain is ready.
+  --service-pipe                Accept requests on stdin and send frames on stdout.
   --next ADDR                   Next stage's listen address.
   --listen-token ADDR           Listen for the tail's token stream.
   --test-state-int8             Test only: quantize each outgoing row to int8 and restore FP32.
@@ -99,6 +100,7 @@ Stage links:
   --write-timeout-s N           Write and send-queue timeout (default 120 s).
   --read-timeout-s N            Read timeout (default 0, allow idle links between requests).
   --queue-max-mib N             Maximum queued bytes per outgoing link in MiB (default 256).
+  --ingress-max-mib N           Maximum queued incoming work in MiB (default 512).
   --tls-cert FILE               Node certificate chain (PEM) with URI SAN publicompute:node:ID.
   --tls-key FILE                Node private key (PEM PKCS#8).
   --tls-ca FILE                 Coordinator CA (PEM).
@@ -135,7 +137,7 @@ fn parse(v: &[String]) -> Result<Args, String> {
     let mut i = 0;
     while i < v.len() {
         if let Some(k) = v[i].strip_prefix("--") {
-            if matches!(k, "identical-tokens" | "bit-identical" | "log-llama" | "all-positions" | "verifier-mode" | "test-state-int8" | "mtp") {
+            if matches!(k, "identical-tokens" | "bit-identical" | "log-llama" | "all-positions" | "verifier-mode" | "test-state-int8" | "mtp" | "service-pipe") {
                 m.insert(k.to_string(), String::new());
                 i += 1;
                 continue;
@@ -149,7 +151,7 @@ fn parse(v: &[String]) -> Result<Args, String> {
                     | "work-timeout-s" | "recovery-timeout-s" | "max-recoveries" | "service" | "next" | "listen-token"
                     | "state-format" | "draft-max-tokens" | "draft-source" | "test-draft-oracle"
                     | "test-draft-corrupt-every" | "draft-max-rows" | "test-mtp-depth" | "log-mtp"
-                    | "hello-timeout-s" | "write-timeout-s" | "read-timeout-s" | "queue-max-mib"
+                    | "hello-timeout-s" | "write-timeout-s" | "read-timeout-s" | "queue-max-mib" | "ingress-max-mib"
                     | "tls-cert" | "tls-key" | "tls-ca" | "capability" | "capability-pub" | "clock-offset-s"
                     | "input-format" | "index" | "listen" | "head-token" | "reconnect-grace-s"
                     | "reserve-timeout-s" | "idle-timeout-s" | "test-conv-error" | "test-pilot"
@@ -334,17 +336,26 @@ mod execution {
         let slots: u32 = a.num("slots", n_prompt as u32)?;
         let attesa_s: u64 = a.num("timeout-s", 300)?;
         let service = a.text("service").map(String::from);
-        if service.is_some() && reference {
-            return Err("--service requires a chain head".into());
+        let service_pipe = a.text("service-pipe").is_some();
+        if service_pipe && service.is_some() {
+            return Err("--service and --service-pipe are mutually exclusive".into());
+        }
+        if (service.is_some() || service_pipe) && reference {
+            return Err("service mode requires a chain head".into());
+        }
+        let block = a.num("block", 0)?;
+        if block == 0 && a.text("block").is_some() {
+            return Err("--block must be positive".into());
         }
         let o = HeadOptions {
             // Service requests supply their own prompts after startup.
-            prompt: if service.is_some() { a.text("prompt").unwrap_or_default().to_string() } else { a.richiesto("prompt")? },
+            prompt: if service.is_some() || service_pipe { a.text("prompt").unwrap_or_default().to_string() } else { a.richiesto("prompt")? },
             service,
+            service_pipe,
             n_prompt,
             salta: a.num("skip", 0)?,
             max_tokens: a.num("max-tokens", 64)?,
-            block: a.num("block", 512)?,
+            block,
             groups: a.num("groups", 2)?,
             temperature: a.num("temperature", 0.0)?,
             seed: a.num("seed", 1)?,
@@ -383,7 +394,7 @@ mod execution {
             Some(HeadLinks { next: a.richiesto("next")?, ascolta_token: a.richiesto("listen-token")? })
         };
         let m = engine(a, slots, false)?;
-        head::run(m, &o, network.as_ref(), slots)
+        head::run(m, o, network.as_ref(), slots)
     }
 
     pub fn stage(a: &Args, role: Role) -> Result<(), String> {
@@ -403,6 +414,7 @@ mod execution {
             ctx_per_slot: a.num("ctx-per-slot", 1024)?,
             attesa_s: a.num("timeout-s", 300)?,
             grazia_s: a.num("reconnect-grace-s", 3)?,
+            ingress_max_mib: a.num("ingress-max-mib", 512)?,
             experts: a.text("log-experts").map(String::from),
             top: a.text("log-top").map(String::from),
             thread_campiona: a.num("sampling-threads", 0)?,

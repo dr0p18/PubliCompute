@@ -13,7 +13,7 @@ use super::tests::{prossimo, tempdir};
 use super::*;
 use crate::engine::{
     progress::Progress,
-    stages::{Delta, StadiEngine},
+    stages::{delta_channel, StadiEngine},
     Generation, Limits,
 };
 use crate::bridge::{tests::relay_di_prova, Bridge};
@@ -158,12 +158,12 @@ async fn quattro_insieme(eng: &Arc<StadiEngine>) -> (Vec<Generation>, Vec<f64>) 
     for p in PROMPT {
         let e = eng.clone();
         task.push(tokio::spawn(async move {
-            let (dtx, mut drx) = mpsc::unbounded_channel::<Delta>();
+            let (dtx, mut drx, _) = delta_channel();
             let timings = tokio::spawn(async move {
                 let (mut v, mut previous) = (Vec::new(), None::<Instant>);
                 while let Some(d) = drx.recv().await {
                     let now = Instant::now();
-                    if let (Some(p), n) = (previous, d.token_ids.len()) {
+                    if let (Some(p), n) = (previous, d.item.token_ids.len()) {
                         if n > 0 {
                             v.extend(std::iter::repeat((now - p).as_secs_f64() * 1000.0 / n as f64).take(n));
                         }
@@ -189,13 +189,13 @@ async fn quattro_insieme(eng: &Arc<StadiEngine>) -> (Vec<Generation>, Vec<f64>) 
 async fn quattro_in_fila(eng: &Arc<StadiEngine>) -> (Vec<Generation>, Vec<f64>) {
     let (mut gen, mut timings) = (Vec::new(), Vec::new());
     for p in PROMPT {
-        let (dtx, mut drx) = mpsc::unbounded_channel::<Delta>();
+        let (dtx, mut drx, _) = delta_channel();
         let e = eng.clone();
         let chat = tokio::spawn(async move { e.chat(&request(p, TOKEN), Some(dtx), None).await.expect("chat") });
         let mut previous = None::<Instant>;
         while let Some(d) = drx.recv().await {
             let now = Instant::now();
-            if let (Some(p), n) = (previous, d.token_ids.len()) {
+            if let (Some(p), n) = (previous, d.item.token_ids.len()) {
                 if n > 0 {
                     timings.extend(std::iter::repeat((now - p).as_secs_f64() * 1000.0 / n as f64).take(n));
                 }
@@ -321,6 +321,267 @@ async fn real_bridge_matches_direct_chain_with_small_overhead() {
     server.shutdown().await.ok();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires both stage executables and fixture GGUF"]
+async fn mixed_stage_versions_replay_a_failed_conversation_in_both_directions() {
+    let (current, model) = ambiente().expect("set PUBLICOMPUTE_STAGE_BIN and PUBLICOMPUTE_STAGE_MODEL");
+    let legacy = PathBuf::from(std::env::var_os("PUBLICOMPUTE_STAGE_LEGACY_BIN").expect("set PUBLICOMPUTE_STAGE_LEGACY_BIN"));
+    let dir = tempdir("mixed-stage-replay");
+    for (name, head, tail) in [("legacy-head", &legacy, &current), ("legacy-tail", &current, &legacy)] {
+        let binaries = BatchStages { head, tail, middle: None, tail_args: &["--test-conv-error", "1:1"] };
+        let (listen, token) = (porta_libera().unwrap(), porta_libera().unwrap());
+        let next = format!("127.0.0.1:{listen}");
+        let token_address = format!("127.0.0.1:{token}");
+        let (output, _) = corsa_a_lotti(name, &dir, &binaries, &model, listen, token, &next, &token_address).await;
+        let rows = std::fs::read_to_string(&output).unwrap();
+        let lengths = rows.lines().map(|row| serde_json::from_str::<serde_json::Value>(row).unwrap()["token"].as_array().unwrap().len()).collect::<Vec<_>>();
+        assert_eq!(lengths, vec![TOKEN as usize; PROMPT.len()], "{name}");
+        let log = std::fs::read_to_string(dir.join(format!("{name}.head.log"))).unwrap();
+        assert!(log.contains("conversation fault"), "{name} did not exercise replay");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires both stage executables and fixture GGUF"]
+async fn mixed_stage_versions_reconnect_a_three_stage_chain_and_replay_tokens() {
+    let (current, model) = ambiente().expect("set PUBLICOMPUTE_STAGE_BIN and PUBLICOMPUTE_STAGE_MODEL");
+    let legacy = PathBuf::from(std::env::var_os("PUBLICOMPUTE_STAGE_LEGACY_BIN").expect("set PUBLICOMPUTE_STAGE_LEGACY_BIN"));
+    let dir = tempdir("mixed-link-replay");
+    let mut expected: Vec<Vec<i32>> = Vec::new();
+    // Keep the four-second outage case alongside the cases using the tail's default grace.
+    let long_grace: &[&str] = &["--reconnect-grace-s", "10"];
+    for (name, head, tail, outage_s, tail_args) in [
+        ("baseline", &current, &current, 0, &[][..]),
+        ("legacy-head", &legacy, &current, 1, &[][..]),
+        ("legacy-tail", &current, &legacy, 1, &[][..]),
+        ("legacy-head-long", &legacy, &current, 4, long_grace),
+        ("legacy-tail-long", &current, &legacy, 4, long_grace),
+    ] {
+        let (listen, token, middle) = (porta_libera().unwrap(), porta_libera().unwrap(), porta_libera().unwrap());
+        let downstream = format!("127.0.0.1:{listen}");
+        let proxy = if outage_s == 0 {
+            None
+        } else {
+            Some(interrupt_forward_link(&downstream, Duration::from_secs(outage_s)).await)
+        };
+        let middle_next = proxy.as_ref().map_or(downstream.as_str(), |(address, _, _)| address.as_str());
+        let binaries = BatchStages { head, tail, middle: Some((&current, middle_next)), tail_args };
+        let (output, _) = corsa_a_lotti(
+            name, &dir, &binaries, &model, listen, token, &format!("127.0.0.1:{middle}"), &format!("127.0.0.1:{token}"),
+        ).await;
+        let rows = std::fs::read_to_string(output).unwrap();
+        let tokens: Vec<Vec<i32>> = rows.lines().map(|row| {
+            let row: serde_json::Value = serde_json::from_str(row).unwrap();
+            serde_json::from_value(row["token"].clone()).unwrap()
+        }).collect();
+        assert_eq!(tokens.iter().map(Vec::len).collect::<Vec<_>>(), vec![TOKEN as usize; PROMPT.len()]);
+        if let Some((_, proxy, blocks)) = proxy {
+            proxy.abort();
+            let log = std::fs::read_to_string(dir.join(format!("{name}.head.log"))).unwrap();
+            assert!(log.contains("chain fault"), "{name}: {log}");
+            assert_eq!(log.matches("final attempt 2, 1 recoveries, transcript has no gaps or duplicates").count(), PROMPT.len(), "{name}: {log}");
+            let blocks = blocks.lock().unwrap();
+            for (i, (actual, baseline)) in tokens.iter().zip(&expected).enumerate() {
+                let id = i as u64 + 1;
+                let &(prompt, first_step) = blocks.get(&(id, 1)).expect("initial prefill");
+                let &(prefix, resumed_step) = blocks.get(&(id, 2)).expect("replayed prefill");
+                assert_eq!((first_step, resumed_step, prefix), (0, 1, prompt + 1), "{name}, conversation {id}");
+                assert_eq!(actual[0], baseline[0], "{name} changed the confirmed token for conversation {id}");
+            }
+        } else {
+            expected = tokens;
+        }
+    }
+}
+
+type PrefillBlocks = Arc<Mutex<std::collections::HashMap<(u64, u32), (u32, u32)>>>;
+
+/// Cut the forward link before the first generation round reaches the tail.
+/// Record final prefill blocks before and after the cut.
+async fn interrupt_forward_link(target: &str, outage: Duration) -> (String, tokio::task::JoinHandle<()>, PrefillBlocks) {
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::JoinSet;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let target = target.to_string();
+    let blocks = PrefillBlocks::default();
+    let captured = blocks.clone();
+    let proxy = tokio::spawn(async move {
+        let (signal, mut cut) = mpsc::channel(1);
+        let mut armed = true;
+        let mut streams = JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = cut.recv(), if armed => {
+                    armed = false;
+                    streams.shutdown().await;
+                    tokio::time::sleep(outage).await;
+                }
+                _ = streams.join_next(), if !streams.is_empty() => {}
+                incoming = listener.accept() => {
+                    let (from, _) = incoming.unwrap();
+                    let (target, captured) = (target.clone(), captured.clone());
+                    let signal = armed.then(|| signal.clone());
+                    streams.spawn(async move {
+                        let to = TcpStream::connect(target).await.ok()?;
+                        proxy_stage_stream(from, to, signal, captured).await
+                    });
+                }
+            }
+        }
+    });
+    (address, proxy, blocks)
+}
+
+async fn proxy_stage_stream(
+    mut from: tokio::net::TcpStream, mut to: tokio::net::TcpStream, cut: Option<mpsc::Sender<()>>, blocks: PrefillBlocks,
+) -> Option<()> {
+    use publicompute_proto::stage::{message::Body, Stream};
+    use publicompute_proto::wire::encode_frame;
+    use tokio::io::AsyncWriteExt;
+
+    let mut buf = bytes::BytesMut::new();
+    let hello = read_stage_frame(&mut from, &mut buf).await?;
+    let Some(Body::Hello(h)) = &hello.body else { return None };
+    let stream = h.stream;
+    let mut frame = Vec::new();
+    encode_frame(&hello, &mut frame).ok()?;
+    to.write_all(&frame).await.ok()?;
+    if stream != Stream::Prefill as i32 && !(stream == Stream::Generation as i32 && cut.is_some()) {
+        to.write_all(&buf).await.ok()?;
+        tokio::io::copy_bidirectional(&mut from, &mut to).await.ok()?;
+        return Some(());
+    }
+
+    let (mut from_read, mut from_write) = from.split();
+    let (mut to_read, mut to_write) = to.split();
+    let forward = async {
+        while let Some(message) = read_stage_frame(&mut from_read, &mut buf).await {
+            match &message.body {
+                Some(Body::Block(b)) if b.last => {
+                    blocks.lock().unwrap().insert((b.conversation_id, b.attempt_id), (b.start_position + b.n_token, b.first_token_step));
+                }
+                Some(Body::Step(_)) if cut.as_ref().is_some_and(|cut| cut.try_send(()).is_ok()) => return Some(()),
+                _ => {}
+            }
+            frame.clear();
+            encode_frame(&message, &mut frame).ok()?;
+            to_write.write_all(&frame).await.ok()?;
+        }
+        Some(())
+    };
+    tokio::select! {
+        result = forward => result,
+        result = tokio::io::copy(&mut to_read, &mut from_write) => result.ok().map(|_| ()),
+    }
+}
+
+async fn read_stage_frame(input: &mut (impl tokio::io::AsyncRead + Unpin), buf: &mut bytes::BytesMut) -> Option<publicompute_proto::stage::Message> {
+    use tokio::io::AsyncReadExt;
+
+    loop {
+        if let Some(message) = publicompute_proto::wire::try_decode_frame(buf).ok()? {
+            return Some(message);
+        }
+        if input.read_buf(buf).await.ok()? == 0 {
+            return None;
+        }
+    }
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the native stage executable and fixture GGUF"]
+async fn head_releases_slot_on_cancel_before_first_token_and_during_reconnect() {
+    use publicompute_proto::stage::{self as wire, message::Body, Stream};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn hello(listener: &TcpListener, stream: Stream) -> TcpStream {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let hello = read_stage_frame(&mut socket, &mut bytes::BytesMut::new()).await.unwrap();
+        assert!(matches!(hello.body, Some(Body::Hello(h)) if h.stream == stream as i32));
+        socket
+    }
+
+    async fn acknowledge(socket: &mut TcpStream) {
+        let message = wire::Message { body: Some(Body::Ack(wire::HelloAck { ok: true, error: String::new() })) };
+        let mut frame = Vec::new();
+        publicompute_proto::wire::encode_frame(&message, &mut frame).unwrap();
+        socket.write_all(&frame).await.unwrap();
+    }
+
+    async fn prefill(socket: &mut TcpStream, reader: &mut bytes::BytesMut, id: u64) -> u32 {
+        let open = read_stage_frame(socket, reader).await.unwrap();
+        let Some(Body::Open(open)) = open.body else { panic!("expected Open, received {open:?}") };
+        assert_eq!((open.conversation_id, open.attempt_id), (id, 1));
+        loop {
+            let block = read_stage_frame(socket, reader).await.unwrap();
+            assert!(matches!(&block.body, Some(Body::Block(b)) if b.conversation_id == id));
+            if matches!(block.body, Some(Body::Block(b)) if b.last) {
+                return open.slot;
+            }
+        }
+    }
+
+    async fn cancelled(request: &mut HeadResponses) {
+        let done = request.recv().await.unwrap();
+        assert!(matches!(done, OutgoingLink::Done(d) if d.reason == "cancelled"));
+    }
+
+    let (bin, model) = ambiente().expect("set PUBLICOMPUTE_STAGE_BIN and PUBLICOMPUTE_STAGE_MODEL");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let next = listener.local_addr().unwrap().to_string();
+    let token = format!("127.0.0.1:{}", porta_libera().unwrap());
+    let dir = tempdir("head-cancel-before-token");
+    let mut child = tokio::process::Command::new(bin)
+        .args(["head", "--model", model.to_str().unwrap(), "--ngl", "0", "--threads", "2", "--layer-end", "6"])
+        .args(["--slots", "1", "--groups", "1", "--ctx-per-slot", "512", "--n-batch", "64"])
+        .args(["--service-pipe", "--next", &next, "--listen-token", &token, "--work-timeout-s", "60"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(std::fs::File::create(dir.join("head.log")).unwrap())
+        .kill_on_drop(true).spawn().unwrap();
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut pf = hello(&listener, Stream::Prefill).await;
+        acknowledge(&mut pf).await;
+        let mut gen = hello(&listener, Stream::Generation).await;
+        acknowledge(&mut gen).await;
+        let mut ctl = hello(&listener, Stream::Control).await;
+        acknowledge(&mut ctl).await;
+        let (reader, writer, buf) = head_ready(child.stdout.take().unwrap(), child.stdin.take().unwrap()).await.unwrap();
+        let link = HeadConnection::from_io(reader, writer, buf);
+        let request = |id| pb::Request { id, text: "hello".into(), max_tokens: 8, ..Default::default() };
+
+        let mut buf = bytes::BytesMut::new();
+        let mut first = link.request(request(1)).await.unwrap();
+        let slot = prefill(&mut pf, &mut buf, 1).await;
+        link.cancel(1).await;
+        tokio::time::timeout(Duration::from_secs(2), cancelled(&mut first)).await.unwrap();
+        let close = read_stage_frame(&mut pf, &mut buf).await.unwrap();
+        assert!(matches!(close.body, Some(Body::Close(c)) if c.conversation_id == 1 && c.attempt_id == 1));
+
+        let mut second = link.request(request(2)).await.unwrap();
+        assert_eq!(prefill(&mut pf, &mut buf, 2).await, slot);
+        drop(ctl);
+        let mut pf = hello(&listener, Stream::Prefill).await;
+        // Hold back HelloAck until the local cancellation is complete.
+        link.cancel(2).await;
+        tokio::time::timeout(Duration::from_secs(2), cancelled(&mut second)).await.unwrap();
+        acknowledge(&mut pf).await;
+        let mut new_gen = hello(&listener, Stream::Generation).await;
+        acknowledge(&mut new_gen).await;
+        let mut new_ctl = hello(&listener, Stream::Control).await;
+        acknowledge(&mut new_ctl).await;
+
+        let mut third = link.request(request(3)).await.unwrap();
+        buf.clear();
+        assert_eq!(prefill(&mut pf, &mut buf, 3).await, slot);
+        link.cancel(3).await;
+        tokio::time::timeout(Duration::from_secs(2), cancelled(&mut third)).await.unwrap();
+    }).await.expect("head cancellation and reconnect completed");
+    child.kill().await.unwrap();
+}
+
 /// Drop the tail bridge during generation. The head must observe the link
 /// failure, end the chat within its stall deadline and allow both stages
 /// to shut down.
@@ -339,13 +600,13 @@ async fn real_bridge_disconnect_releases_stages() {
     let g = c.eng.chat(&request(PROMPT[0], 16), None, None).await.unwrap();
     assert_eq!(g.token_ids.len(), 16);
 
-    let (dtx, mut drx) = mpsc::unbounded_channel::<Delta>();
+    let (dtx, mut drx, _) = delta_channel();
     let e = c.eng.clone();
     let chat = tokio::spawn(async move { e.chat(&request(PROMPT[3], 400), Some(dtx), None).await });
     let mut visti = 0;
     while visti < 8 {
         let d = tokio::time::timeout(Duration::from_secs(60), drx.recv()).await.expect("token before disconnect").expect("token channel closed");
-        visti += d.token_ids.len();
+        visti += d.item.token_ids.len();
     }
     let t0 = Instant::now();
     p_coda.close().await;
@@ -384,9 +645,16 @@ async fn real_bridge_disconnect_releases_stages() {
     server.shutdown().await.ok();
 }
 
+struct BatchStages<'a> {
+    head: &'a Path,
+    tail: &'a Path,
+    middle: Option<(&'a Path, &'a str)>,
+    tail_args: &'a [&'a str],
+}
+
 /// Run the tail and head in batch mode to admit the four prompts together.
 /// Return the head's JSONL output and elapsed time.
-async fn corsa_a_lotti(name: &str, d: &Path, bin: &Path, model: &Path, p_listen: u16, p_token: u16, next: &str, testa_token: &str) -> (PathBuf, f64) {
+async fn corsa_a_lotti(name: &str, d: &Path, binaries: &BatchStages<'_>, model: &Path, p_listen: u16, p_token: u16, next: &str, testa_token: &str) -> (PathBuf, f64) {
     let prompt = d.join("prompt.txt");
     std::fs::write(&prompt, PROMPT.join("\n") + "\n").unwrap();
     let comuni = |c: &mut tokio::process::Command| {
@@ -394,23 +662,39 @@ async fn corsa_a_lotti(name: &str, d: &Path, bin: &Path, model: &Path, p_listen:
         c.kill_on_drop(true);
     };
     let log = |role: &str| std::fs::File::create(d.join(format!("{name}.{role}.log"))).unwrap();
-    let mut tail = tokio::process::Command::new(bin);
+    let mut tail = tokio::process::Command::new(binaries.tail);
     tail.arg("tail");
     comuni(&mut tail);
     tail.args(["--layer-start", "6", "--layer-end", "-1", "--listen", &format!("127.0.0.1:{p_listen}"), "--head-token", testa_token]);
+    tail.args(binaries.tail_args);
     let mut tail = tail.stdout(Stdio::null()).stderr(log("tail")).spawn().unwrap();
+    let mut middle = binaries.middle.map(|(bin, downstream)| {
+        let mut command = tokio::process::Command::new(bin);
+        command.arg("middle");
+        comuni(&mut command);
+        command.args(["--layer-start", "3", "--layer-end", "6", "--listen", next, "--next", downstream, "--timeout-s", "60"]);
+        command.stdout(Stdio::null()).stderr(log("middle")).spawn().unwrap()
+    });
+    let head_end = if middle.is_some() { "3" } else { "6" };
     let output = d.join(name);
-    let mut head = tokio::process::Command::new(bin);
+    let mut head = tokio::process::Command::new(binaries.head);
     head.arg("head");
     comuni(&mut head);
     head.args(["--prompt", prompt.to_str().unwrap(), "--n-prompt", "4", "--max-tokens", &TOKEN.to_string(), "--block", "64", "--temperature", "0", "--seed", "7"]);
-    head.args(["--timeout-s", "60", "--work-timeout-s", "60", "--recovery-timeout-s", "60", "--layer-start", "0", "--layer-end", "6"]);
+    head.args(["--timeout-s", "60", "--work-timeout-s", "60", "--recovery-timeout-s", "60", "--layer-start", "0", "--layer-end", head_end]);
+    if middle.is_some() {
+        head.args(["--prefill-order", "round-robin"]);
+    }
     head.args(["--next", next, "--listen-token", &format!("127.0.0.1:{p_token}"), "--output", output.to_str().unwrap()]);
     let t0 = Instant::now();
     let st = tokio::time::timeout(Duration::from_secs(180), head.stdout(Stdio::null()).stderr(log("head")).status()).await.expect("the head exits").unwrap();
     let durata = t0.elapsed().as_secs_f64();
     assert!(st.success(), "head {name}: {st:?} (log in {})", d.display());
-    let _ = tokio::time::timeout(Duration::from_secs(10), tail.wait()).await;
+    if let Some(middle) = &mut middle {
+        let _ = middle.kill().await;
+    } else {
+        let _ = tokio::time::timeout(Duration::from_secs(10), tail.wait()).await;
+    }
     let _ = tail.kill().await;
     (PathBuf::from(format!("{}.jsonl", output.display())), durata)
 }
@@ -427,9 +711,10 @@ async fn real_bridge_matches_direct_chain_with_fixed_batches() {
     let (server, url) = relay_di_prova().await;
     let (p_testa, p_coda) = (crate::bridge::tests::ponte_di_prova(&url).await, crate::bridge::tests::ponte_di_prova(&url).await);
     let locale = |p: u16| SocketAddr::from(([127, 0, 0, 1], p));
+    let binaries = BatchStages { head: &bin, tail: &bin, middle: None, tail_args: &[] };
 
     let (pl, pt) = (porta_libera().unwrap(), porta_libera().unwrap());
-    let (diretta, s_dir) = corsa_a_lotti("diretta", &d, &bin, &model, pl, pt, &locale(pl).to_string(), &locale(pt).to_string()).await;
+    let (diretta, s_dir) = corsa_a_lotti("diretta", &d, &binaries, &model, pl, pt, &locale(pl).to_string(), &locale(pt).to_string()).await;
 
     let (pl, pt) = (porta_libera().unwrap(), porta_libera().unwrap());
     let (mut g_testa, mut g_coda) = (p_testa.guard(), p_coda.guard());
@@ -437,7 +722,7 @@ async fn real_bridge_matches_direct_chain_with_fixed_batches() {
     p_testa.incoming(&mut g_testa, "lotti", 1, Direction::Token, locale(pt));
     let next = p_testa.output(&mut g_testa, "lotti", 1, Direction::Forward, &p_coda.id(), &url).await.unwrap();
     let token = p_coda.output(&mut g_coda, "lotti", 1, Direction::Token, &p_testa.id(), &url).await.unwrap();
-    let (bridge, s_ponte) = corsa_a_lotti("ponte", &d, &bin, &model, pl, pt, &next.to_string(), &token.to_string()).await;
+    let (bridge, s_ponte) = corsa_a_lotti("ponte", &d, &binaries, &model, pl, pt, &next.to_string(), &token.to_string()).await;
 
     let rows = |f: &Path| std::fs::read_to_string(f).unwrap().lines().count();
     assert_eq!(rows(&diretta), 4);

@@ -34,7 +34,7 @@ use publicompute_proto::service as pbs;
 use publicompute_proto::stage::{self as pb, message::Body};
 use std::collections::VecDeque;
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -115,6 +115,7 @@ pub struct HeadOptions {
     /// A loopback address enables persistent service. Agent requests enter
     /// admission instead of prompts read from a file.
     pub service: Option<String>,
+    pub service_pipe: bool,
     /// Maximum speculative rows per conversation and step. Zero disables drafts.
     /// Set the same limit on every stage so recurrent snapshots cover any rewind.
     pub max_draft_tokens: u32,
@@ -160,7 +161,7 @@ pub struct HeadLinks {
 /// replaced during recovery can be ignored.
 #[derive(Clone, Copy, Debug)]
 enum Fonte {
-    Control(u64),
+    Control(u32),
     Token(u64),
 }
 
@@ -197,8 +198,9 @@ struct Connected {
     prefill: Writer,
     gen: Writer,
     /// Keeps the write side of the control stream open.
-    _tieni: Vec<TcpStream>,
-    epoch: u64,
+    control: TcpStream,
+    caduto: Arc<AtomicBool>,
+    epoch: u32,
 }
 
 enum Downstream {
@@ -208,6 +210,8 @@ enum Downstream {
 
 struct DownstreamLinks {
     col: Connected,
+    /// Last wire epoch attempted, even if the handshake failed.
+    last_epoch: u32,
     rx: Receiver<HeadEvent>,
     tx: Sender<HeadEvent>,
     /// Number of the last accepted `Token` connection.
@@ -262,7 +266,6 @@ struct Conv {
     /// cancellation (close after the next recorded token), and UTF-8 buffering for output text.
     ext_id: u64,
     max_tokens: Option<u32>,
-    cancel: bool,
     utf8: Utf8Fragments,
     /// Sampling cutoffs are set by the service request.
     tagli: Tagli,
@@ -515,41 +518,40 @@ fn ascolta_token(r: &HeadLinks, richiede_mtp: bool) -> Result<TokenListener, Str
 }
 
 /// Connect to the first downstream stage on all three streams, retrying up to `timeout`.
-fn connect_forward(next: &str, timeout: Duration, tx: &Sender<HeadEvent>, epoch: u64) -> Result<Connected, String> {
-    let e32 = epoch.min(u64::from(u32::MAX)) as u32;
-    let (lp, wp) = network::connect(next, pb::Stream::Prefill, timeout, e32)?;
-    let (lg, wg) = network::connect(next, pb::Stream::Generation, timeout, e32)?;
-    let (mut lc, wc) = network::connect(next, pb::Stream::Control, timeout, e32)?;
+fn connect_forward(next: &str, timeout: Duration, tx: &Sender<HeadEvent>, epoch: &mut u32) -> Result<Connected, String> {
+    let [(lp, wp), (lg, wg), (mut lc, wc)] = network::connect_forward(next, timeout, epoch)?;
+    let epoch = *epoch;
+    let caduto = Arc::new(AtomicBool::new(false));
+    let lost = caduto.clone();
     let tx_c = tx.clone();
-    std::thread::spawn(move || loop {
-        match lc.read() {
-            Ok(Some(pb::Message { body: Some(Body::Confirmation(c)) })) => {
-                let _ = tx_c.send(HeadEvent::Confirmation(c));
+    std::thread::spawn(move || {
+        let reason = loop {
+            match lc.read() {
+                Ok(Some(pb::Message { body: Some(Body::Confirmation(c)) })) => {
+                    let _ = tx_c.send(HeadEvent::Confirmation(c));
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break "stage closed the control stream".into(),
+                Err(e) => break format!("control stream: {e}"),
             }
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                let _ = tx_c.send(HeadEvent::Guasto(Fonte::Control(epoch), "stage closed the control stream".into()));
-                break;
-            }
-            Err(e) => {
-                let _ = tx_c.send(HeadEvent::Guasto(Fonte::Control(epoch), format!("control stream: {e}")));
-                break;
-            }
-        }
+        };
+        lost.store(true, Ordering::SeqCst);
+        let _ = tx_c.send(HeadEvent::Guasto(Fonte::Control(epoch), reason));
     });
     drop((lp, lg));
-    Ok(Connected { prefill: Writer::new(wp, "prefill"), gen: Writer::new(wg, "generation"), _tieni: vec![wc], epoch })
+    Ok(Connected { prefill: Writer::new(wp, "prefill"), gen: Writer::new(wg, "generation"), control: wc, caduto, epoch })
 }
 
 fn connect_downstream(r: &HeadLinks, timeout: Duration, richiede_mtp: bool) -> Result<Downstream, String> {
     let (rx, tx, tok_serial, rifiuto) = ascolta_token(r, richiede_mtp)?;
+    let mut epoch = 1;
     let col = if richiede_mtp {
         // The chain is connected on a helper thread: a tail refused because it has no MTP block ends the head at once
         // with that reason, instead of after the whole `timeout` of a chain that will never answer.
         let (txc, rxc) = channel();
         let (next, tx2) = (r.next.clone(), tx.clone());
         std::thread::spawn(move || {
-            let _ = txc.send(connect_forward(&next, timeout, &tx2, 1));
+            let _ = txc.send(connect_forward(&next, timeout, &tx2, &mut epoch));
         });
         let esito = loop {
             if let Some(reason) = rifiuto.lock().unwrap().clone() {
@@ -571,10 +573,10 @@ fn connect_downstream(r: &HeadLinks, timeout: Duration, richiede_mtp: bool) -> R
         }
         col
     } else {
-        connect_forward(&r.next, timeout, &tx, 1)?
+        connect_forward(&r.next, timeout, &tx, &mut epoch)?
     };
     let tok_min = tok_serial.load(Ordering::SeqCst);
-    Ok(Downstream::Rete(Box::new(DownstreamLinks { col, rx, tx, tok_serial, tok_min })))
+    Ok(Downstream::Rete(Box::new(DownstreamLinks { last_epoch: col.epoch, col, rx, tx, tok_serial, tok_min })))
 }
 
 /// Compact completed request indices only when idle and above this count.
@@ -696,15 +698,39 @@ impl Head<'_> {
     }
 
     /// Send on prefill (`gen = false`) or generation. A send error means the link is down.
-    fn manda(&mut self, gen: bool, m: pb::Message) -> R {
-        let r = match &self.valle {
-            Downstream::Rete(v) => (if gen { &v.col.gen } else { &v.col.prefill }).send(&m),
-            Downstream::Locale => Ok(()),
-        };
-        r.map_err(|e| {
+    fn manda(&mut self, gen: bool, m: pb::Message, still_needed: impl Fn(&Self) -> bool) -> R {
+        let mut frame = network::encode(&m).map_err(|e| {
             self.rotta = true;
             Fail::Guasto(e)
-        })
+        })?;
+        let timeout = Writer::queue_timeout();
+        let done = Instant::now() + timeout;
+        let reason = loop {
+            let Downstream::Rete(v) = &self.valle else { return Ok(()) };
+            if self.rotta || v.col.caduto.load(Ordering::SeqCst) {
+                break "stage closed the control stream".into();
+            }
+            let writer = if gen { &v.col.gen } else { &v.col.prefill };
+            let wait = done.saturating_duration_since(Instant::now()).min(Duration::from_millis(50));
+            match writer.send_frame_with_wait(frame, wait) {
+                Ok(None) => return Ok(()),
+                Ok(Some(bytes)) => frame = bytes,
+                Err(e) => break e,
+            }
+            // Keep servicing Cancel while the writer waits for the peer to read.
+            self.poll_service();
+            if self.serv.as_ref().is_some_and(Service::pipe_closed) {
+                return Err(Fail::Fatale("agent pipe closed".into()));
+            }
+            if !still_needed(self) {
+                return Ok(());
+            }
+            if Instant::now() >= done {
+                break format!("stage writer queue full for {timeout:?}");
+            }
+        };
+        self.rotta = true;
+        Err(Fail::Guasto(reason))
     }
 
     /// Apply the state machine's actions. `Close` is best effort because a dropped link has no receiver and
@@ -714,11 +740,19 @@ impl Head<'_> {
             match a {
                 Action::Open { tentativo, start_position } => self.convs[c].da_aprire = Some((tentativo, start_position)),
                 Action::Close { tentativo } => {
-                    let conv_id = self.convs[c].conv_id;
-                    // Shares the prefill stream with `Open` so the next Open for the slot cannot overtake Close.
-                    let m = msg(Body::Close(pb::Close { conversation_id: conv_id, attempt_id: tentativo }));
-                    let gen = m.body.as_ref().is_some_and(network::on_generation_stream);
-                    let _ = self.manda(gen, m);
+                    if let Downstream::Rete(v) = &self.valle {
+                        if !self.rotta {
+                            // Close shares the prefill stream so Open cannot overtake it.
+                            let close = msg(Body::Close(pb::Close {
+                                conversation_id: self.convs[c].conv_id, attempt_id: tentativo,
+                            }));
+                            if let Err(e) = v.col.prefill.send_with_wait(&close, Duration::from_millis(100)) {
+                                self.rotta = true;
+                                let _ = v.col.control.shutdown(std::net::Shutdown::Both);
+                                eprintln!("[head] could not send Close: {e}");
+                            }
+                        }
+                    }
                 }
                 Action::ErroreClient(reason) => {
                     eprintln!("[head] conversation {} failed ({:?})", self.convs[c].prompt_id, reason);
@@ -757,7 +791,7 @@ impl Head<'_> {
             sampling: Some(pb::Sampling { temperature: self.convs[c].seme_ctl.0, root_seed: self.convs[c].seme_ctl.1, top_p: self.convs[c].tagli.top_p, top_k: self.convs[c].tagli.top_k }),
             state_format: self.o.state_format as i32,
         };
-        self.manda(false, msg(Body::Open(ap)))
+        self.manda(false, msg(Body::Open(ap)), |head| head.convs[c].done.is_none())
     }
 
     /// Compute and send the next prefill block for conversation `c`.
@@ -802,6 +836,7 @@ impl Head<'_> {
                     token: token_blocco,
                     draft_count: k_blocco,
                 })),
+                |head| head.convs[c].done.is_none(),
             ),
             (Downstream::Locale, None) => {
                 if last {
@@ -955,6 +990,7 @@ impl Head<'_> {
                     state: encode_state(&s, self.m.n_embd, self.m.stream_count, self.o.state_format),
                     stream_count: crate::network::declared_stream_count(self.o.state_format, self.m.stream_count),
                 })),
+                |head| membri.iter().any(|&c| head.convs[c].done.is_none()),
             ),
             (Downstream::Locale, None) => {
                 let mut logit: Vec<&[f32]> = Vec::with_capacity(rp.len());
@@ -1031,18 +1067,26 @@ impl Head<'_> {
 
     /// Wait for a `Token` that matches `pred`. Leave the others in `pronti`. An error `Confirmation`, dropped
     /// link or expired `T_lavoro` triggers recovery.
-    fn attendi(&mut self, pred: impl Fn(&pb::Token) -> bool, cosa: &str) -> R<(pb::Token, Instant)> {
+    fn attendi(&mut self, pred: impl Fn(&pb::Token) -> bool, obsolete: impl Fn(&Self) -> bool, cosa: &str) -> R<Option<(pb::Token, Instant)>> {
         let limite = Instant::now() + Duration::from_secs(self.o.t_lavoro_s);
         loop {
+            self.poll_service();
+            if self.serv.as_ref().is_some_and(Service::pipe_closed) {
+                return Err(Fail::Fatale("agent pipe closed".into()));
+            }
+            if obsolete(self) {
+                return Ok(None);
+            }
             if let Some(i) = self.pronti.iter().position(|(t, _)| pred(t)) {
-                return Ok(self.pronti.remove(i));
+                return Ok(Some(self.pronti.remove(i)));
             }
             let Downstream::Rete(v) = &self.valle else {
                 return Err(Fail::Fatale(format!("{cosa}: no token ready in the reference run")));
             };
             let resto = limite.saturating_duration_since(Instant::now());
             let t_att = Instant::now();
-            let r = v.rx.recv_timeout(resto.min(Duration::from_secs(5)));
+            let intervallo = if self.serv.is_some() { Duration::from_millis(50) } else { Duration::from_secs(5) };
+            let r = v.rx.recv_timeout(resto.min(intervallo));
             crate::timings::aggiungi(crate::timings::Fase::Attesa, t_att.elapsed());
             match r {
                 Ok(HeadEvent::Token(t, q)) => {
@@ -1055,7 +1099,7 @@ impl Head<'_> {
                     // A chain-wide Confirmation from a superseded link describes a fault already handled by the recovery
                     // that reconnected the chain, so it must not start another recovery.
                     let corrente = if let Downstream::Rete(v) = &self.valle { v.col.epoch } else { 0 };
-                    if c.conversation_id == 0 && conferma_catena_vecchia(c.epoch, corrente) {
+                    if c.conversation_id == 0 && conferma_catena_vecchia(c.epoch, u64::from(corrente)) {
                         self.prot.conferma_vecchia(c.stage);
                         eprintln!("[head] ignoring a chain error from stale epoch {} < {corrente}: {m}", c.epoch);
                         continue;
@@ -1063,7 +1107,10 @@ impl Head<'_> {
                     match classify_confirmation(&self.convs, &c) {
                         ConfirmationClass::Ignora => {}
                         ConfirmationClass::Conv(i) => return Err(Fail::GuastoConv(i, m)),
-                        ConfirmationClass::Chain => return Err(Fail::Guasto(m)),
+                        ConfirmationClass::Chain => {
+                            self.rotta = true;
+                            return Err(Fail::Guasto(m));
+                        }
                     }
                 }
                 Ok(HeadEvent::Guasto(f, e)) => {
@@ -1125,21 +1172,27 @@ impl Head<'_> {
             pezzo = self.m.pezzo(r.token);
             self.convs[c].pezzi.extend_from_slice(&pezzo);
         }
-        let mut stop = false;
-        if self.convs[c].ext_id != 0 {
-            stop = self.service_token(c, r, eog, &pezzo);
-        }
+        let stop = if self.convs[c].ext_id != 0 {
+            match self.service_token(c, r, eog, &pezzo) {
+                Ok(stop) => stop,
+                Err(()) => {
+                    self.service_cancel(c);
+                    self.convs[c].done = Some("output_stalled");
+                    return Ok(());
+                }
+            }
+        } else {
+            false
+        };
         let cv = &mut self.convs[c];
         let limite = cv.forzati.as_ref().map_or(cv.max_tokens.unwrap_or(self.o.max_tokens) as usize, |f| f.len());
-        if eog || stop || cv.token.len() >= limite || cv.cancel {
+        if eog || stop || cv.token.len() >= limite {
             cv.done = Some(if eog {
                 "eog"
             } else if stop {
                 "stop"
-            } else if cv.token.len() >= limite {
-                "max_token"
             } else {
-                "cancelled"
+                "max_token"
             });
             // Close the request once its response is complete so its slot can be reused.
             let mut az = cv.c.finish_response(adesso).map_err(|e| format!("end of response rejected: {e:?}"))?;
@@ -1161,7 +1214,10 @@ impl Head<'_> {
         let n = self.convs.len();
         let da_aprire: Vec<usize> = (0..n).filter(|&c| self.convs[c].done.is_none() && self.convs[c].ammessa && self.convs[c].da_aprire.is_some()).collect();
         for &c in &da_aprire {
-            self.open(c)?;
+            self.poll_service();
+            if self.convs[c].done.is_none() {
+                self.open(c)?;
+            }
         }
         // Conversations awaiting prefill or a first token (already opened for the first time or for recovery).
         let in_ricostruzione = |s: &Self| -> Vec<usize> {
@@ -1182,7 +1238,8 @@ impl Head<'_> {
         loop {
             let mut fatto = false;
             for &c in &da_fare {
-                if self.convs[c].inviati < self.convs[c].da_inviare.len() {
+                self.poll_service();
+                if self.convs[c].done.is_none() && self.convs[c].inviati < self.convs[c].da_inviare.len() {
                     self.block(c)?;
                     fatto = true;
                 }
@@ -1197,10 +1254,11 @@ impl Head<'_> {
                 continue; // Already recorded (back after recovering another conversation).
             }
             let (id, tent) = (self.convs[c].conv_id, self.convs[c].c.tentativo());
-            let (t, q) = self.attendi(
+            let Some((t, q)) = self.attendi(
                 |t| t.prefill && t.rows.first().is_some_and(|r| r.conversation_id == id && r.attempt_id == tent),
+                |head| head.convs[c].done.is_some(),
                 "the first token",
-            )?;
+            )? else { continue };
             for r in &t.rows {
                 self.registra(r, q, t.stage)?;
             }
@@ -1229,8 +1287,23 @@ impl Head<'_> {
         loop {
             if let Some(&g) = self.in_volo.front() {
                 let r = self.round[g];
-                let (t, q) = self.attendi(|t| !t.prefill && t.group_id == g as u32 && t.group_round == r, &format!("group {g}, round {r}"))?;
+                let reply = self.attendi(
+                    |t| !t.prefill && t.group_id == g as u32 && t.group_round == r,
+                    |head| head.membri_volo[g].iter().all(|&(c, _)| head.convs[c].done.is_some()),
+                    &format!("group {g}, round {r}"),
+                )?;
                 self.in_volo.pop_front();
+                let Some((t, q)) = reply else {
+                    self.membri_volo[g].clear();
+                    self.round[g] += 1;
+                    let m = self.membri(g);
+                    if !m.is_empty() {
+                        self.step(g, self.round[g], &m)?;
+                        self.in_volo.push_back(g);
+                    }
+                    self.admission(false)?;
+                    continue;
+                };
                 self.passi += 1;
                 self.mis.token(g, q);
                 let now = Instant::now();
@@ -1298,6 +1371,9 @@ impl Head<'_> {
                     if self.convs.iter().any(|c| c.done.is_none() && c.orfana) {
                         break; // Wait for the error below.
                     }
+                    if !self.amm.pendenti() && self.corrente.is_none() && self.attesa_primo.is_empty() {
+                        break;
+                    }
                     return Err(Fail::Fatale("admission blocked: no work in flight, no free slots and no pending arrivals".into()));
                 }
             } else {
@@ -1307,7 +1383,11 @@ impl Head<'_> {
         // No step in flight, but a conversation awaits its error. Wait for that error or expired
         // `T_lavoro` (chain fault). Never return `Ok`.
         if self.convs.iter().any(|c| c.done.is_none() && c.orfana) {
-            self.attendi(|_| false, "an error from an unresponsive conversation")?;
+            self.attendi(
+                |_| false,
+                |head| !head.convs.iter().any(|c| c.done.is_none() && c.orfana),
+                "an error from an unresponsive conversation",
+            )?;
         }
         Ok(())
     }
@@ -1368,10 +1448,11 @@ impl Head<'_> {
                 break;
             }
             let (id, tent) = (self.convs[c].conv_id, self.convs[c].c.tentativo());
-            let (tk, q) = self.attendi(
+            let Some((tk, q)) = self.attendi(
                 |t| t.prefill && t.rows.first().is_some_and(|r| r.conversation_id == id && r.attempt_id == tent),
+                |head| head.convs[c].done.is_some(),
                 "the first token of an admitted conversation",
-            )?;
+            )? else { fatto = true; continue };
             self.attesa_primo.pop_front();
             for r in &tk.rows {
                 self.registra(r, q, tk.stage)?;
@@ -1416,7 +1497,9 @@ impl Head<'_> {
             if let Some((c, g, locale)) = self.amm.prossima() {
                 self.admit(c, g, locale, true);
                 self.open(c)?;
-                self.corrente = Some(c);
+                if self.convs[c].done.is_none() {
+                    self.corrente = Some(c);
+                }
                 fatto = true;
             }
         }
@@ -1425,7 +1508,7 @@ impl Head<'_> {
             self.block(c)?;
             self.lavoro_amm = true;
             fatto = true;
-            if self.convs[c].inviati >= self.convs[c].da_inviare.len() {
+            if self.corrente == Some(c) && self.convs[c].inviati >= self.convs[c].da_inviare.len() {
                 self.corrente = None;
                 self.attesa_primo.push_back((c, self.giro_amm));
             }
@@ -1503,10 +1586,39 @@ impl Head<'_> {
     fn ricollega(&mut self) -> Result<(), String> {
         let r = self.network.ok_or("no links to reconnect")?;
         let timeout = Duration::from_secs(self.o.attesa_s);
-        let Downstream::Rete(v) = &mut self.valle else { return Err("no links to reconnect".into()) };
-        let new = connect_forward(&r.next, timeout, &v.tx, v.col.epoch + 1)?;
+        let Downstream::Rete(v) = &self.valle else { return Err("no links to reconnect".into()) };
+        let mut epoch = v.last_epoch.checked_add(1).ok_or("stage link epoch exhausted")?;
+        v.col.prefill.abort();
+        v.col.gen.abort();
+        let _ = v.col.control.shutdown(std::net::Shutdown::Both);
+        let new = if self.serv.is_some() {
+            let (next, tx) = (r.next.clone(), v.tx.clone());
+            let (result, wait) = channel();
+            std::thread::spawn(move || {
+                let new = connect_forward(&next, timeout, &tx, &mut epoch);
+                let _ = result.send((new, epoch));
+            });
+            loop {
+                self.poll_service();
+                if self.serv.as_ref().is_some_and(Service::pipe_closed) {
+                    return Err("agent pipe closed".into());
+                }
+                match wait.recv_timeout(Duration::from_millis(50)) {
+                    Ok((result, last_epoch)) => {
+                        epoch = last_epoch;
+                        break result;
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => return Err("reconnect worker stopped".into()),
+                }
+            }
+        } else {
+            connect_forward(&r.next, timeout, &v.tx, &mut epoch)
+        };
+        let Downstream::Rete(v) = &mut self.valle else { unreachable!() };
+        v.last_epoch = epoch;
         // Drop the old writers without waiting. Their threads exit on their own.
-        v.col = new;
+        v.col = new?;
         v.tok_min = v.tok_serial.load(Ordering::SeqCst);
         self.rotta = false;
         Ok(())
@@ -1515,6 +1627,7 @@ impl Head<'_> {
     /// Retire all live attempts after a chain fault. Reconnect if needed, then
     /// give each conversation a new attempt within its own recovery limits.
     fn recovery(&mut self, reason: &str) {
+        self.poll_service();
         let adesso = self.adesso();
         self.episodio += 1;
         self.gen_avviata = false;
@@ -1542,7 +1655,8 @@ impl Head<'_> {
             self.m.svuota_posto(slot);
         }
         let mut ricollegata = true;
-        if self.rotta {
+        let reconnect = self.rotta;
+        if reconnect {
             if let Err(e) = self.ricollega() {
                 eprintln!("[head] cannot rebuild the chain: {e}");
                 ricollegata = false;
@@ -1550,9 +1664,12 @@ impl Head<'_> {
         }
         // Drop everything in flight or already arrived because it belongs to closed attempts.
         self.pronti.clear();
-        if let Downstream::Rete(v) = &self.valle {
-            while v.rx.try_recv().is_ok() {}
+        if !reconnect {
+            if let Downstream::Rete(v) = &self.valle {
+                while v.rx.try_recv().is_ok() {}
+            }
         }
+        self.poll_service();
         let now = self.adesso();
         for c in 0..n {
             if self.convs[c].done.is_some() || self.convs[c].c.state() != Status::Suspended {
@@ -1680,6 +1797,9 @@ impl Head<'_> {
     fn corsa_servizio(&mut self) -> R {
         loop {
             self.poll_service();
+            if self.serv.as_ref().is_some_and(Service::pipe_closed) {
+                return Err(Fail::Fatale("agent pipe closed".into()));
+            }
             let now = self.ms(Instant::now());
             for c in self.amm.arriva(self.passi, false) {
                 self.convs[c].t_arrivo_ms = Some(now);
@@ -1742,6 +1862,9 @@ impl Head<'_> {
     /// Take events already received on the socket, close finished conversations (`Done`) and update `Status`.
     /// Call on every admission round so new requests enter as arrivals between group `Token` messages.
     fn poll_service(&mut self) {
+        if self.serv.is_none() {
+            return;
+        }
         while let Some(ev) = self.serv.as_ref().and_then(|s| s.prova_evento()) {
             self.service_event(ev);
         }
@@ -1753,9 +1876,10 @@ impl Head<'_> {
         let state = (self.posti_tot.saturating_sub(self.amm.occupati() as u32), self.serv_vive.len() as u32);
         if self.serv_stato != Some(state) {
             if let Some(s) = &self.serv {
-                s.manda(pbs::FromHead { body: Some(pbs::from_head::Body::Status(pbs::Status { free_slots: state.0, pending: state.1 })) });
+                if s.manda(pbs::FromHead { body: Some(pbs::from_head::Body::Status(pbs::Status { free_slots: state.0, pending: state.1 })) }) {
+                    self.serv_stato = Some(state);
+                }
             }
-            self.serv_stato = Some(state);
         }
     }
 
@@ -1822,16 +1946,17 @@ impl Head<'_> {
             }
             let limite = (self.o.ctx_per_slot as usize).saturating_sub(max_tokens as usize);
             let m = &self.m;
-            let adattata = crate::service::fit_context(r.messages.clone(), limite, |v| m.prepara_conversazione(v).map(|(t, _, _)| t.len()));
+            let adattata = crate::service::fit_context(&r.messages, limite, |messages| {
+                let (tokens, _, _) = m.prepara_conversazione(messages)?;
+                let count = tokens.len();
+                Ok((tokens, count))
+            });
             match adattata {
-                Ok((msgs, tolti)) => {
+                Ok((tokens, tolti)) => {
                     if tolti > 0 {
                         eprintln!("[head] request {} exceeded the context; dropped {tolti} oldest messages", r.id);
                     }
-                    match self.m.prepara_conversazione(&msgs) {
-                        Ok((t, _, _)) => t,
-                        Err(e) => return self.reject_request(r.id, format!("cannot prepare prompt: {e}")),
-                    }
+                    tokens
                 }
                 Err(e) => return self.reject_request(r.id, format!("{e}: prompt exceeds the slot context ({})", self.o.ctx_per_slot)),
             }
@@ -1884,7 +2009,6 @@ impl Head<'_> {
             sospensioni: 0,
             ext_id: r.id,
             max_tokens: Some(max_tokens),
-            cancel: false,
             utf8: Utf8Fragments::default(),
             tagli: Tagli { top_p: camp.top_p, top_k: camp.top_k },
             filtro: StopFilter::new(&r.stop),
@@ -1893,32 +2017,42 @@ impl Head<'_> {
         self.serv_vive.push(idx);
     }
 
-    /// Cancel a request. Remove a queued request immediately. If admitted, close on the next recorded
-    /// token (`registra`), sending `Close` to the stages and freeing the slot as at end of response.
+    /// Retire the attempt and release the admission as soon as Cancel arrives.
     fn service_cancel(&mut self, c: usize) {
         if self.convs[c].done.is_some() {
             return;
         }
-        if !self.convs[c].ammessa && self.amm.cancel(c) {
-            self.convs[c].done = Some("cancelled");
-        } else {
-            self.convs[c].cancel = true;
+        let now = self.adesso();
+        let actions = self.convs[c].c.cancel(now).unwrap_or_default();
+        if !self.amm.cancel(c) && self.convs[c].ammessa {
+            self.m.svuota_posto(self.convs[c].slot);
+            self.amm.libera(c);
+            self.applica(c, actions);
         }
+        let cv = &mut self.convs[c];
+        cv.done = Some("cancelled");
+        cv.da_aprire = None;
+        cv.orfana = false;
+        if self.corrente == Some(c) {
+            self.corrente = None;
+        }
+        self.attesa_primo.retain(|&(idx, _)| idx != c);
+        let id = cv.conv_id;
+        self.pronti.retain(|(t, _)| !t.prefill || !t.rows.iter().any(|r| r.conversation_id == id));
     }
 
-    /// Report the committed token's text to the agent. Return true when a stop
-    /// string matches, omitting the match and any following text.
-    fn service_token(&mut self, c: usize, r: &pb::TokenRow, eog: bool, pezzo: &[u8]) -> bool {
+    /// Report a committed token. A full output queue cancels its request.
+    fn service_token(&mut self, c: usize, r: &pb::TokenRow, eog: bool, pezzo: &[u8]) -> Result<bool, ()> {
         let cv = &mut self.convs[c];
         let completo = if eog { String::new() } else { cv.utf8.aggiungi(pezzo) };
         let (text, stop) = if completo.is_empty() { (String::new(), false) } else { cv.filtro.passa(&completo) };
-        let id = cv.ext_id;
         if let Some(s) = &self.serv {
-            s.manda(pbs::FromHead {
-                body: Some(pbs::from_head::Body::Token(pbs::OutputToken { id, token: r.token, text, logprob: r.logprob, step: r.conversation_step, eog })),
-            });
+            let token = pbs::OutputToken { id: cv.ext_id, token: r.token, text, logprob: r.logprob, step: r.conversation_step, eog };
+            if !s.manda(pbs::FromHead { body: Some(pbs::from_head::Body::Token(token)) }) {
+                return Err(());
+            }
         }
-        stop
+        Ok(stop)
     }
 
     /// Send the terminal frame, then release allocations that are no longer needed.
@@ -1926,6 +2060,7 @@ impl Head<'_> {
         let now = self.ms(Instant::now());
         let cv = &mut self.convs[c];
         let arrivo = cv.t_arrivo_ms.unwrap_or(now);
+        let stalled = cv.done == Some("output_stalled");
         let done = pbs::Done {
             id: cv.ext_id,
             reason: cv.done.unwrap_or("failed").to_string(),
@@ -1935,9 +2070,9 @@ impl Head<'_> {
                 ttft_ms: cv.tempi_ms.first().map_or(0.0, |t| (t - arrivo).max(0.0)),
                 total_ms: (now - arrivo).max(0.0),
             }),
-            error: String::new(),
+            error: if stalled { "head service output queue is full".into() } else { String::new() },
             // On `stop`, the buffered text was the start of the stop string, so drop it.
-            remaining_text: if cv.done == Some("stop") {
+            remaining_text: if stalled || cv.done == Some("stop") {
                 cv.utf8.clear();
                 cv.filtro.clear();
                 String::new()
@@ -2019,8 +2154,9 @@ fn forma_verificatore(m: &mut Engine, convs: &mut [Conv], o: &HeadOptions, top: 
 /// per-request output through that socket.
 fn run_service(mut engine: Engine, o: &HeadOptions, network: Option<&HeadLinks>, slots: u32) -> Result<(), String> {
     let network = network.ok_or("--service requires a chain head")?;
-    let addr = o.service.as_deref().unwrap_or_default();
-    crate::service::validate_address(addr)?;
+    if let Some(addr) = &o.service {
+        crate::service::validate_address(addr)?;
+    }
     if o.forzati.is_some() || o.forma_verificatore || o.arrivi.is_some() || o.classi.is_some() {
         return Err("--service cannot be combined with --tokens, --verifier-mode, --arrivals or --classes".into());
     }
@@ -2031,10 +2167,14 @@ fn run_service(mut engine: Engine, o: &HeadOptions, network: Option<&HeadLinks>,
     let per_ctx = (slots as usize).div_ceil(g).max(1);
     let amm = Admission::con_classi(Vec::new(), Vec::new(), g, per_ctx, slots as usize, o.riserva_interattive);
     let valle = connect_downstream(network, Duration::from_secs(o.attesa_s), o.draft_source == DraftSource::Mtp)?;
-    let serv = Service::listen(addr)?;
-    eprintln!("[head] chain ready with {slots} slots and {g} groups; service listening on {}", serv.address());
+    let service = if o.service_pipe { Service::pipes()? } else { Service::listen(o.service.as_deref().unwrap_or_default())? };
+    if let Some(addr) = service.address() {
+        eprintln!("[head] chain ready with {slots} slots and {g} groups; service listening on {addr}");
+    } else {
+        eprintln!("[head] chain ready with {slots} slots and {g} groups; service over inherited pipes");
+    }
     let mut t = Head::new(&mut engine, o, Some(network), Vec::new(), valle, amm, slots);
-    t.serv = Some(serv);
+    t.serv = Some(service);
     let esito = t.corsa_servizio().map_err(|f| match f {
         Fail::Guasto(m) | Fail::GuastoConv(_, m) | Fail::Fatale(m) => m,
     });
@@ -2042,13 +2182,23 @@ fn run_service(mut engine: Engine, o: &HeadOptions, network: Option<&HeadLinks>,
         s.manda(pbs::FromHead { body: Some(pbs::from_head::Body::Status(pbs::Status { free_slots: 0, pending: 0 })) });
     }
     if let Downstream::Rete(v) = t.valle {
-        v.col.prefill.terminate();
-        v.col.gen.terminate();
+        v.col.prefill.abort();
+        v.col.gen.abort();
+        let _ = v.col.control.shutdown(std::net::Shutdown::Both);
     }
     esito
 }
 
-pub fn run(mut engine: Engine, o: &HeadOptions, network: Option<&HeadLinks>, slots: u32) -> Result<(), String> {
+pub fn run(mut engine: Engine, mut options: HeadOptions, network: Option<&HeadLinks>, slots: u32) -> Result<(), String> {
+    if options.block == 0 {
+        let target = engine.n_batch.min(512);
+        options.block = if network.is_some() {
+            target.min(crate::network::max_block_tokens_with_ids(engine.n_embd, engine.stream_count, options.state_format, options.draft_source == DraftSource::Mtp))
+        } else {
+            target
+        };
+    }
+    let o = &options;
     if !engine.head {
         return Err("head must start at layer 0".into());
     }
@@ -2089,7 +2239,7 @@ pub fn run(mut engine: Engine, o: &HeadOptions, network: Option<&HeadLinks>, slo
     if o.prova_stato_int8 && network.is_none() {
         return Err("--test-state-int8 requires a chain head".into());
     }
-    if o.service.is_some() {
+    if o.service.is_some() || o.service_pipe {
         return run_service(engine, o, network, slots);
     }
     let prompt = leggi_prompt(&o.prompt, o.salta, o.n_prompt)?;
@@ -2181,7 +2331,6 @@ pub fn run(mut engine: Engine, o: &HeadOptions, network: Option<&HeadLinks>, slo
             sospensioni: 0,
             ext_id: 0,
             max_tokens: None,
-            cancel: false,
             utf8: Utf8Fragments::default(),
             tagli,
             filtro: StopFilter::default(),
@@ -2462,7 +2611,6 @@ mod test {
             sospensioni: 0,
             ext_id: 0,
             max_tokens: None,
-            cancel: false,
             utf8: Utf8Fragments::default(),
             tagli: Tagli::default(),
             filtro: StopFilter::default(),

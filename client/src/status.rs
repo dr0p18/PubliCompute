@@ -45,9 +45,7 @@ pub struct Summary {
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 pub struct Status {
-    #[serde(default)]
     pub connected: bool,
-    #[serde(default)]
     pub paused: bool,
     #[serde(default)]
     pub preference: Preference,

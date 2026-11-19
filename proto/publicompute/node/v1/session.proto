@@ -243,6 +243,8 @@ enum AgentFeature {
   AGENT_FEATURE_MODEL_SWITCH = 4;
   // Can enter and leave standby for a stage assignment.
   AGENT_FEATURE_ENGINE_SWITCH = 5;
+  // The agent accepts StageAssign.
+  AGENT_FEATURE_STAGES = 6;
 }
 
 enum ContributionMode {

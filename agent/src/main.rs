@@ -61,7 +61,9 @@ struct Args {
     /// PEM trust anchor for the coordinator connection.
     #[arg(long, global = true)]
     ca: Option<PathBuf>,
-    /// Directory for the enrollment key and certificate.
+    /// Directory for the enrollment identity and local state.
+    /// It must be a real local directory and stay at the same path while the agent runs.
+    /// Custom service units specify its real path.
     #[arg(long, default_value = "data/agent")]
     data_dir: PathBuf,
     /// Local control socket path. A configured path grants access to the agent group.
@@ -185,7 +187,7 @@ struct Args {
     /// Free mode lets the scheduler use it where needed. A stored preference takes priority.
     #[arg(long = "mode", default_value = "usage")]
     modo: String,
-    /// Initial weight selection as an ID with optional quantization. Defaults to the installed weights.
+    /// USE selection as an ID with optional quantization. Defaults to the installed weights.
     #[arg(long = "selected-model")]
     modello_scelto: Option<String>,
 
@@ -212,7 +214,7 @@ struct Args {
     #[arg(long, env = "PUBLICOMPUTE_RELAY")]
     relay: Option<String>,
 
-    /// Stage executable required in stage mode. Pass the complete GGUF with --model-path.
+    /// Stage executable for stage mode or switching a managed llama-server to a stage.
     #[arg(long)]
     stage_bin: Option<PathBuf>,
     /// Stage log directory. Defaults to the stage subdirectory of the data directory.
@@ -265,22 +267,18 @@ fn main() {
 }
 
 fn run_command(args: Args) -> Result<()> {
-    let listener = if args.command.is_none() {
+    let local = if args.command.is_none() {
         if args.ca.is_none() {
             bail!("--ca is required for the coordinator QUIC certificate");
         }
         std::fs::create_dir_all(&args.data_dir).with_context(|| format!("create {}", args.data_dir.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&args.data_dir, std::fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("set permissions on {}", args.data_dir.display()))?;
-        }
+        let live = control::Live::open(&args.data_dir)?;
         let path = args.control_socket.clone().unwrap_or_else(|| args.data_dir.join("agent.sock"));
-        Some(control::Listener::bind(path, args.control_socket.is_some())?)
+        Some((control::Listener::bind(path, args.control_socket.is_some())?, live))
     } else {
         None
     };
+    let data_dir_lock = local.as_ref().map(|(_, live)| live.clone());
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let result = runtime.block_on(async {
         match &args.command {
@@ -298,10 +296,14 @@ fn run_command(args: Args) -> Result<()> {
             }
             #[cfg(target_os = "linux")]
             Some(Command::SwapInstall { staging, installed }) => swap_install(staging, installed),
-            None => run(args, listener.expect("agent listener")).await,
+            None => {
+                let (listener, live) = local.expect("agent control state");
+                run(args, listener, live).await
+            }
         }
     });
     runtime.shutdown_timeout(Duration::from_secs(1));
+    drop(data_dir_lock);
     result
 }
 
@@ -349,19 +351,20 @@ fn read_owner_token(file: Option<&std::path::Path>, fallback: Option<String>) ->
     Ok(Some(token.to_string()))
 }
 
-async fn run(mut args: Args, listener: control::Listener) -> Result<()> {
+async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Live>) -> Result<()> {
     let mut model = model_metadata(&args)?;
     let modo = contribution::PreferenceMode::parse(&args.modo)?;
-    let modello_scelto = match (modo, args.modello_scelto.as_deref()) {
-        (contribution::PreferenceMode::Free, _) => None,
-        (_, None) => Some(contribution::ModelSelection { id: model.model_id.clone(), quant: model.quantization.clone() }),
-        (_, Some(m)) => Some(match m.split_once(':') {
+    let modello_scelto = match args.modello_scelto.as_deref() {
+        None => contribution::ModelSelection { id: model.model_id.clone(), quant: model.quantization.clone() },
+        Some(m) => match m.split_once(':') {
             Some((id, quant)) => contribution::ModelSelection { id: id.to_string(), quant: quant.to_string() },
             None => contribution::ModelSelection { id: m.to_string(), quant: model.quantization.clone() },
-        }),
+        },
     };
-    let contribution = contribution::Contribution::open(&args.data_dir, contribution::Preference { modo, model: modello_scelto, revision: 0 })?;
-    let live = control::Live::new();
+    let contribution = contribution::Contribution::open(&args.data_dir, contribution::Preference {
+        modo, model: (modo == contribution::PreferenceMode::Usage).then(|| modello_scelto.clone()), revision: 0,
+    })?;
+    contribution.align_model(modello_scelto)?;
     let telemetria_gpu = Arc::new(gpu::Telemetria::default());
     let (engine_state, engine_rx) = tokio::sync::watch::channel(engine::supervisor::EngineState::Starting);
     listener.serve(control::Control::new(
@@ -466,14 +469,15 @@ async fn run(mut args: Args, listener: control::Listener) -> Result<()> {
     };
     let progress = Arc::new(engine::progress::Progress::default());
     let stats = Arc::new(engine::stats::Stats::new(Some(&args.data_dir)));
-    let stages = match args.engine {
-        EngineArg::Stages => {
-            if args.llama_mode as u8 == LlamaMode::Managed as u8 {
-                bail!("--llama-mode managed requires a llama engine");
-            }
+    let stage_only = matches!(args.engine, EngineArg::Stages);
+    if stage_only && matches!(args.llama_mode, LlamaMode::Managed) {
+        bail!("--llama-mode managed requires a llama engine");
+    }
+    let stages = match args.stage_bin.as_ref() {
+        Some(bin) if stage_only || managed_gpu => {
             Some(stages::Stages::new(stages::StagesConfig {
-                stage_bin: args.stage_bin.clone().context("--engine stages requires --stage-bin")?,
-                model_path: args.model_path.clone().context("--engine stages requires --model-path pointing to the full GGUF")?,
+                stage_bin: bin.clone(),
+                model_path: args.model_path.clone().context("--stage-bin requires --model-path pointing to the full GGUF")?,
                 weights_sha256: model.weights_sha256.clone(),
                 log_dir: args.stage_log_dir.clone().unwrap_or_else(|| args.data_dir.join("stadi")),
                 threads: args.stage_threads,
@@ -488,34 +492,33 @@ async fn run(mut args: Args, listener: control::Listener) -> Result<()> {
                 in_chiaro: args.stadi_in_chiaro,
             }))
         }
-        _ => {
-            if args.stage_bin.is_some() {
-                bail!("--stage-bin requires --engine stages");
-            }
-            None
-        }
+        Some(_) => bail!("--stage-bin requires --engine stages or a managed llama engine"),
+        None if stage_only => bail!("--engine stages requires --stage-bin"),
+        None => None,
     };
-    let engine = Arc::new(match args.engine {
-        EngineArg::Mock => engine::Engine::Mock(engine::mock::MockEngine {
+    let stage_engine = stages.as_ref().map(|s| Arc::new(engine::Engine::Stages(engine::stages::StadiEngine {
+        stages: s.clone(),
+        attive: Default::default(),
+        limits: limits.clone(),
+        // Stage chats track their own progress while llama-server is parked.
+        progress: if stage_only { progress.clone() } else { Default::default() },
+    })));
+    let engine = match args.engine {
+        EngineArg::Mock => Arc::new(engine::Engine::Mock(engine::mock::MockEngine {
             per_token_delay: Duration::from_millis(args.mock_delay_ms),
             cheat: args.mock_cheat,
             hang: std::sync::atomic::AtomicU32::new(args.mock_hang),
             limits: limits.clone(),
             progress: progress.clone(),
-        }),
-        EngineArg::Llama => engine::Engine::Llama(engine::llama::LlamaEngine::new(
+        })),
+        EngineArg::Llama => Arc::new(engine::Engine::Llama(engine::llama::LlamaEngine::new(
             args.llama_url.clone(),
             limits.clone(),
             progress.clone(),
             args.llama_stream,
-        )?),
-        EngineArg::Stages => engine::Engine::Stages(engine::stages::StadiEngine {
-            stages: stages.clone().expect("creato sopra"),
-            attive: Default::default(),
-            limits: limits.clone(),
-            progress: progress.clone(),
-        }),
-    });
+        )?)),
+        EngineArg::Stages => stage_engine.as_ref().expect("stage config is required").clone(),
+    };
     let managed = match (args.engine, args.llama_mode) {
         (EngineArg::Llama, LlamaMode::Managed) => Some(engine::managed::ManagedCfg {
             bin: args.llama_bin.clone().context("--llama-mode managed requires --llama-bin")?,
@@ -599,7 +602,7 @@ async fn run(mut args: Args, listener: control::Listener) -> Result<()> {
         }
         (Some(_), None) => {
             // Shared configuration may set a relay even on nodes that never start a stage.
-            warn!("--relay requires --engine stages; ignoring it");
+            warn!("--relay requires --stage-bin; ignoring it");
             None
         }
         _ => None,
@@ -610,6 +613,7 @@ async fn run(mut args: Args, listener: control::Listener) -> Result<()> {
         hardware: hw,
         sup: sup.clone(),
         stages,
+        stage_engine: stage_engine.filter(|_| !stage_only),
         region: args.region.clone(),
         nat_class: nat_class.as_str().to_string(),
         iroh_node_id: bridge.as_ref().map(|p| p.id()).unwrap_or_default(),

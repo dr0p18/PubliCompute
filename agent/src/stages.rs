@@ -3,15 +3,14 @@
 //! next assignment comes from the coordinator.
 //!
 //! An intermediate or tail stage announces readiness on stderr after it
-//! opens its listener. The head opens its service socket after the chain
-//! acknowledges setup, so connecting to that socket both proves readiness
-//! and establishes the channel for chat requests.
+//! opens its listener. The head signals readiness on its inherited output
+//! pipe after connecting to the chain.
 //!
 //! One task serializes assignments, releases and stops. The session can
 //! continue processing control messages while the stage is shutting down.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     path::{Path, PathBuf},
     process::Stdio,
@@ -30,12 +29,17 @@ use publicompute_proto::{
     wire,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{tcp::OwnedWriteHalf, TcpStream},
-    process::{Child, Command},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    process::{ChildStdin, ChildStdout, Command},
     sync::{mpsc, oneshot, watch, Mutex as AsyncMutex},
 };
 use tracing::{info, warn};
+
+use crate::engine::{
+    managed,
+    output::{self, OutputSender, OutputSize, Queued},
+    supervisor::{EngineState, ParkedEngine, Supervisor},
+};
 
 /// Configuration shared by stage assignments on this agent.
 #[derive(Clone, Debug)]
@@ -154,8 +158,8 @@ fn validate(a: &StageAssign) -> Result<Role> {
     Ok(r)
 }
 
-/// Build stage command arguments. The optional service address belongs to the local head.
-pub fn arguments(cfg: &StagesConfig, a: &StageAssign, service: Option<&str>) -> Result<Vec<String>> {
+/// Build stage command arguments for the local child.
+pub fn arguments(cfg: &StagesConfig, a: &StageAssign) -> Result<Vec<String>> {
     let role = validate(a)?;
     let format = if a.state_format.is_empty() { "fp32" } else { a.state_format.as_str() };
     let timeout = cfg.load_timeout.as_secs().max(1);
@@ -176,13 +180,9 @@ pub fn arguments(cfg: &StagesConfig, a: &StageAssign, service: Option<&str>) -> 
     op("--timeout-s", timeout.to_string());
     match role {
         Role::Head => {
-            let s = service.context("head requires a local service address")?;
             op("--state-format", format.into());
             op("--next", a.next_addr.clone());
             op("--listen-token", a.head_token_addr.clone());
-            op("--service", s.into());
-            // Keep each prefill chunk within the engine's batch capacity.
-            op("--block", a.n_batch.min(512).to_string());
             // Bound the wait for a response so a dead stage becomes a recoverable chain fault.
             op("--work-timeout-s", "120".into());
         }
@@ -197,6 +197,9 @@ pub fn arguments(cfg: &StagesConfig, a: &StageAssign, service: Option<&str>) -> 
             op("--head-token", a.head_token_addr.clone());
             op("--index", a.stage_index.to_string());
         }
+    }
+    if role == Role::Head {
+        v.push("--service-pipe".into());
     }
     v.extend(cfg.extra_args.iter().cloned());
     Ok(v)
@@ -216,23 +219,49 @@ pub enum OutgoingLink {
     Done(pb::Done),
 }
 
+impl OutputSize for OutgoingLink {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Token(token) => token.text.capacity(),
+            Self::Done(done) => done.remaining_text.capacity() + done.error.capacity() + done.reason.capacity() + done.prompt_token.capacity() * size_of::<i32>(),
+        }
+    }
+}
+
+pub struct HeadResponses {
+    messages: mpsc::Receiver<Queued<OutgoingLink>>,
+    status: watch::Receiver<bool>,
+}
+
+impl HeadResponses {
+    pub async fn recv(&mut self) -> Option<OutgoingLink> {
+        tokio::select! {
+            biased;
+            _ = output::wait_for_saturation(&mut self.status) => None,
+            message = self.messages.recv() => message.map(|message| message.item),
+        }
+    }
+
+    pub fn saturated(&self) -> bool {
+        *self.status.borrow()
+    }
+}
+
 /// Multiplex concurrent requests through one head connection. Route each
 /// response to its request ID because token messages can be interleaved.
 pub struct HeadConnection {
-    scrittore: AsyncMutex<OwnedWriteHalf>,
-    in_volo: Mutex<HashMap<u64, mpsc::UnboundedSender<OutgoingLink>>>,
+    scrittore: AsyncMutex<Box<dyn AsyncWrite + Send + Unpin>>,
+    in_volo: Mutex<HashMap<u64, OutputSender<OutgoingLink>>>,
     prossimo: AtomicU64,
     state: Mutex<pb::Status>,
     chiuso: watch::Sender<bool>,
 }
 
 impl HeadConnection {
-    pub fn new(stream: TcpStream) -> Arc<Self> {
-        let _ = stream.set_nodelay(true);
-        let (mut lettura, scrittura) = stream.into_split();
+    fn from_io(mut lettura: impl AsyncRead + Send + Unpin + 'static, scrittura: impl AsyncWrite + Send + Unpin + 'static, mut buf: BytesMut) -> Arc<Self> {
         let (chiuso, _) = watch::channel(false);
         let link = Arc::new(HeadConnection {
-            scrittore: AsyncMutex::new(scrittura),
+            scrittore: AsyncMutex::new(Box::new(scrittura)),
             in_volo: Mutex::new(HashMap::new()),
             prossimo: AtomicU64::new(1),
             state: Mutex::new(pb::Status::default()),
@@ -240,7 +269,7 @@ impl HeadConnection {
         });
         let l2 = link.clone();
         tokio::spawn(async move {
-            let (mut buf, mut tmp) = (BytesMut::new(), vec![0u8; 64 << 10]);
+            let mut tmp = vec![0u8; 64 << 10];
             'lettura: loop {
                 loop {
                     match wire::try_decode_frame::<pb::FromHead>(&mut buf) {
@@ -258,10 +287,15 @@ impl HeadConnection {
                 }
             }
             // Close outstanding response channels so callers can detect disconnect.
-            l2.in_volo.lock().unwrap().clear();
-            let _ = l2.chiuso.send(true);
+            l2.close();
         });
         link
+    }
+
+    fn close(&self) {
+        let mut pending = self.in_volo.lock().unwrap();
+        self.chiuso.send_replace(true);
+        pending.clear();
     }
 
     fn smista(&self, m: pb::FromHead) {
@@ -277,7 +311,7 @@ impl HeadConnection {
                 }
             }
             Some(pb::from_head::Body::Status(s)) => *self.state.lock().unwrap() = s,
-            None => {}
+            Some(pb::from_head::Body::Ready(_)) | None => {}
         }
     }
 
@@ -303,24 +337,36 @@ impl HeadConnection {
     async fn write(&self, m: pb::FromAgent) -> Result<()> {
         let mut v = Vec::with_capacity(prost::Message::encoded_len(&m) + 8);
         wire::encode_frame(&m, &mut v)?;
-        let mut w = self.scrittore.lock().await;
-        w.write_all(&v).await.context("write to the head")
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut writer = self.scrittore.lock().await;
+            if !self.aperto() {
+                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "head pipe closed"));
+            }
+            writer.write_all(&v).await
+        }).await.context("head pipe write timed out").and_then(|result| result.context("write to the head"));
+        if result.is_err() {
+            self.close();
+        }
+        result
     }
 
     /// Send a request and return its token and completion receiver. Connection
     /// loss closes the receiver without a completion event.
-    pub async fn request(&self, r: pb::Request) -> Result<mpsc::UnboundedReceiver<OutgoingLink>> {
-        if !self.aperto() {
-            bail!("connection to the head closed");
-        }
+    pub async fn request(&self, r: pb::Request) -> Result<HeadResponses> {
         let id = r.id;
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.in_volo.lock().unwrap().insert(id, tx);
+        let (tx, messages, status) = output::channel(256, 4 << 20);
+        {
+            let mut pending = self.in_volo.lock().unwrap();
+            if !self.aperto() {
+                bail!("connection to the head closed");
+            }
+            pending.insert(id, tx);
+        }
         if let Err(e) = self.write(pb::FromAgent { body: Some(pb::from_agent::Body::Request(r)) }).await {
             self.in_volo.lock().unwrap().remove(&id);
             return Err(e);
         }
-        Ok(rx)
+        Ok(HeadResponses { messages, status })
     }
 
     /// Ask the head to finish this request with a cancellation result.
@@ -337,7 +383,8 @@ impl HeadConnection {
 // Assignment lifecycle and process supervision.
 
 enum Cmd {
-    Assegna(StageAssign),
+    Assegna(StageAssign, Option<Arc<Supervisor>>),
+    Renew(StageAssign),
     Rilascia(StageRelease),
     /// Stop the active stage and close its reporting task at session end.
     FermaTutto(oneshot::Sender<()>),
@@ -353,6 +400,32 @@ struct Attivo {
     /// Completion means the child has exited and its final state was reported.
     finito: watch::Receiver<bool>,
     last: StageStatus,
+    closing: bool,
+}
+
+struct EngineSwitch {
+    chain_id: String,
+    epoch: u64,
+    // The session keeps the routing state through the terminal status even after the worker unparks Llama.
+    parked: Option<ParkedEngine>,
+    closing: bool,
+}
+
+impl EngineSwitch {
+    fn matches(&self, a: &StageAssign) -> bool {
+        self.chain_id == a.chain_id && self.epoch == a.assign_epoch
+    }
+
+    fn close(&mut self) {
+        self.closing = true;
+        if let Some(parked) = &self.parked {
+            parked.returning();
+        }
+    }
+
+    fn can_start_stage(&self) -> bool {
+        self.parked.as_ref().is_some_and(|parked| parked.can_start_stage())
+    }
 }
 
 /// Mutual TLS uses the enrolled node identity. Assignment authorization uses
@@ -368,6 +441,9 @@ pub struct TlsFiles {
 struct Interno {
     tx: Option<mpsc::Sender<StageStatus>>,
     attivo: Option<Attivo>,
+    switching: Option<EngineSwitch>,
+    // Renewals can arrive after the stage exits and Llama is ready again.
+    closed: HashSet<(String, u64)>,
     link: Option<Arc<HeadConnection>>,
     tls: TlsFiles,
     /// Clock correction used when a stage checks signed assignment expiry.
@@ -391,11 +467,11 @@ impl Stages {
         tokio::spawn(async move {
             while let Some(c) = rx.recv().await {
                 match c {
-                    Cmd::Assegna(a) => s2.assign(a).await,
+                    Cmd::Assegna(a, sup) => s2.assign(a, sup).await,
+                    Cmd::Renew(a) => s2.renew_switch(&a).await,
                     Cmd::Rilascia(r) => s2.release(r).await,
                     Cmd::FermaTutto(fatto) => {
                         s2.stop_active("session closed").await;
-                        s2.interno.lock().unwrap().tx = None;
                         let _ = fatto.send(());
                     }
                 }
@@ -406,7 +482,12 @@ impl Stages {
 
     /// Take the lifecycle receiver used by the session to report stage state.
     pub fn connect_peer(&self, tx: mpsc::Sender<StageStatus>) {
-        self.interno.lock().unwrap().tx = Some(tx);
+        let mut i = self.interno.lock().unwrap();
+        i.closed.clear();
+        if i.switching.as_ref().is_some_and(|s| s.parked.is_none()) {
+            i.switching = None;
+        }
+        i.tx = Some(tx);
     }
 
     /// Inject credential paths for tests. Normal startup writes the enrolled
@@ -530,15 +611,99 @@ impl Stages {
     }
 
     pub fn queue_assignment(&self, a: StageAssign) {
-        let _ = self.cmd.send(Cmd::Assegna(a));
+        let _ = self.cmd.send(Cmd::Assegna(a, None));
     }
 
-    pub fn queue_release(&self, r: StageRelease) {
+    /// Reserve the single engine before returning to the session's offer loop.
+    pub fn queue_switch(&self, a: StageAssign, sup: &Arc<Supervisor>, allow_new: bool) -> std::result::Result<(), StageStatus> {
+        let key = (a.chain_id.clone(), a.assign_epoch);
+        let mut i = self.interno.lock().unwrap();
+        if i.closed.contains(&key) {
+            return Ok(());
+        }
+        if let Err(e) = self.controlla(&a) {
+            i.closed.insert(key);
+            return Err(status_message(&a, State::Failed, &format!("{e:#}"), 0, 0.0));
+        }
+        if let Some(s) = &i.switching {
+            if s.matches(&a) {
+                if !s.closing {
+                    let _ = self.cmd.send(Cmd::Renew(a));
+                }
+                return Ok(());
+            }
+        }
+        let parked = if allow_new && i.switching.is_none() { sup.try_park() } else { None };
+        let Some(parked) = parked else {
+            i.closed.insert(key);
+            return Err(status_message(&a, State::Stopped, "busy", 0, 0.0));
+        };
+        i.switching = Some(EngineSwitch { chain_id: key.0, epoch: key.1, parked: Some(parked), closing: false });
+        let _ = self.cmd.send(Cmd::Assegna(a, Some(sup.clone())));
+        Ok(())
+    }
+
+    pub fn serving_chain(&self) -> Option<String> {
+        self.interno.lock().unwrap().switching.as_ref().filter(|s| !s.closing).map(|s| s.chain_id.clone())
+    }
+
+    pub fn switch_state(&self) -> Option<EngineState> {
+        self.interno.lock().unwrap().switching.as_ref().map(|s| {
+            if s.closing { EngineState::Recovering } else { EngineState::Parked }
+        })
+    }
+
+    /// Keep routing and availability on the stage until its terminal report is handled.
+    pub fn stage_status_current(&self, status: &StageStatus) -> bool {
+        let mut i = self.interno.lock().unwrap();
+        let Some(s) = i.switching.as_ref().filter(|s| s.chain_id == status.chain_id && s.epoch == status.assign_epoch) else {
+            return false;
+        };
+        let terminal = matches!(status.state(), State::Stopped | State::Failed);
+        let current = terminal || !s.closing;
+        if terminal && s.parked.is_none() {
+            i.switching = None;
+        }
+        current
+    }
+
+    /// Close admission before enqueueing the stop. A following offer may
+    /// already be in flight on the control stream.
+    pub fn queue_release(&self, r: StageRelease) -> bool {
+        let matched = self.close_assignment(&r.chain_id, r.assign_epoch);
         let _ = self.cmd.send(Cmd::Rilascia(r));
+        matched
+    }
+
+    fn close_assignment(&self, chain_id: &str, epoch: u64) -> bool {
+        let mut i = self.interno.lock().unwrap();
+        i.closed.insert((chain_id.to_owned(), epoch));
+        let mut matched = false;
+        if let Some(s) = i.switching.as_mut().filter(|s| s.chain_id == chain_id && s.epoch <= epoch) {
+            s.close();
+            matched = true;
+        }
+        if let Some(a) = i.attivo.as_mut().filter(|a| a.chain_id == chain_id && a.epoch <= epoch) {
+            a.closing = true;
+            matched = true;
+        }
+        matched
+    }
+
+    pub fn release_current(&self, reason: &str) {
+        let key = {
+            let i = self.interno.lock().unwrap();
+            i.switching.as_ref().filter(|s| !s.closing).map(|s| (s.chain_id.clone(), s.epoch))
+                .or_else(|| i.attivo.as_ref().filter(|a| !a.closing).map(|a| (a.chain_id.clone(), a.epoch)))
+        };
+        if let Some((chain_id, assign_epoch)) = key {
+            self.queue_release(StageRelease { chain_id, assign_epoch, reason: reason.into() });
+        }
     }
 
     /// On session close, terminate the child and end stage reporting.
     pub async fn stop_all(&self) {
+        self.release_current("session closed");
         let (tx, rx) = oneshot::channel();
         if self.cmd.send(Cmd::FermaTutto(tx)).is_ok() {
             let _ = tokio::time::timeout(self.cfg.stop_grace + self.cfg.kill_wait + Duration::from_secs(5), rx).await;
@@ -547,7 +712,12 @@ impl Stages {
 
     /// Return the service connection only when this node's head is ready.
     pub fn head(&self) -> Option<Arc<HeadConnection>> {
-        self.interno.lock().unwrap().link.clone().filter(|l| l.aperto())
+        let i = self.interno.lock().unwrap();
+        if i.attivo.as_ref().is_some_and(|a| a.closing)
+            || i.switching.as_ref().is_some_and(|s| !s.can_start_stage()) {
+            return None;
+        }
+        i.link.clone().filter(|l| l.aperto())
     }
 
     /// Active chain capacity for concurrent chat leases, with a minimum of one.
@@ -561,7 +731,7 @@ impl Stages {
         let (tx, st) = {
             let mut i = self.interno.lock().unwrap();
             let Some(a) = i.attivo.as_mut() else { return };
-            if !matches!(a.last.state(), State::Ready | State::Running) {
+            if a.closing || !matches!(a.last.state(), State::Ready | State::Running) {
                 return;
             }
             let new = if attive { State::Running } else { State::Ready };
@@ -596,15 +766,38 @@ impl Stages {
         }
     }
 
-    async fn assign(self: &Arc<Self>, a: StageAssign) {
+    async fn assign(self: &Arc<Self>, a: StageAssign, sup: Option<Arc<Supervisor>>) {
+        let status = self.start_assignment(&a, sup.as_ref()).await;
+        if let Some(status) = status {
+            self.finish_assignment(&a);
+            self.report(status).await;
+        }
+    }
+
+    /// A failed launch returns a terminal status. A running child owns completion.
+    async fn start_assignment(self: &Arc<Self>, a: &StageAssign, sup: Option<&Arc<Supervisor>>) -> Option<StageStatus> {
+        let key = (a.chain_id.clone(), a.assign_epoch);
+        if sup.is_none() && self.interno.lock().unwrap().closed.contains(&key) {
+            return None;
+        }
+        let failed = |e: anyhow::Error| status_message(a, State::Failed, &format!("{e:#}"), 0, 0.0);
+        let stopped = || status_message(a, State::Stopped, "assignment cancelled", 0, 0.0);
         // Validate the assignment before allocating child resources.
-        let role = match self.controlla(&a) {
+        let role = match self.controlla(a) {
             Ok(r) => r,
-            Err(e) => {
-                self.report(status_message(&a, State::Failed, &format!("{e:#}"), 0, 0.0)).await;
-                return;
-            }
+            Err(e) => return Some(failed(e)),
         };
+        let gpu = if let Some(sup) = sup {
+            if let Err(e) = sup.stop_child().await {
+                return Some(failed(e.context("could not stop llama-server before starting a stage")));
+            }
+            let i = self.interno.lock().unwrap();
+            let s = i.switching.as_ref().unwrap();
+            if !s.can_start_stage() {
+                return Some(stopped());
+            }
+            s.parked.as_ref().unwrap().gpu.clone()
+        } else { None };
         // An agent owns one active stage, so classify duplicates before launching another.
         let previous = {
             let i = self.interno.lock().unwrap();
@@ -613,74 +806,90 @@ impl Stages {
         if let Some((chain, epoch, last)) = previous {
             if chain != a.chain_id {
                 let m = format!("node already hosts a stage for chain {chain}");
-                self.report(status_message(&a, State::Failed, &m, 0, 0.0)).await;
-                return;
+                return Some(status_message(a, State::Failed, &m, 0, 0.0));
             }
             if a.assign_epoch < epoch {
                 warn!(chain = %chain, new = a.assign_epoch, current = epoch, "ignored stale assignment");
-                return;
+                return None;
             }
             if a.assign_epoch == epoch {
-                // A repeated assignment can refresh the capability file. The running
-                // stage reloads the file, so publishing readiness again needs no restart.
-                if !a.capability.is_empty() {
-                    if let Err(e) = self.write_capability(&a) {
-                        warn!(chain = %chain, "could not write the renewed capability: {e:#}");
-                    }
-                }
-                self.report(last).await;
-                return;
+                self.renew(a, last).await;
+                return None;
             }
             self.stop_active("stage reassigned").await;
         }
-        let service = if role == Role::Head {
-            match porta_libera() {
-                Ok(p) => Some(SocketAddr::from(([127, 0, 0, 1], p))),
-                Err(e) => {
-                    self.report(status_message(&a, State::Failed, &format!("no free local port: {e:#}"), 0, 0.0)).await;
-                    return;
-                }
-            }
-        } else {
-            None
-        };
         // Use the translated addresses so the child reaches bridged peers through loopback.
-        let (per_stadio, guard) = match self.connect_bridge(&a, role).await {
+        let (per_stadio, guard) = match self.connect_bridge(a, role).await {
             Ok(x) => x,
-            Err(e) => {
-                self.report(status_message(&a, State::Failed, &format!("{e:#}"), 0, 0.0)).await;
-                return;
-            }
+            Err(e) => return Some(failed(e)),
         };
-        let args = match arguments(&self.cfg, &per_stadio, service.map(|s| s.to_string()).as_deref()).and_then(|mut v| {
-            v.extend(self.tls_arguments(&a)?);
+        let args = match arguments(&self.cfg, &per_stadio).and_then(|mut v| {
+            v.extend(self.tls_arguments(a)?);
             Ok(v)
         }) {
             Ok(v) => v,
-            Err(e) => {
-                self.report(status_message(&a, State::Failed, &format!("{e:#}"), 0, 0.0)).await;
-                return;
-            }
+            Err(e) => return Some(failed(e)),
         };
         let (ferma_tx, ferma_rx) = oneshot::channel::<String>();
         let (fin_tx, fin_rx) = watch::channel(false);
         {
             let mut i = self.interno.lock().unwrap();
+            if i.closed.contains(&key) || i.switching.as_ref().is_some_and(|s| !s.can_start_stage()) {
+                return Some(stopped());
+            }
             i.attivo = Some(Attivo {
                 chain_id: a.chain_id.clone(),
                 slots: a.slots,
                 epoch: a.assign_epoch,
                 ferma: Some(ferma_tx),
                 finito: fin_rx,
-                last: status_message(&a, State::Loading, "", 0, 0.0),
+                last: status_message(a, State::Loading, "", 0, 0.0),
+                closing: false,
             });
         }
         let s2 = self.clone();
+        let a = a.clone();
         tokio::spawn(async move {
-            s2.vita(a, role, args, service, ferma_rx).await;
+            let status = s2.vita(&a, role, args, gpu.as_deref(), ferma_rx).await;
             drop(guard);
+            s2.pulisci(&a);
+            s2.finish_assignment(&a);
+            s2.report(status).await;
             let _ = fin_tx.send(true);
         });
+        None
+    }
+
+    fn finish_assignment(&self, a: &StageAssign) {
+        let mut i = self.interno.lock().unwrap();
+        i.closed.insert((a.chain_id.clone(), a.assign_epoch));
+        if let Some(s) = i.switching.as_mut().filter(|s| s.matches(a)) {
+            if let Some(parked) = s.parked.take() {
+                parked.unpark();
+            }
+        }
+    }
+
+    async fn renew_switch(&self, a: &StageAssign) {
+        let last = {
+            let i = self.interno.lock().unwrap();
+            i.attivo.as_ref().filter(|s| s.chain_id == a.chain_id && s.epoch == a.assign_epoch && !s.closing)
+                .map(|s| s.last.clone())
+        };
+        // A renewal queued during teardown must never resurrect the stage.
+        if let Some(last) = last {
+            self.renew(a, last).await;
+        }
+    }
+
+    async fn renew(&self, a: &StageAssign, last: StageStatus) {
+        // The stage reloads the capability file while continuing to serve.
+        if !a.capability.is_empty() {
+            if let Err(e) = self.write_capability(a) {
+                warn!(chain = %a.chain_id, "could not write the renewed capability: {e:#}");
+            }
+        }
+        self.report(last).await;
     }
 
     fn controlla(&self, a: &StageAssign) -> Result<Role> {
@@ -726,47 +935,48 @@ impl Stages {
         if let Some(f) = ferma {
             let _ = f.send(reason.to_string());
         }
-        let limite = self.cfg.stop_grace + self.cfg.kill_wait + Duration::from_secs(5);
-        let _ = tokio::time::timeout(limite, finito.wait_for(|f| *f)).await;
+        let _ = finito.wait_for(|f| *f).await;
     }
 
     /// Drive one child from startup through its final lifecycle update.
-    async fn vita(self: Arc<Self>, a: StageAssign, role: Role, args: Vec<String>, service: Option<SocketAddr>, mut ferma: oneshot::Receiver<String>) {
+    async fn vita(&self, a: &StageAssign, role: Role, args: Vec<String>, gpu: Option<&str>, mut ferma: oneshot::Receiver<String>) -> StageStatus {
         let t0 = Instant::now();
         let porta = if role == Role::Head { 0 } else { porta_di(&a.listen_addr, "listen_addr").unwrap_or(0) as u32 };
-        self.report(status_message(&a, State::Loading, "", 0, 0.0)).await;
+        self.report(status_message(a, State::Loading, "", 0, 0.0)).await;
         let log_path = self.cfg.log_dir.join(format!("stage-{}-{}.log", nome_file(&a.chain_id), a.assign_epoch));
-        let (mut figlio, pronto_rx, ultime) = match start(&self.cfg, &args, &log_path).await {
+        let started = tokio::select! {
+            biased;
+            reason = &mut ferma => {
+                let reason = reason.unwrap_or_else(|_| "agent stopped".into());
+                return status_message(a, State::Stopped, &reason, 0, 0.0);
+            }
+            result = start(&self.cfg, &args, &log_path, role == Role::Head, gpu) => result,
+        };
+        let (mut figlio, pronto_rx, ultime) = match started {
             Ok(x) => x,
             Err(e) => {
-                self.report(status_message(&a, State::Failed, &format!("could not start publicompute-stage: {e:#}"), 0, 0.0)).await;
-                self.pulisci(&a);
-                return;
+                return status_message(a, State::Failed, &format!("could not start publicompute-stage: {e:#}"), 0, 0.0);
             }
         };
         info!(chain = %a.chain_id, role = role.comando(), log = %log_path.display(), "stage started");
         let scadenza = tokio::time::sleep(self.cfg.load_timeout);
         tokio::pin!(scadenza);
         let esito: Outcome = {
+            let pipes = figlio.child.stdout.take().zip(figlio.child.stdin.take());
             let attesa_pronto = async {
-                match service {
-                    // The head listens only after chain setup, so a service connection confirms readiness.
-                    Some(addr) => loop {
-                        match TcpStream::connect(addr).await {
-                            Ok(s) => break Some(s),
-                            Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
-                        }
-                    },
-                    None => {
-                        let _ = pronto_rx.await;
-                        None
-                    }
+                match pipes {
+                    Some((reader, writer)) => head_ready(reader, writer).await.map(Some),
+                    None if role == Role::Head => bail!("head pipes unavailable"),
+                    None => pronto_rx.await.context("stage stderr closed before readiness").map(|_| None),
                 }
             };
             tokio::pin!(attesa_pronto);
             tokio::select! {
-                s = &mut attesa_pronto => Outcome::Pronto(s),
-                st = figlio.wait() => Outcome::Uscito(st.map_err(|e| e.to_string())),
+                result = &mut attesa_pronto => match result {
+                    Ok(stream) => Outcome::Pronto(stream),
+                    Err(error) => Outcome::Invalid(error),
+                },
+                st = figlio.child.wait() => Outcome::Uscito(st.map_err(|e| e.to_string())),
                 m = &mut ferma => Outcome::Fermato(m.unwrap_or_else(|_| "agent stopped".into())),
                 _ = &mut scadenza => Outcome::Scaduto,
             }
@@ -774,11 +984,11 @@ impl Stages {
         match esito {
             Outcome::Pronto(stream) => {
                 let carico = t0.elapsed().as_secs_f64();
-                let link = stream.map(HeadConnection::new);
+                let link = stream.map(|(reader, writer, buf)| HeadConnection::from_io(reader, writer, buf));
                 if let Some(l) = &link {
                     self.interno.lock().unwrap().link = Some(l.clone());
                 }
-                self.report(status_message(&a, State::Ready, "", porta, carico)).await;
+                self.report(status_message(a, State::Ready, "", porta, carico)).await;
                 // Once ready, watch the process and stop request. For a head, loss of
                 // the service connection also ends the assignment.
                 let mut caduto = link.as_ref().map(|l| l.osserva_chiusura());
@@ -791,37 +1001,49 @@ impl Stages {
                     }
                 };
                 tokio::select! {
-                    st = figlio.wait() => {
+                    st = figlio.child.wait() => {
+                        if let Some(link) = &link {
+                            link.close();
+                        }
+                        self.terminate(a, &mut figlio, "stage launcher exited").await;
                         let m = descrivi_uscita(st.map_err(|e| e.to_string()), &ultime);
-                        self.report(status_message(&a, State::Failed, &m, porta, carico)).await;
+                        status_message(a, State::Failed, &m, porta, carico)
                     }
                     m = &mut ferma => {
                         let reason = m.unwrap_or_else(|_| "agent stopped".into());
-                        self.terminate(&mut figlio, &reason).await;
-                        self.report(status_message(&a, State::Stopped, &reason, porta, carico)).await;
+                        if let Some(link) = &link {
+                            link.close();
+                        }
+                        self.terminate(a, &mut figlio, &reason).await;
+                        status_message(a, State::Stopped, &reason, porta, carico)
                     }
                     _ = done => {
                         let m = "lost the connection to the head service".to_string();
-                        self.terminate(&mut figlio, &m).await;
-                        self.report(status_message(&a, State::Failed, &m, porta, carico)).await;
+                        self.terminate(a, &mut figlio, &m).await;
+                        status_message(a, State::Failed, &m, porta, carico)
                     }
                 }
             }
+            Outcome::Invalid(error) => {
+                self.terminate(a, &mut figlio, "invalid stage readiness signal").await;
+                let message = format!("stage readiness failed: {error:#}; {}", ultime_righe(&ultime));
+                status_message(a, State::Failed, &message, 0, t0.elapsed().as_secs_f64())
+            }
             Outcome::Uscito(st) => {
+                self.terminate(a, &mut figlio, "stage launcher exited during load").await;
                 let m = descrivi_uscita(st, &ultime);
-                self.report(status_message(&a, State::Failed, &format!("stage exited during load: {m}"), 0, t0.elapsed().as_secs_f64())).await;
+                status_message(a, State::Failed, &format!("stage exited during load: {m}"), 0, t0.elapsed().as_secs_f64())
             }
             Outcome::Fermato(reason) => {
-                self.terminate(&mut figlio, &reason).await;
-                self.report(status_message(&a, State::Stopped, &reason, 0, t0.elapsed().as_secs_f64())).await;
+                self.terminate(a, &mut figlio, &reason).await;
+                status_message(a, State::Stopped, &reason, 0, t0.elapsed().as_secs_f64())
             }
             Outcome::Scaduto => {
                 let m = format!("loading exceeded {} s: {}", self.cfg.load_timeout.as_secs(), ultime_righe(&ultime));
-                self.terminate(&mut figlio, "stage load timed out").await;
-                self.report(status_message(&a, State::Failed, &m, 0, t0.elapsed().as_secs_f64())).await;
+                self.terminate(a, &mut figlio, "stage load timed out").await;
+                status_message(a, State::Failed, &m, 0, t0.elapsed().as_secs_f64())
             }
         }
-        self.pulisci(&a);
     }
 
     fn pulisci(&self, a: &StageAssign) {
@@ -832,32 +1054,45 @@ impl Stages {
         }
     }
 
-    /// Signal graceful exit first. Escalate after the grace period and bound the final wait.
-    async fn terminate(&self, figlio: &mut Child, reason: &str) {
+    /// Escalate to SIGKILL after the grace period and reap before reporting exit.
+    async fn terminate(&self, a: &StageAssign, figlio: &mut managed::Process, reason: &str) {
         info!(reason, "stopping the stage");
-        if figlio.try_wait().ok().flatten().is_some() {
-            return;
-        }
-        #[cfg(unix)]
-        if let Some(pid) = figlio.id() {
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-            if tokio::time::timeout(self.cfg.stop_grace, figlio.wait()).await.is_ok() {
-                return;
+        if let Err(error) = managed::stop(figlio, self.cfg.stop_grace, self.cfg.kill_wait, "publicompute-stage").await {
+            self.close_assignment(&a.chain_id, a.assign_epoch);
+            let switching = self.interno.lock().unwrap().switching.as_ref().is_some_and(|s| s.matches(a));
+            warn!(%error, "could not confirm stage group exit; waiting for it to empty");
+            if switching {
+                self.report(status_message(a, State::Failed, &format!("{error:#}"), 0, 0.0)).await;
             }
-            warn!("stage still running {} s after SIGTERM; sending SIGKILL", self.cfg.stop_grace.as_secs());
-        }
-        let _ = figlio.start_kill();
-        if tokio::time::timeout(self.cfg.kill_wait, figlio.wait()).await.is_err() {
-            warn!("stage still running {} s after SIGKILL", self.cfg.kill_wait.as_secs());
+            // Keep the switch guard until the entire group has exited.
+            while figlio.wait_for_exit("publicompute-stage").await.is_err() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
     }
 }
 
 enum Outcome {
-    Pronto(Option<TcpStream>),
+    Pronto(Option<(ChildStdout, ChildStdin, BytesMut)>),
+    Invalid(anyhow::Error),
     Uscito(std::result::Result<std::process::ExitStatus, String>),
     Fermato(String),
     Scaduto,
+}
+
+async fn head_ready(mut reader: ChildStdout, writer: ChildStdin) -> Result<(ChildStdout, ChildStdin, BytesMut)> {
+    let mut buf = BytesMut::with_capacity(4096);
+    loop {
+        if let Some(message) = wire::try_decode_frame::<pb::FromHead>(&mut buf)? {
+            if matches!(message.body, Some(pb::from_head::Body::Ready(_))) {
+                return Ok((reader, writer, buf));
+            }
+            bail!("expected readiness frame from the head");
+        }
+        if reader.read_buf(&mut buf).await? == 0 {
+            bail!("head pipe closed before readiness");
+        }
+    }
 }
 
 fn descrivi_uscita(st: std::result::Result<std::process::ExitStatus, String>, ultime: &Arc<Mutex<VecDeque<String>>>) -> String {
@@ -932,17 +1167,26 @@ fn write_atomic(path: &Path, dati: &[u8], _modo: u32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn porta_libera() -> Result<u16> {
     let l = std::net::TcpListener::bind("127.0.0.1:0")?;
     Ok(l.local_addr()?.port())
 }
 
 /// Spawn the stage, retain recent stderr for diagnostics and watch for its readiness line.
-async fn start(cfg: &StagesConfig, args: &[String], log_path: &Path) -> Result<(Child, oneshot::Receiver<()>, Arc<Mutex<VecDeque<String>>>)> {
+async fn start(cfg: &StagesConfig, args: &[String], log_path: &Path, use_pipes: bool, gpu: Option<&str>) -> Result<(managed::Process, oneshot::Receiver<()>, Arc<Mutex<VecDeque<String>>>)> {
     tokio::fs::create_dir_all(&cfg.log_dir).await.with_context(|| format!("create {}", cfg.log_dir.display()))?;
     let mut log = tokio::fs::OpenOptions::new().create(true).append(true).open(log_path).await.with_context(|| format!("open {}", log_path.display()))?;
     let mut cmd = Command::new(&cfg.stage_bin);
-    cmd.args(args).envs(cfg.env.iter().cloned()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
+    cmd.args(args).envs(cfg.env.iter().cloned()).stderr(Stdio::piped());
+    if let Some(uuid) = gpu {
+        cmd.env("CUDA_VISIBLE_DEVICES", uuid);
+    }
+    if use_pipes {
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null()).stdout(Stdio::null());
+    }
     // Make the stage exit with its parent so an orphan cannot hold the GPU.
     #[cfg(target_os = "linux")]
     unsafe {
@@ -951,8 +1195,8 @@ async fn start(cfg: &StagesConfig, args: &[String], log_path: &Path) -> Result<(
             Ok(())
         });
     }
-    let mut figlio = cmd.spawn().with_context(|| format!("start {}", cfg.stage_bin.display()))?;
-    let stderr = figlio.stderr.take().context("stage stderr unavailable")?;
+    let mut figlio = managed::Process::spawn(cmd).with_context(|| format!("start {}", cfg.stage_bin.display()))?;
+    let stderr = figlio.child.stderr.take().expect("stage stderr was piped");
     let (pronto_tx, pronto_rx) = oneshot::channel();
     let ultime: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
     let u2 = ultime.clone();
@@ -1046,8 +1290,8 @@ pub(crate) mod tests {
     #[test]
     fn arguments_for_role() {
         let d = tempdir("argomenti");
-        let cfg = StagesConfig { extra_args: vec!["--log-top".into(), "x".into()], ..cfg_test(&d) };
-        let head = arguments(&cfg, &assignment("c", 1, 1, 3, 0), Some("127.0.0.1:5555")).unwrap();
+        let cfg = StagesConfig { extra_args: vec!["--log-top".into(), "x".into(), "--ingress-max-mib".into(), "96".into()], ..cfg_test(&d) };
+        let head = arguments(&cfg, &assignment("c", 1, 1, 3, 0)).unwrap();
         let s = head.join(" ");
         assert_eq!(head[0], "head");
         for expected in [
@@ -1060,26 +1304,27 @@ pub(crate) mod tests {
             "--state-format fp16",
             "--next 127.0.0.1:9",
             "--listen-token 127.0.0.1:19999",
-            "--service 127.0.0.1:5555",
-            "--block 64",
+            "--service-pipe",
             "--log-top x",
         ] {
             assert!(s.contains(expected), "missing \"{expected}\" in: {s}");
         }
         assert!(!s.contains("--index"), "head has an unexpected --index: {s}");
-        let medio = arguments(&cfg, &assignment("c", 1, 2, 3, 7001), None).unwrap().join(" ");
+        assert!(!s.contains("--block"), "head should calculate the default block: {s}");
+        let medio = arguments(&cfg, &assignment("c", 1, 2, 3, 7001)).unwrap().join(" ");
         assert!(medio.starts_with("middle ") && medio.contains("--listen 127.0.0.1:7001") && medio.contains("--next 127.0.0.1:9") && medio.contains("--index 2"), "{medio}");
-        let tail = arguments(&cfg, &assignment("c", 1, 3, 3, 7002), None).unwrap().join(" ");
+        assert!(medio.contains("--ingress-max-mib 96"));
+        let tail = arguments(&cfg, &assignment("c", 1, 3, 3, 7002)).unwrap().join(" ");
         assert!(tail.starts_with("tail ") && tail.contains("--head-token 127.0.0.1:19999") && tail.contains("--index 3") && tail.contains("--layer-end -1"), "{tail}");
         assert!(!tail.contains("--state-format"));
-        assert!(arguments(&cfg, &assignment("c", 1, 1, 1, 0), Some("x")).is_err(), "reject a single-stage chain");
-        assert!(arguments(&cfg, &assignment("c", 1, 4, 3, 1), None).is_err(), "index exceeds n_stages");
+        assert!(arguments(&cfg, &assignment("c", 1, 1, 1, 0)).is_err(), "reject a single-stage chain");
+        assert!(arguments(&cfg, &assignment("c", 1, 4, 3, 1)).is_err(), "index exceeds n_stages");
         let mut a = assignment("c", 1, 3, 3, 7002);
         a.state_format = "int8".into();
-        assert!(arguments(&cfg, &a, None).is_err());
+        assert!(arguments(&cfg, &a).is_err());
         let mut a = assignment("c", 1, 2, 3, 0);
         a.listen_addr = "127.0.0.1:0".into();
-        assert!(arguments(&cfg, &a, None).is_err(), "port 0");
+        assert!(arguments(&cfg, &a).is_err(), "port 0");
     }
 
     fn righe_log(d: &Path, chain: &str, epoch: u64) -> String {
@@ -1330,6 +1575,27 @@ pub(crate) mod tests {
         assert_eq!(prossimo(&mut rx).await.state(), State::Stopped);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forced_stop_reaps_stage_before_returning() {
+        let d = tempdir("kill-reap");
+        let cfg = StagesConfig {
+            env: vec![("FAKE_STAGE_IGNORE_TERM".into(), "1".into())],
+            kill_wait: Duration::ZERO,
+            ..cfg_test(&d)
+        };
+        let assign = assignment("c", 1, 3, 3, porta_libera().unwrap());
+        let args = arguments(&cfg, &assign).unwrap();
+        let (mut child, ready, _) = start(&cfg, &args, &cfg.log_dir.join("reap.log"), false, None).await.unwrap();
+        let pid = child.child.id().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), ready).await.unwrap().unwrap();
+        let stages = Stages::new(cfg);
+        stages.terminate(&assign, &mut child, "test").await;
+        assert!(child.child.id().is_none());
+        assert_eq!(unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+    }
+
     #[tokio::test]
     async fn head_is_ready_when_service_accepts_requests() {
         let d = tempdir("head");
@@ -1358,6 +1624,80 @@ pub(crate) mod tests {
         // A lost head connection clears readiness.
         stages.stop_all().await;
         assert!(stages.head().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn head_eof_before_subscription_while_child_is_alive() {
+        let dir = tempdir("head-eof");
+        let mut config = cfg_test(&dir);
+        config.env.push(("FAKE_STAGE_CLOSE_STDOUT".into(), "1".into()));
+        let args = arguments(&config, &assignment("c", 1, 1, 2, 0)).unwrap();
+        let (mut child, _, _) = start(&config, &args, &dir.join("head.log"), true, None).await.unwrap();
+        let stdout = child.child.stdout.take().unwrap();
+        let stdin = child.child.stdin.take().unwrap();
+        let (reader, writer, buf) = head_ready(stdout, stdin).await.unwrap();
+        let link = HeadConnection::from_io(reader, writer, buf);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while link.aperto() {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert!(child.child.try_wait().unwrap().is_none());
+        assert!(*link.osserva_chiusura().borrow());
+        child.child.kill().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_or_missing_readiness_does_not_report_ready() {
+        for setting in ["FAKE_STAGE_NO_READY", "FAKE_STAGE_INVALID_READY"] {
+            let dir = tempdir("head-invalid");
+            let mut config = cfg_test(&dir);
+            config.env.push((setting.into(), "1".into()));
+            let stages = Stages::new(config);
+            let (tx, mut rx) = mpsc::channel(16);
+            stages.connect_peer(tx);
+            stages.queue_assignment(assignment("c", 1, 1, 2, 0));
+            assert_eq!(prossimo(&mut rx).await.state(), State::Loading);
+            let failed = prossimo(&mut rx).await;
+            assert_eq!(failed.state(), State::Failed);
+            assert!(failed.error.contains("stage readiness failed"), "{}", failed.error);
+            assert!(stages.head().is_none());
+            stages.stop_all().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn head_pipe_loss_closes_requests_and_allows_reassignment() {
+        let dir = tempdir("head-reassignment");
+        let stages = Stages::new(cfg_test(&dir));
+        let (tx, mut rx) = mpsc::channel(16);
+        stages.connect_peer(tx);
+        stages.queue_assignment(assignment("c", 1, 1, 2, 0));
+        assert_eq!(prossimo(&mut rx).await.state(), State::Loading);
+        assert_eq!(prossimo(&mut rx).await.state(), State::Ready);
+        let link = stages.head().unwrap();
+        let mut pending = link.request(pb::Request { id: link.nuovo_id(), text: "close-head-pipe".into(), ..Default::default() }).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(5), pending.recv()).await.unwrap().is_none());
+        assert_eq!(prossimo(&mut rx).await.state(), State::Failed);
+        assert!(!link.aperto());
+        stages.queue_assignment(assignment("c", 2, 1, 2, 0));
+        assert_eq!(prossimo(&mut rx).await.state(), State::Loading);
+        assert_eq!(prossimo(&mut rx).await.state(), State::Ready);
+        let link = stages.head().unwrap();
+        let mut pending = link.request(pb::Request { id: link.nuovo_id(), text: "ciao".into(), max_tokens: 10, ..Default::default() }).await.unwrap();
+        let done = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(response) = pending.recv().await {
+                if let OutgoingLink::Done(done) = response {
+                    return done;
+                }
+            }
+            panic!("replacement head closed before completion");
+        }).await.unwrap();
+        assert_eq!(done.reason, "eog");
+        stages.stop_all().await;
     }
 }
 
@@ -1491,7 +1831,7 @@ mod real_tests {
 
         // Start a second request during the first and cancel a third after partial output.
         let (e1, e2, e3) = (eng.clone(), eng.clone(), eng.clone());
-        let (dtx, mut drx) = mpsc::unbounded_channel();
+        let (dtx, mut drx, _) = crate::engine::stages::delta_channel();
         let a = tokio::spawn(async move { e1.chat(&request(text, 48), Some(dtx), None).await });
         let primo = tokio::time::timeout(Duration::from_secs(60), drx.recv()).await.expect("expected the first fragment").expect("token channel closed");
         println!("first fragment of the first response: {primo:?}");

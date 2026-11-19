@@ -28,14 +28,14 @@ use anyhow::{bail, Context, Result};
 use publicompute_proto::node::{ChatRole, FinishReason, InferenceRequest, RequestFailureCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use super::{
     fault,
     progress::{Phase, Progress},
     prompt_tokens_sha256, request_error,
-    stages::Delta,
+    stages::{Delta, DeltaSender},
     FaultCause, Generation, Limits, Recomputed, TokenProbs, Verification,
 };
 
@@ -395,7 +395,7 @@ impl LlamaEngine {
 
     /// Run a chat with its own progress counter, optional text deltas and
     /// cancellation. Also update the shared counter for supervision.
-    pub async fn chat_lease(&self, req: &InferenceRequest, top_k: u32, progress: &Progress, deltas: Option<mpsc::UnboundedSender<Delta>>, cancel: Cancel) -> Result<Generation> {
+    pub async fn chat_lease(&self, req: &InferenceRequest, top_k: u32, progress: &Progress, deltas: Option<DeltaSender>, cancel: Cancel) -> Result<Generation> {
         self.generate_with(req, top_k, progress, deltas, cancel).await
     }
 
@@ -407,7 +407,7 @@ impl LlamaEngine {
         }
     }
 
-    async fn generate_with(&self, req: &InferenceRequest, top_k: u32, progress: &Progress, deltas: Option<mpsc::UnboundedSender<Delta>>, mut cancel: Cancel) -> Result<Generation> {
+    async fn generate_with(&self, req: &InferenceRequest, top_k: u32, progress: &Progress, deltas: Option<DeltaSender>, mut cancel: Cancel) -> Result<Generation> {
         self.su_entrambi(progress, |p| p.set_phase(Phase::Prefill));
         self.su_entrambi(progress, |p| p.set_prompt_processed(0));
         let prompt = self.prompt_tokens(req).await?;
@@ -534,7 +534,7 @@ impl LlamaEngine {
     /// Stream text as it becomes available and reset the watchdog on valid
     /// progress. Recover missing IDs from the text after the final chunk.
     /// Cancellation closes the request and returns the partial response.
-    async fn complete_stream(&self, body: Value, progress: &Progress, deltas: Option<&mpsc::UnboundedSender<Delta>>, cancel: &mut Cancel) -> Result<Streamed> {
+    async fn complete_stream(&self, body: Value, progress: &Progress, deltas: Option<&DeltaSender>, cancel: &mut Cancel) -> Result<Streamed> {
         let lim = &self.limits;
         let deadline = Instant::now() + lim.request_max;
         // The headers arrive with the first body event, so they share the prefill deadline.
@@ -639,7 +639,7 @@ impl LlamaEngine {
                 }
                 if let Some(d) = deltas {
                     if !text.is_empty() || !tokens.is_empty() {
-                        let _ = d.send(Delta { index: index as u32, text: text.to_string(), token_ids: tokens });
+                        d.send(Delta { index: index as u32, text: text.to_string(), token_ids: tokens })?;
                     }
                 }
                 if let Some(ps) = v.get("completion_probabilities").filter(|p| p.is_array()) {
@@ -959,11 +959,11 @@ mod server_tests {
 
     async fn repaired_stream(f: &fake_llama::Fake, req: &InferenceRequest) -> (Generation, Vec<Delta>) {
         let (e, p) = engine(f, limits(5000, 5000), true);
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx, _) = super::super::stages::delta_channel();
         let g = e.chat_lease(req, 3, &p, Some(tx), None).await.unwrap();
         let mut deltas = Vec::new();
         while let Ok(delta) = rx.try_recv() {
-            deltas.push(delta);
+            deltas.push(delta.item);
         }
         assert_eq!(deltas.iter().map(|d| d.text.as_str()).collect::<String>(), g.text);
         assert_eq!(f.state.completions.load(Ordering::SeqCst), 1);
@@ -1078,7 +1078,7 @@ mod server_tests {
             (0, 12, FinishReason::Stop),
         ] {
             let req = request("Perché? 🙂", 0.0, 1, limit);
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (tx, mut rx, _) = super::super::stages::delta_channel();
             let g = stream.chat_lease(&req, 3, &progress, Some(tx), None).await.unwrap();
             assert_eq!(g.token_ids.len(), count);
             assert_eq!(g.probs.len(), count);
@@ -1087,7 +1087,7 @@ mod server_tests {
             assert_eq!(g.text.contains('🙂'), limit >= 5 || limit == 0);
             let mut text = String::new();
             for (index, (&id, p)) in g.token_ids.iter().zip(&g.probs).enumerate() {
-                let d = rx.try_recv().unwrap();
+                let d = rx.try_recv().unwrap().item;
                 assert_eq!(d.index, index as u32);
                 assert_eq!(d.token_ids, [id]);
                 if (1..4).contains(&index) {
@@ -1273,7 +1273,7 @@ mod server_tests {
         let t0 = Instant::now();
         let chat = |text: &'static str, p: Arc<Progress>| {
             let e = e.clone();
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx, _) = super::super::stages::delta_channel();
             let h = tokio::spawn(async move { e.chat_lease(&request(text, 0.0, 1, 0), 3, &p, Some(tx), None).await });
             (h, rx)
         };
@@ -1289,7 +1289,7 @@ mod server_tests {
         for (g, rx) in [(&ga, &mut rxa), (&gb, &mut rxb)] {
             let mut text = String::new();
             while let Ok(d) = rx.try_recv() {
-                text.push_str(&d.text);
+                text.push_str(&d.item.text);
             }
             assert_eq!(text, g.text);
         }
@@ -1461,11 +1461,11 @@ mod real_tests {
         let (mut compared, mut repaired) = (0, 0);
         for (i, (what, r)) in cases.iter().enumerate() {
             n.generate(&flush, 1).await.unwrap();
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (tx, mut rx, _) = super::super::stages::delta_channel();
             let streamed = s.chat_lease(r, 5, &s.progress, Some(tx), None).await.unwrap();
             let mut text = String::new();
             while let Ok(delta) = rx.try_recv() {
-                text.push_str(&delta.text);
+                text.push_str(&delta.item.text);
             }
             assert_eq!(text, streamed.text, "{what}: streamed text");
             assert_eq!(streamed.probs.len(), streamed.token_ids.len(), "{what}: probability positions");

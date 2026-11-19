@@ -1,5 +1,5 @@
-//! Local service socket for the head. It accepts one loopback client once
-//! the chain is ready. Incoming frames become request events for the
+//! Local service for the head over inherited pipes or a loopback socket.
+//! Incoming frames become request events for the
 //! compute thread, and a separate writer sends tokens and final results.
 //! Disconnect or invalid input tells the head to cancel open requests.
 //! The message types are defined in proto/publicompute/stage/service/v1/service.proto.
@@ -13,7 +13,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub use pb::{FromAgent, FromHead};
 
@@ -30,8 +30,70 @@ pub enum Event {
 /// [`Service::attendi_evento`] and writes with [`Service::manda`].
 pub struct Service {
     rx: Receiver<Event>,
-    output: Arc<Mutex<Option<Sender<Vec<u8>>>>>,
-    addr: SocketAddr,
+    output: Arc<Mutex<Option<Output>>>,
+    addr: Option<SocketAddr>,
+}
+
+const OUTPUT_BYTES: usize = 32 << 20;
+const OUTPUT_FRAMES: usize = 256;
+const DONE_BYTES: usize = 16 << 20;
+const DONE_FRAMES: usize = 16;
+const OUTPUT_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct Output {
+    tx: Sender<Vec<u8>>,
+    queue: Arc<Mutex<OutputQueue>>,
+    socket: Option<TcpStream>,
+}
+
+#[derive(Default)]
+struct OutputQueue {
+    bytes: usize,
+    frames: usize,
+    progress: Option<Instant>,
+    closed: bool,
+}
+
+impl Output {
+    fn new(socket: Option<TcpStream>) -> (Self, Receiver<Vec<u8>>) {
+        let (tx, rx) = channel();
+        (Self { tx, queue: Arc::default(), socket }, rx)
+    }
+
+    fn close(&self) {
+        self.queue.lock().unwrap().closed = true;
+        if let Some(socket) = &self.socket {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    fn closed(&self) -> bool {
+        let q = self.queue.lock().unwrap();
+        q.closed || q.progress.is_some_and(|t| t.elapsed() >= OUTPUT_TIMEOUT)
+    }
+
+    fn send(&self, message: FromHead) -> bool {
+        let done = matches!(message.body, Some(pb::from_head::Body::Done(_)));
+        // Keep space for terminal frames in the same FIFO as the tokens.
+        let max_bytes = if done { OUTPUT_BYTES + DONE_BYTES } else { OUTPUT_BYTES };
+        let max_frames = if done { OUTPUT_FRAMES + DONE_FRAMES } else { OUTPUT_FRAMES };
+        let len = message.encoded_len();
+        let size = len + prost::encoding::encoded_len_varint(len as u64);
+        let mut q = self.queue.lock().unwrap();
+        if q.closed || q.frames >= max_frames || size > max_bytes - q.bytes.min(max_bytes)
+            || len > publicompute_proto::wire::MAX_FRAME_SIZE
+        {
+            return false;
+        }
+        let mut frame = Vec::with_capacity(size);
+        if encode_frame(&message, &mut frame).is_err() || self.tx.send(frame).is_err() {
+            return false;
+        }
+        q.bytes += size;
+        q.frames += 1;
+        q.progress.get_or_insert_with(Instant::now);
+        true
+    }
 }
 
 /// Bind only to a loopback address.
@@ -51,7 +113,7 @@ impl Service {
         let listener = TcpListener::bind(s).map_err(|e| format!("bind {address}: {e}"))?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         let (tx, rx) = channel::<Event>();
-        let output: Arc<Mutex<Option<Sender<Vec<u8>>>>> = Arc::new(Mutex::new(None));
+        let output = Arc::new(Mutex::new(None));
         let attivo = Arc::new(AtomicBool::new(false));
         let u2 = output.clone();
         std::thread::spawn(move || {
@@ -64,12 +126,41 @@ impl Service {
                 start_connection(stream, tx.clone(), u2.clone(), attivo.clone());
             }
         });
-        Ok(Service { rx, output, addr })
+        Ok(Service { rx, output, addr: Some(addr) })
+    }
+
+    pub fn pipes() -> Result<Service, String> {
+        let mut stdout = std::io::stdout();
+        let ready = FromHead { body: Some(pb::from_head::Body::Ready(pb::Ready {})) };
+        let mut frame = Vec::new();
+        encode_frame(&ready, &mut frame).map_err(|e| e.to_string())?;
+        stdout.write_all(&frame).and_then(|_| stdout.flush()).map_err(|e| format!("write readiness: {e}"))?;
+        let (tx, rx) = channel();
+        let (writer, frames) = Output::new(None);
+        let queue = writer.queue.clone();
+        let output = Arc::new(Mutex::new(Some(writer)));
+        let reader_output = output.clone();
+        std::thread::spawn(move || {
+            read_requests(&mut std::io::stdin().lock(), &tx);
+            *reader_output.lock().unwrap() = None;
+            let _ = tx.send(Event::Disconnesso);
+        });
+        std::thread::spawn(move || write_responses(&mut stdout.lock(), frames, queue));
+        Ok(Service { rx, output, addr: None })
     }
 
     /// Actual address, useful when binding to port 0.
-    pub fn address(&self) -> SocketAddr {
+    pub fn address(&self) -> Option<SocketAddr> {
         self.addr
+    }
+
+    pub fn pipe_closed(&self) -> bool {
+        let output = self.output.lock().unwrap();
+        if let Some(writer) = output.as_ref().filter(|writer| writer.closed()) {
+            writer.close();
+            return self.addr.is_none();
+        }
+        self.addr.is_none() && output.is_none()
     }
 
     /// Take an event that has already arrived, without waiting.
@@ -85,73 +176,86 @@ impl Service {
         }
     }
 
-    /// Queue output for the active client. Return false if the frame exceeds
-    /// the payload limit, there is no session, or its writer has closed.
+    /// Queue output or fail promptly when the active client falls behind.
     pub fn manda(&self, m: FromHead) -> bool {
-        let mut v = Vec::with_capacity(m.encoded_len() + 8);
-        if encode_frame(&m, &mut v).is_err() {
-            return false;
+        let terminal = matches!(m.body, Some(pb::from_head::Body::Done(_)));
+        let output = self.output.lock().unwrap();
+        let Some(writer) = output.as_ref() else { return false };
+        if writer.send(m) {
+            return true;
         }
-        match self.output.lock().unwrap().as_ref() {
-            Some(tx) => tx.send(v).is_ok(),
-            None => false,
+        if terminal {
+            writer.close();
         }
+        false
     }
 }
 
-fn start_connection(stream: TcpStream, ev: Sender<Event>, output: Arc<Mutex<Option<Sender<Vec<u8>>>>>, attivo: Arc<AtomicBool>) {
+fn start_connection(stream: TcpStream, ev: Sender<Event>, output: Arc<Mutex<Option<Output>>>, attivo: Arc<AtomicBool>) {
     let _ = stream.set_nodelay(true);
-    let Ok(mut write) = stream.try_clone() else {
+    let _ = stream.set_write_timeout(Some(OUTPUT_TIMEOUT));
+    let (Ok(mut write), Ok(shutdown)) = (stream.try_clone(), stream.try_clone()) else {
         attivo.store(false, Ordering::SeqCst);
         return;
     };
-    let (tx_out, rx_out) = channel::<Vec<u8>>();
-    *output.lock().unwrap() = Some(tx_out);
+    let (writer, frames) = Output::new(Some(shutdown));
+    let queue = writer.queue.clone();
+    *output.lock().unwrap() = Some(writer);
     let _ = ev.send(Event::Connesso);
-    // Removing the sender lets the writer exit after pending output.
     std::thread::spawn(move || {
-        for dati in rx_out {
-            if write.write_all(&dati).is_err() {
-                break;
-            }
-        }
+        write_responses(&mut write, frames, queue);
         let _ = write.shutdown(std::net::Shutdown::Both);
     });
     std::thread::spawn(move || {
         let mut stream = stream;
-        let mut buf = BytesMut::new();
-        let mut tmp = vec![0u8; 64 << 10];
-        'lettura: loop {
-            loop {
-                match try_decode_frame::<FromAgent>(&mut buf) {
-                    Ok(Some(m)) => match m.body {
-                        Some(pb::from_agent::Body::Request(r)) => {
-                            let _ = ev.send(Event::Request(r));
-                        }
-                        Some(pb::from_agent::Body::Cancel(a)) => {
-                            let _ = ev.send(Event::Cancel(a.id));
-                        }
-                        None => {}
-                    },
-                    Ok(None) => break,
-                    Err(e) => {
-                        eprintln!("[service] invalid frame from the agent: {e}");
-                        break 'lettura;
-                    }
-                }
-            }
-            match stream.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => buf.extend_from_slice(&tmp[..n]),
-            }
+        read_requests(&mut stream, &ev);
+        if let Some(writer) = output.lock().unwrap().take() {
+            writer.close();
         }
-        // Drop the departing client's output sender before notifying the head
-        // so pending responses cannot enter the closed session.
-        *output.lock().unwrap() = None;
-        let _ = stream.shutdown(std::net::Shutdown::Both);
         let _ = ev.send(Event::Disconnesso);
         attivo.store(false, Ordering::SeqCst);
     });
+}
+
+fn write_responses(writer: &mut impl Write, frames: Receiver<Vec<u8>>, queue: Arc<Mutex<OutputQueue>>) {
+    for frame in frames {
+        let closed = queue.lock().unwrap().closed;
+        if closed || writer.write_all(&frame).and_then(|_| writer.flush()).is_err() {
+            break;
+        }
+        let mut q = queue.lock().unwrap();
+        q.bytes -= frame.len();
+        q.frames -= 1;
+        q.progress = (q.frames > 0).then(Instant::now);
+    }
+    queue.lock().unwrap().closed = true;
+}
+
+fn read_requests(reader: &mut impl Read, events: &Sender<Event>) {
+    let mut buf = BytesMut::new();
+    let mut tmp = vec![0u8; 64 << 10];
+    loop {
+        match try_decode_frame::<FromAgent>(&mut buf) {
+            Ok(Some(message)) => {
+                let event = match message.body {
+                    Some(pb::from_agent::Body::Request(request)) => Event::Request(request),
+                    Some(pb::from_agent::Body::Cancel(cancel)) => Event::Cancel(cancel.id),
+                    None => continue,
+                };
+                if events.send(event).is_err() {
+                    break;
+                }
+            }
+            Ok(None) => match reader.read(&mut tmp) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => buf.extend_from_slice(&tmp[..count]),
+            },
+            Err(error) => {
+                eprintln!("[service] invalid frame from the agent: {error}");
+                break;
+            }
+        }
+    }
 }
 
 /// Split a stream of UTF-8 bytes received in chunks. A character can span several tokens, so
@@ -208,7 +312,7 @@ impl Utf8Fragments {
 /// Render the role markers and trimmed content directly. The native chat
 /// formatter cannot evaluate this template. Open the response with an
 /// empty reasoning channel.
-pub fn gemma4_conversation(msgs: &[pb::Message]) -> Result<String, String> {
+pub fn gemma4_conversation<'a>(msgs: impl IntoIterator<Item = &'a pb::Message>) -> Result<String, String> {
     let mut t = String::from("<bos>");
     for m in msgs {
         let role = match m.role.as_str() {
@@ -227,7 +331,7 @@ pub fn gemma4_conversation(msgs: &[pb::Message]) -> Result<String, String> {
 /// prompt begins with an explicit BOS marker and the system text. User
 /// turns open an assistant segment with reasoning disabled, and assistant
 /// content ends with an end-of-sentence marker.
-pub fn deepseek4_conversation(msgs: &[pb::Message]) -> Result<String, String> {
+pub fn deepseek4_conversation<'a>(msgs: impl IntoIterator<Item = &'a pb::Message>) -> Result<String, String> {
     let mut t = String::from("<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>");
     for m in msgs {
         match m.role.as_str() {
@@ -247,38 +351,68 @@ pub fn deepseek4_conversation(msgs: &[pb::Message]) -> Result<String, String> {
     Ok(t)
 }
 
-/// Remove the oldest non-system messages until the prompt fits, dropping
-/// orphaned assistant replies along the way. Preserve system messages when
-/// possible and always keep the last message. Return the trimmed history
-/// and number of removals. An empty history, a token counting error, or
-/// a final message too large to fit by itself is an error.
-pub fn fit_context(
-    mut msgs: Vec<pb::Message>,
-    limite: usize,
-    mut conta: impl FnMut(&[pb::Message]) -> Result<usize, String>,
-) -> Result<(Vec<pb::Message>, usize), String> {
-    let totale = msgs.len();
-    let Some(last) = msgs.last().cloned() else { return Err("empty conversation".into()) };
-    let sistema = |m: &pb::Message| m.role == "system";
-    loop {
-        if conta(&msgs)? <= limite {
-            return Ok((msgs.clone(), totale - msgs.len()));
+const CONTEXT_ATTEMPTS: usize = 8;
+
+/// Try a bounded search over whole turns and keep the prepared prompt that fit.
+pub fn fit_context<T>(
+    messages: &[pb::Message],
+    limit: usize,
+    mut prepare: impl FnMut(&[&pb::Message]) -> Result<(T, usize), String>,
+) -> Result<(T, usize), String> {
+    let last = messages.last().ok_or("empty conversation")?;
+    let last_index = messages.len() - 1;
+    let mut candidate = messages.iter().collect::<Vec<_>>();
+    let (full, count) = prepare(&candidate)?;
+    if count <= limit {
+        return Ok((full, 0));
+    }
+    drop(full);
+
+    let system = |message: &pb::Message| message.role == "system";
+    let mut cuts = vec![0];
+    if let Some(first) = messages.iter().position(|message| !system(message)) {
+        cuts.extend((first + 1..last_index).filter(|&index| !system(&messages[index]) && messages[index].role != "assistant"));
+    }
+    cuts.push(last_index);
+    let mut prepare_suffix = |start| {
+        candidate.clear();
+        candidate.extend(messages.iter().enumerate().filter_map(|(index, message)| (index >= start || system(message)).then_some(message)));
+        if candidate.len() == messages.len() {
+            return Ok(None);
         }
-        // Oldest non-system message, as long as it is not the last one.
-        let Some(i) = msgs.iter().position(|m| !sistema(m)).filter(|&i| i + 1 < msgs.len()) else { break };
-        msgs.remove(i);
-        while msgs.iter().position(|m| !sistema(m)).is_some_and(|i| msgs[i].role == "assistant" && i + 1 < msgs.len()) {
-            let i = msgs.iter().position(|m| !sistema(m)).unwrap();
-            msgs.remove(i);
+        let (prepared, count) = prepare(&candidate)?;
+        Ok::<_, String>(Some((prepared, count, candidate.len())))
+    };
+
+    if let Some((smallest, count, size)) = prepare_suffix(last_index)? {
+        if count <= limit {
+            let mut best = (smallest, messages.len() - size);
+            let (mut too_long, mut fits) = (0, cuts.len() - 1);
+            for _ in 0..CONTEXT_ATTEMPTS - 2 {
+                if fits - too_long <= 1 {
+                    break;
+                }
+                let probe = too_long + (fits - too_long) / 2;
+                if let Some((prepared, count, size)) = prepare_suffix(cuts[probe])? {
+                    if count <= limit {
+                        best = (prepared, messages.len() - size);
+                        fits = probe;
+                        continue;
+                    }
+                }
+                too_long = probe;
+            }
+            return Ok(best);
+        }
+        if size == 1 {
+            return Err("the last message alone exceeds the slot context".into());
         }
     }
-    // Keep the last message and the system message if present. If they do not fit, try the last message alone.
-    if conta(&msgs)? <= limite {
-        return Ok((msgs.clone(), totale - msgs.len()));
-    }
-    let solo = vec![last];
-    if conta(&solo)? <= limite {
-        return Ok((solo, totale - 1));
+    if last_index > 0 {
+        let (prepared, count) = prepare(&[last])?;
+        if count <= limit {
+            return Ok((prepared, last_index));
+        }
     }
     Err("the last message alone exceeds the slot context".into())
 }
@@ -291,6 +425,50 @@ mod test {
 
     fn m(r: &str, t: &str) -> pb::Message {
         pb::Message { role: r.into(), text: t.into() }
+    }
+
+    #[test]
+    fn output_queue_bounds_tokens_and_keeps_terminal_frame_in_order() {
+        use pb::from_head::Body;
+        let (output, frames) = Output::new(None);
+        for step in 0..OUTPUT_FRAMES as u32 {
+            let token = pb::OutputToken { id: 1, step, ..Default::default() };
+            assert!(output.send(FromHead { body: Some(Body::Token(token)) }));
+        }
+        assert!(!output.send(FromHead { body: Some(Body::Token(pb::OutputToken { id: 1, ..Default::default() })) }));
+        assert!(output.send(FromHead { body: Some(Body::Done(pb::Done { id: 1, ..Default::default() })) }));
+        let mut written = Vec::new();
+        let queue = output.queue.clone();
+        drop(output);
+        write_responses(&mut written, frames, queue.clone());
+        let mut buf = BytesMut::from(written.as_slice());
+        for step in 0..OUTPUT_FRAMES as u32 {
+            let message = try_decode_frame::<FromHead>(&mut buf).unwrap().unwrap();
+            assert!(matches!(message.body, Some(Body::Token(t)) if t.id == 1 && t.step == step));
+        }
+        let message = try_decode_frame::<FromHead>(&mut buf).unwrap().unwrap();
+        assert!(matches!(message.body, Some(Body::Done(d)) if d.id == 1));
+        assert!(buf.is_empty());
+        assert_eq!(queue.lock().unwrap().bytes, 0);
+    }
+
+    #[test]
+    fn output_queue_bounds_bytes_and_detects_stalled_pipe() {
+        let (output, _frames) = Output::new(None);
+        let large_token = || FromHead {
+            body: Some(pb::from_head::Body::Token(pb::OutputToken {
+                id: 1,
+                text: "x".repeat((OUTPUT_BYTES / 3) + 1),
+                ..Default::default()
+            })),
+        };
+        assert!(output.send(large_token()));
+        assert!(output.send(large_token()));
+        assert!(!output.send(large_token()));
+        output.queue.lock().unwrap().progress = Some(Instant::now() - OUTPUT_TIMEOUT);
+        let (_tx, rx) = channel();
+        let service = Service { rx, output: Arc::new(Mutex::new(Some(output))), addr: None };
+        assert!(service.pipe_closed());
     }
 
     #[test]
@@ -330,23 +508,51 @@ mod test {
         assert!(deepseek4_conversation(&[m("user", "a"), m("developer", "x")]).is_err());
     }
 
-    fn conta(v: &[pb::Message]) -> Result<usize, String> {
-        Ok(v.iter().map(|x| x.text.len()).sum())
+    fn prepare(messages: &[&pb::Message]) -> Result<(Vec<String>, usize), String> {
+        Ok((messages.iter().map(|message| message.text.clone()).collect(), messages.iter().map(|message| message.text.len()).sum()))
     }
 
     #[test]
     fn fit_context_drops_oldest_messages_and_keeps_system_message() {
         let v = vec![m("system", "SS"), m("user", "aaaa"), m("assistant", "bbbb"), m("user", "cccc"), m("assistant", "dddd"), m("user", "ee")];
-        let (r, tolti) = fit_context(v.clone(), 100, conta).unwrap();
+        let (r, tolti) = fit_context(&v, 100, prepare).unwrap();
         assert_eq!((r.len(), tolti), (6, 0));
-        let (r, tolti) = fit_context(v.clone(), 12, conta).unwrap();
+        let (r, tolti) = fit_context(&v, 12, prepare).unwrap();
         assert_eq!(tolti, 2);
-        assert_eq!(r.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(), ["SS", "cccc", "dddd", "ee"]);
-        let (r, tolti) = fit_context(v.clone(), 4, conta).unwrap();
-        assert_eq!((r.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(), tolti), (vec!["SS", "ee"], 4));
-        let (r, tolti) = fit_context(v.clone(), 3, conta).unwrap();
-        assert_eq!((r.len(), tolti, r[0].text.as_str()), (1, 5, "ee"));
-        assert!(fit_context(v, 1, conta).is_err());
+        assert_eq!(r, ["SS", "cccc", "dddd", "ee"]);
+        let (r, tolti) = fit_context(&v, 4, prepare).unwrap();
+        assert_eq!(r, ["SS", "ee"]);
+        assert_eq!(tolti, 4);
+        let (r, tolti) = fit_context(&v, 3, prepare).unwrap();
+        assert_eq!((r.len(), tolti, r[0].as_str()), (1, 5, "ee"));
+        assert!(fit_context(&v, 1, prepare).is_err());
+    }
+
+    #[test]
+    fn fit_context_bounds_tokenization_and_returns_the_accepted_tokens() {
+        let mut history = vec![m("system", "system")];
+        for _ in 0..4000 {
+            history.extend([m("user", "ask"), m("assistant", "reply")]);
+        }
+        history.push(m("user", "last"));
+        let mut calls = 0;
+        let (tokens, dropped) = fit_context(&history, 2000, |messages| {
+            calls += 1;
+            assert_ne!(messages[1].role, "assistant");
+            let tokens = vec![calls; messages.len()];
+            Ok((tokens, messages.len()))
+        }).unwrap();
+        assert!(calls <= CONTEXT_ATTEMPTS);
+        assert!(tokens.len() <= 2000);
+        assert_eq!(tokens.len() + dropped, history.len());
+        assert!((1..=calls).contains(&tokens[0]));
+
+        let mut calls = 0;
+        let (tokens, dropped) = fit_context(&history, 1, |messages| {
+            calls += 1;
+            Ok((vec![calls; messages.len()], messages.len()))
+        }).unwrap();
+        assert_eq!((calls, tokens, dropped), (3, vec![3], history.len() - 1));
     }
 
     fn write(s: &mut TcpStream, m: &FromAgent) {
@@ -394,7 +600,7 @@ mod test {
     #[test]
     fn requests_cancels_and_responses_round_trip() {
         let sv = Service::listen("127.0.0.1:0").unwrap();
-        let mut c = TcpStream::connect(sv.address()).unwrap();
+        let mut c = TcpStream::connect(sv.address().unwrap()).unwrap();
         let mut buf = BytesMut::new();
         assert!(matches!(sv.attendi_evento(T), Some(Event::Connesso)));
         write(&mut c, &request(41, "ciao"));
@@ -429,10 +635,10 @@ mod test {
     #[test]
     fn single_connection_and_reconnect_after_disconnect() {
         let sv = Service::listen("127.0.0.1:0").unwrap();
-        let a = TcpStream::connect(sv.address()).unwrap();
+        let a = TcpStream::connect(sv.address().unwrap()).unwrap();
         assert!(matches!(sv.attendi_evento(T), Some(Event::Connesso)));
         // Check that refusing the extra client produces no head event.
-        let mut b = TcpStream::connect(sv.address()).unwrap();
+        let mut b = TcpStream::connect(sv.address().unwrap()).unwrap();
         b.set_read_timeout(Some(T)).unwrap();
         let mut x = [0u8; 8];
         assert!(matches!(b.read(&mut x), Ok(0) | Err(_)));
@@ -442,7 +648,7 @@ mod test {
         assert!(matches!(sv.attendi_evento(T), Some(Event::Disconnesso)));
         assert!(!sv.manda(FromHead { body: Some(CT::Status(pb::Status::default())) }));
         let mut c = loop {
-            let c = TcpStream::connect(sv.address()).unwrap();
+            let c = TcpStream::connect(sv.address().unwrap()).unwrap();
             if let Some(Event::Connesso) = sv.attendi_evento(Duration::from_millis(300)) {
                 break c;
             }
@@ -454,7 +660,7 @@ mod test {
     #[test]
     fn malformed_frame_closes_connection() {
         let sv = Service::listen("127.0.0.1:0").unwrap();
-        let mut c = TcpStream::connect(sv.address()).unwrap();
+        let mut c = TcpStream::connect(sv.address().unwrap()).unwrap();
         assert!(matches!(sv.attendi_evento(T), Some(Event::Connesso)));
         c.write_all(&[0xff, 0xff, 0xff, 0xff, 0x0f]).unwrap();
         assert!(matches!(sv.attendi_evento(T), Some(Event::Disconnesso)));

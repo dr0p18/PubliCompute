@@ -31,15 +31,45 @@ unit=$account.service
 unit_file=/etc/systemd/system/$unit
 link=/usr/local/bin/publicompute
 
-lock=/run/lock/publicompute-agent.lock
+root_directory() {
+    if [ -e "$1" ] || [ -L "$1" ]; then
+        [ ! -L "$1" ] && [ -d "$1" ] && [ "$(stat -c %u "$1")" = 0 ] ||
+            fail "Expected a root-owned directory at $1."
+        mode=$(stat -c %a "$1")
+        [ "$((0$mode & 022))" -eq 0 ] || fail "Directory writable by other users: $1."
+    fi
+}
+
+root_directory /run
+lock_dir=/run/publicompute-agent-lock
+mkdir -m 0700 -- "$lock_dir" 2>/dev/null || :
+[ ! -L "$lock_dir" ] && [ -d "$lock_dir" ] && [ "$(stat -c %u:%a "$lock_dir")" = 0:700 ] ||
+    fail 'Invalid installer lock directory.'
+lock=$lock_dir/lock
 if [ ! -e "$lock" ]; then (umask 077; set -C; : > "$lock") 2>/dev/null || :; fi
-[ ! -L "$lock" ] && [ -f "$lock" ] && [ "$(stat -c %u "$lock")" = 0 ] || fail 'Invalid installer lock file.'
+[ ! -L "$lock" ] && [ -f "$lock" ] && [ "$(stat -c %u:%h "$lock")" = 0:1 ] || fail 'Invalid installer lock file.'
 exec 9>>"$lock"
-fd=/proc/$$/fd/9
-[ -f "$fd" ] && [ "$(stat -Lc %u:%h "$fd")" = 0:1 ] && [ ! -L "$lock" ] &&
-    [ "$(stat -Lc %d:%i "$fd")" = "$(stat -c %d:%i "$lock")" ] || fail 'Invalid opened installer lock file.'
-chmod 0600 "$fd"
+chmod 0600 "$lock"
 flock -x -w 120 9 || fail 'Timed out after 120 s waiting for the PubliCompute installer lock.'
+
+# Older installers and uninstallers still lock the root-owned file in /run/lock.
+legacy_dir=/run/lock
+legacy_lock=$legacy_dir/$account.lock
+if [ ! -L "$legacy_dir" ] && [ -d "$legacy_dir" ] && [ "$(stat -c %u "$legacy_dir")" = 0 ]; then
+    mode=$(stat -c %a "$legacy_dir")
+    if [ "$((0$mode & 022))" -eq 0 ] || [ "$((0$mode & 01000))" -ne 0 ]; then
+        if [ ! -e "$legacy_lock" ] && [ ! -L "$legacy_lock" ]; then
+            if legacy_temp=$(mktemp -- "$legacy_dir/.$account.XXXXXXXX"); then
+                ln -T -- "$legacy_temp" "$legacy_lock" 2>/dev/null || :
+                rm -f -- "$legacy_temp"
+            fi
+        fi
+        if [ ! -L "$legacy_lock" ] && [ -f "$legacy_lock" ] && [ "$(stat -c %u:%h "$legacy_lock")" = 0:1 ]; then
+            exec 8<"$legacy_lock"
+            flock -x -w 120 8 || fail 'Timed out after 120 s waiting for the legacy PubliCompute installer lock.'
+        fi
+    fi
+fi
 
 require_unmounted() {
     mounts=$(findmnt --kernel --raw -n -o TARGET) || fail 'Cannot read the mount table.'
@@ -52,14 +82,9 @@ MOUNTS
     done
 }
 
-for path in "$scratch" "$conf" "$prefix"; do
-    if [ -e "$path" ] || [ -L "$path" ]; then
-        [ ! -L "$path" ] && [ -d "$path" ] && [ "$(stat -c %u "$path")" = 0 ] ||
-            fail "Expected a root-owned directory at $path."
-        mode=$(stat -c %a "$path")
-        [ "$((0$mode & 022))" -eq 0 ] || fail "Directory writable by other users: $path."
-    fi
-done
+root_directory "$scratch"
+root_directory "$conf"
+root_directory "$prefix"
 [ ! -L "$state" ] && { [ ! -e "$state" ] || [ -d "$state" ]; } || fail "Invalid state directory: $state."
 require_unmounted "$scratch" "$state" "$conf" "$prefix" "/run/$account"
 

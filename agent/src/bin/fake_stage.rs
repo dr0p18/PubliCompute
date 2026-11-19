@@ -9,7 +9,7 @@ use bytes::BytesMut;
 use publicompute_proto::service as pb;
 use publicompute_proto::wire::{encode_frame, try_decode_frame};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -41,11 +41,11 @@ fn main() {
     }
     match role.as_str() {
         "head" => {
-            let Some(addr) = val("--service") else {
-                eprintln!("error: the fake head requires --service");
+            if !args.iter().any(|arg| arg == "--service-pipe") {
+                eprintln!("error: the fake head requires --service-pipe");
                 std::process::exit(2);
-            };
-            head(&addr);
+            }
+            head();
         }
         "middle" | "tail" => {
             let Some(addr) = val("--listen") else {
@@ -69,50 +69,67 @@ fn main() {
     }
 }
 
-fn manda(s: &mut TcpStream, m: pb::FromHead) -> bool {
+fn manda(s: &mut impl Write, m: pb::FromHead) -> bool {
     let mut v = Vec::new();
     encode_frame(&m, &mut v).unwrap();
-    s.write_all(&v).is_ok()
+    s.write_all(&v).and_then(|_| s.flush()).is_ok()
 }
 
-fn head(addr: &str) {
-    let l = TcpListener::bind(addr).unwrap_or_else(|e| {
-        eprintln!("error: bind {addr}: {e}");
-        std::process::exit(2);
-    });
-    eprintln!("[head] fake chain ready; service listening on {addr}");
+#[cfg(unix)]
+fn close_stdout_and_wait() -> ! {
+    unsafe { libc::close(libc::STDOUT_FILENO) };
+    wait_for_exit();
+}
+
+fn wait_for_exit() -> ! {
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+fn head() {
     let ritardo = env_ms("FAKE_STAGE_TOKEN_DELAY_MS");
-    for conn in l.incoming() {
-        let Ok(stream) = conn else { continue };
-        let _ = stream.set_nodelay(true);
-        // Each request owns a thread. Workers serialize writes to keep response frames intact.
-        let write = Arc::new(Mutex::new(stream.try_clone().unwrap()));
-        let annullate: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
-        let mut stream = stream;
-        let (mut buf, mut tmp) = (BytesMut::new(), vec![0u8; 4096]);
-        {
-            let mut w = write.lock().unwrap();
-            manda(&mut w, pb::FromHead { body: Some(pb::from_head::Body::Status(pb::Status { free_slots: 4, pending: 0 })) });
-        }
-        'lettura: loop {
-            while let Ok(Some(m)) = try_decode_frame::<pb::FromAgent>(&mut buf) {
-                match m.body {
-                    Some(pb::from_agent::Body::Request(r)) => {
-                        let (write, annullate) = (write.clone(), annullate.clone());
-                        std::thread::spawn(move || request(r, ritardo, &write, &annullate));
+    let mut stdout = std::io::stdout();
+    #[cfg(unix)]
+    if std::env::var_os("FAKE_STAGE_NO_READY").is_some() {
+        close_stdout_and_wait();
+    }
+    if std::env::var_os("FAKE_STAGE_INVALID_READY").is_some() {
+        stdout.write_all(&[1, 0]).unwrap();
+        stdout.flush().unwrap();
+        wait_for_exit();
+    }
+    manda(&mut stdout, pb::FromHead { body: Some(pb::from_head::Body::Ready(pb::Ready {})) });
+    #[cfg(unix)]
+    if std::env::var_os("FAKE_STAGE_CLOSE_STDOUT").is_some() {
+        close_stdout_and_wait();
+    }
+    manda(&mut stdout, pb::FromHead { body: Some(pb::from_head::Body::Status(pb::Status { free_slots: 4, pending: 0 })) });
+    let write = Arc::new(Mutex::new(stdout));
+    let annullate: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+    let mut stdin = std::io::stdin().lock();
+    let (mut buf, mut tmp) = (BytesMut::new(), vec![0u8; 4096]);
+    loop {
+        while let Ok(Some(m)) = try_decode_frame::<pb::FromAgent>(&mut buf) {
+            match m.body {
+                Some(pb::from_agent::Body::Request(r)) => {
+                    #[cfg(unix)]
+                    if r.text == "close-head-pipe" {
+                        close_stdout_and_wait();
                     }
-                    Some(pb::from_agent::Body::Cancel(a)) => {
-                        // Log cancellation so the supervisor tests can observe it.
-                        eprintln!("[fake-stage] Cancel received for request {}", a.id);
-                        annullate.lock().unwrap().insert(a.id);
-                    }
-                    None => {}
+                    let (write, annullate) = (write.clone(), annullate.clone());
+                    std::thread::spawn(move || request(r, ritardo, &write, &annullate));
                 }
+                Some(pb::from_agent::Body::Cancel(a)) => {
+                    eprintln!("[fake-stage] Cancel received for request {}", a.id);
+                    annullate.lock().unwrap().insert(a.id);
+                }
+                None => {}
             }
-            match stream.read(&mut tmp) {
-                Ok(0) | Err(_) => break 'lettura,
-                Ok(n) => buf.extend_from_slice(&tmp[..n]),
-            }
+        }
+        match stdin.read(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
         }
     }
 }
@@ -122,14 +139,31 @@ fn testo_di(r: &pb::Request) -> String {
     r.messages.iter().rev().find(|m| m.role == "user").map(|m| m.text.clone()).unwrap_or_else(|| r.text.clone())
 }
 
-fn request(r: pb::Request, ritardo: Duration, write: &Arc<Mutex<TcpStream>>, annullate: &Arc<Mutex<HashSet<u64>>>) {
+fn request(r: pb::Request, ritardo: Duration, write: &Arc<Mutex<std::io::Stdout>>, annullate: &Arc<Mutex<HashSet<u64>>>) {
     let text = testo_di(&r);
     let send = |m: pb::FromHead| {
         let mut w = write.lock().unwrap();
-        manda(&mut w, m)
+        manda(&mut *w, m)
     };
     if text.contains("rifiuta") {
         send(pb::FromHead { body: Some(pb::from_head::Body::Done(pb::Done { id: r.id, reason: "error".into(), error: "prompt exceeds the slot context".into(), ..Default::default() })) });
+        return;
+    }
+    if matches!(text.as_str(), "stall-chat-output" | "flood-chat-output") {
+        let count = if text == "stall-chat-output" { 1 } else { 16 };
+        for step in 0..count {
+            if annullate.lock().unwrap().contains(&r.id) {
+                break;
+            }
+            send(pb::FromHead { body: Some(pb::from_head::Body::Token(pb::OutputToken {
+                id: r.id, token: 101, text: "x".repeat(512 << 10), logprob: -0.25, step, eog: false,
+            })) });
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        while !annullate.lock().unwrap().remove(&r.id) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        send(pb::FromHead { body: Some(pb::from_head::Body::Done(pb::Done { id: r.id, reason: "cancelled".into(), ..Default::default() })) });
         return;
     }
     // Hold this request until cancellation to simulate a prefill that never finishes.

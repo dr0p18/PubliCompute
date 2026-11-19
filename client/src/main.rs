@@ -200,6 +200,17 @@ fn draw(lines: &[String]) {
     let _ = out.flush();
 }
 
+fn follow_updates(socket: &Socket, silence: Duration, mut emit: impl FnMut(Msg) -> bool) -> bool {
+    match sock::follow(socket, silence, |status| emit(Msg::Status(status))) {
+        Ok(()) => false,
+        // A quiet subscription can still belong to an agent that answers commands.
+        Err(why) => match sock::get_status(socket) {
+            Ok(status) => emit(Msg::Status(status)),
+            Err(_) => emit(Msg::Down(why)),
+        },
+    }
+}
+
 fn interactive(socket: &Socket) -> Result<(), String> {
     let color = std::env::var_os("NO_COLOR").is_none();
     let _guard = TermGuard::enter().map_err(|e| e.to_string())?;
@@ -210,8 +221,7 @@ fn interactive(socket: &Socket) -> Result<(), String> {
     let t = tx.clone();
     let sock_path = socket.clone();
     thread::spawn(move || loop {
-        let why = sock::follow(&sock_path, |s| t.send(Msg::Status(s)).is_ok());
-        if t.send(Msg::Down(why)).is_err() {
+        if !follow_updates(&sock_path, sock::FOLLOW_TIMEOUT, |msg| t.send(msg).is_ok()) {
             return;
         }
         thread::sleep(Duration::from_secs(2));

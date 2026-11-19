@@ -11,13 +11,13 @@ use std::{
 
 use anyhow::Result;
 use publicompute_proto::node::{ChatRole, FinishReason, InferenceRequest};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use super::{
     fault,
     progress::{Phase, Progress},
     prompt_tokens_sha256,
-    stages::Delta,
+    stages::{Delta, DeltaSender},
     FaultCause, Generation, Limits, Recomputed, TokenProbs, Verification,
 };
 
@@ -43,7 +43,7 @@ impl MockEngine {
     }
 
     /// Run a chat with independent progress, deltas and cancellation.
-    pub async fn chat_lease(&self, req: &InferenceRequest, top_k: u32, progress: &Progress, deltas: Option<mpsc::UnboundedSender<Delta>>, cancel: Option<oneshot::Receiver<()>>) -> Result<Generation> {
+    pub async fn chat_lease(&self, req: &InferenceRequest, top_k: u32, progress: &Progress, deltas: Option<DeltaSender>, cancel: Option<oneshot::Receiver<()>>) -> Result<Generation> {
         self.generate_inner(req, top_k, self.cheat, progress, deltas, cancel).await
     }
 
@@ -68,7 +68,7 @@ impl MockEngine {
         top_k: u32,
         cheat: bool,
         progress: &Progress,
-        deltas: Option<mpsc::UnboundedSender<Delta>>,
+        deltas: Option<DeltaSender>,
         mut cancel: Option<oneshot::Receiver<()>>,
     ) -> Result<Generation> {
         let su_entrambi = |f: &dyn Fn(&Progress)| {
@@ -139,7 +139,7 @@ impl MockEngine {
             if let Some(d) = &deltas {
                 in_attesa.push(out[i]);
                 if let Ok(t) = std::str::from_utf8(&in_attesa) {
-                    let _ = d.send(Delta { index: primo as u32, text: t.to_string(), token_ids: (primo..=i).map(|k| u32::from(out[k])).collect() });
+                    d.send(Delta { index: primo as u32, text: t.to_string(), token_ids: (primo..=i).map(|k| u32::from(out[k])).collect() })?;
                     in_attesa.clear();
                     primo = i + 1;
                 }

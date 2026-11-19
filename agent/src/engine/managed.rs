@@ -3,7 +3,7 @@
 //! wait for exit before allowing a replacement to use the GPU. Windows creates
 //! a process group and stops the child with forced termination.
 
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{io, path::PathBuf, process::Stdio, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use tokio::process::{Child, Command};
@@ -126,7 +126,7 @@ pub fn args_con_posti(extra: &[String], slots: u32) -> Result<Vec<String>> {
 }
 
 impl ManagedCfg {
-    pub fn spawn(&self, gpu_uuid: Option<&str>) -> Result<Child> {
+    pub fn spawn(&self, gpu_uuid: Option<&str>) -> Result<Process> {
         let open = || std::fs::OpenOptions::new().create(true).append(true).open(&self.log_path);
         let mut log = open().with_context(|| format!("open log {}", self.log_path.display()))?;
         {
@@ -146,53 +146,77 @@ impl ManagedCfg {
             .args(&self.extra_args)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone()?))
-            .stderr(Stdio::from(log))
-            .kill_on_drop(true);
+            .stderr(Stdio::from(log));
+        let process = Process::spawn(cmd).with_context(|| format!("start {}", self.bin.display()))?;
+        info!(pid = process.pid, log = %self.log_path.display(), "llama-server started");
+        Ok(process)
+    }
+}
+
+pub struct Process {
+    pub child: Child,
+    // Child::id disappears when the launcher is reaped, even if its group survives.
+    pid: u32,
+}
+
+impl Process {
+    pub fn spawn(mut cmd: Command) -> io::Result<Self> {
+        cmd.kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0);
         #[cfg(windows)]
         cmd.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP
-        let child = cmd.spawn().with_context(|| format!("start {}", self.bin.display()))?;
-        info!(pid = child.id(), log = %self.log_path.display(), "llama-server started");
-        Ok(child)
+        let child = cmd.spawn()?;
+        let pid = child.id().expect("new child has a PID");
+        Ok(Self { child, pid })
     }
-}
 
-#[cfg(unix)]
-fn signal_group(pid: u32, sig: i32) {
-    // A negative PID addresses the entire process group.
-    unsafe {
-        libc::kill(-(pid as i32), sig);
-    }
-}
-
-/// Stop the child and reap it. Return an error if it does not exit even
-/// after forced termination.
-pub async fn stop(child: &mut Child, grace: Duration, kill_wait: Duration) -> Result<()> {
-    if let Ok(Some(st)) = child.try_wait() {
-        info!(status = %st, "llama-server already exited");
-        return Ok(());
-    }
-    let pid = child.id();
     #[cfg(unix)]
-    if let Some(pid) = pid {
-        signal_group(pid, libc::SIGTERM);
+    fn signal_group(&self, sig: i32) -> io::Result<bool> {
+        // A negative PID addresses the entire process group.
+        if unsafe { libc::kill(-(self.pid as i32), sig) } == 0 {
+            return Ok(true);
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(false);
+        }
+        Err(err)
+    }
+
+    pub async fn wait_for_exit(&mut self, process: &str) -> Result<()> {
+        let status = self.child.wait().await.with_context(|| format!("could not reap {process}"))?;
+        #[cfg(unix)]
+        while self.signal_group(0).with_context(|| format!("could not check the {process} process group"))? {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        info!(process, %status, "process exited");
+        Ok(())
+    }
+}
+
+/// Stop the process group before another engine can claim the same GPU.
+pub async fn stop(child: &mut Process, grace: Duration, kill_wait: Duration, process: &str) -> Result<()> {
+    let pid = child.pid;
+    #[cfg(unix)]
+    {
+        let _ = child.signal_group(libc::SIGTERM);
         // A stopped child cannot handle SIGTERM until execution resumes.
-        signal_group(pid, libc::SIGCONT);
-        if let Ok(st) = tokio::time::timeout(grace, child.wait()).await {
-            info!(status = ?st.ok(), "llama-server exited after SIGTERM");
+        let _ = child.signal_group(libc::SIGCONT);
+        if let Ok(Ok(())) = tokio::time::timeout(grace, child.wait_for_exit(process)).await {
             return Ok(());
         }
-        warn!(pid, "llama-server still running after {} s; sending SIGKILL", grace.as_secs());
-        signal_group(pid, libc::SIGKILL);
+        warn!(process, pid, "process group has not exited; sending SIGKILL");
+        let _ = child.signal_group(libc::SIGKILL);
     }
-    let _ = child.start_kill();
-    match tokio::time::timeout(kill_wait, child.wait()).await {
-        Ok(st) => {
-            info!(status = ?st.ok(), "llama-server terminato");
-            Ok(())
-        }
-        Err(_) => bail!("llama-server (pid {pid:?}) still running {} s after SIGKILL", kill_wait.as_secs()),
+    #[cfg(not(unix))]
+    {
+        let _ = grace;
+        let _ = child.child.start_kill();
+    }
+    match tokio::time::timeout(kill_wait, child.wait_for_exit(process)).await {
+        Ok(result) => result,
+        Err(_) => bail!("{process} (pid {pid}) still running {} s after SIGKILL", kill_wait.as_secs()),
     }
 }
 
@@ -229,6 +253,32 @@ mod tests {
         assert!(port_from_url("http://localhost").is_err());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_error_does_not_prove_exit() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 0"]);
+        let mut child = Process::spawn(cmd).unwrap();
+        let pid = child.pid as libc::pid_t;
+        // Reap externally to exercise the error returned by Child::wait.
+        assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) }, pid);
+        let error = stop(&mut child, Duration::ZERO, Duration::from_secs(1), "llama-server").await.unwrap_err();
+        assert!(format!("{error:#}").contains("could not reap llama-server"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_waits_for_the_group_after_the_launcher_exits() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "trap '' TERM; sleep 30 &"]);
+        let mut child = Process::spawn(cmd).unwrap();
+        assert!(child.child.wait().await.unwrap().success());
+        assert!(child.signal_group(0).unwrap(), "the launcher left a descendant");
+
+        stop(&mut child, Duration::from_millis(50), Duration::from_secs(3), "launcher").await.unwrap();
+        assert!(!child.signal_group(0).unwrap(), "the group must be empty before switching");
+    }
+
     #[tokio::test]
     async fn busy_port_is_refused() {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -260,10 +310,10 @@ mod stop_tests {
             kill_wait: Duration::from_secs(3),
         };
         let mut child = cfg.spawn(None).unwrap();
-        let pid = child.id().unwrap();
+        let pid = child.pid;
         tokio::time::sleep(Duration::from_millis(400)).await;
         let t0 = std::time::Instant::now();
-        stop(&mut child, cfg.stop_grace, cfg.kill_wait).await.unwrap();
+        stop(&mut child, cfg.stop_grace, cfg.kill_wait, "llama-server").await.unwrap();
         assert!(t0.elapsed() >= Duration::from_millis(500), "should wait for the grace period");
         assert!(unsafe { libc::kill(pid as i32, 0) } != 0, "the process should have exited");
     }

@@ -578,13 +578,13 @@ impl Engine {
 
     /// Apply the model's chat template to a user message (CLI tests) and tokenize.
     pub fn prepara_prompt(&self, utente: &str) -> Result<(Vec<i32>, String, bool), String> {
-        self.prepara_conversazione(&[Message { role: "user".into(), text: utente.to_string() }])
+        self.prepara_conversazione(&[&Message { role: "user".into(), text: utente.to_string() }])
     }
 
     /// Template and tokenize the supplied conversation. Return the token IDs,
     /// rendered prompt, and whether the native template API produced it.
     /// Some templates use a local formatter when the native API cannot render them.
-    pub fn prepara_conversazione(&self, msgs: &[Message]) -> Result<(Vec<i32>, String, bool), String> {
+    pub fn prepara_conversazione(&self, msgs: &[&Message]) -> Result<(Vec<i32>, String, bool), String> {
         if msgs.is_empty() {
             return Err("empty conversation".into());
         }
@@ -598,11 +598,11 @@ impl Engine {
             if tmpl_testo.is_empty() && self.architettura() == "deepseek4" {
                 // The local formatter supplies the chat markers for this architecture when
                 // the weight file does not provide a template.
-                (crate::service::deepseek4_conversation(msgs)?, false)
+                (crate::service::deepseek4_conversation(msgs.iter().copied())?, false)
             } else if tmpl_testo.contains("<|turn>") {
                 // The native formatter cannot render this template. The local formatter
                 // trims message content and opens an empty reasoning channel.
-                (crate::service::gemma4_conversation(msgs)?, false)
+                (crate::service::gemma4_conversation(msgs.iter().copied())?, false)
             } else {
                 let mut buf = vec![0u8; lunghezza * 2 + 1024];
                 let mut n = if tmpl.is_null() {

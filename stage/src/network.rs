@@ -4,16 +4,20 @@
 //! successor is ready, so the acknowledgement propagates readiness upstream.
 
 use crate::tls::{TlsError, StageSecurity};
-use bytes::BytesMut;
+use prost::{encoding, Message};
 use publicompute_proto::stage::{self as pb, message::Body};
-use publicompute_proto::wire::{encode_frame, try_decode_frame, FrameError, MAX_FRAME_SIZE};
-use std::io::{Read, Write};
+use publicompute_proto::wire::{encode_frame, FrameError, MAX_FRAME_SIZE};
+use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+const INGRESS_EVENT_OVERHEAD: usize = 256;
+const STEP_ROW_OVERHEAD: usize = 64;
+pub const CONTROL_INGRESS_BYTES: usize = 3 * MAX_FRAME_SIZE + INGRESS_EVENT_OVERHEAD;
 
 pub const WIRE_VERSION: (u32, u32) = (0, 1);
 
@@ -119,9 +123,7 @@ impl Hint for pb::Message {
 }
 
 pub struct Reader {
-    stream: TcpStream,
-    buf: BytesMut,
-    tmp: Vec<u8>,
+    stream: BufReader<TcpStream>,
     /// Epoch declared in `Hello` (only readers created by `read_hello`, otherwise 0).
     pub epoca_hello: u32,
     /// The tail's token stream advertises draft capability in its hello.
@@ -133,55 +135,206 @@ pub struct Reader {
 impl Reader {
     pub fn new(stream: TcpStream) -> Self {
         let _ = stream.set_read_timeout(seconds(&T_LETTURA_S));
-        Self { stream, buf: BytesMut::new(), tmp: vec![0u8; 1 << 20], epoca_hello: 0, mtp_hello: false, peer: None }
+        Self { stream: BufReader::new(stream), epoca_hello: 0, mtp_hello: false, peer: None }
     }
 
     fn set_read_deadline(&self, d: Option<Duration>) {
-        let _ = self.stream.set_read_timeout(d);
+        let _ = self.stream.get_ref().set_read_timeout(d);
     }
 
     /// Read one message within a whole-frame deadline. Check its declared
     /// length before reading or allocating the payload.
     fn leggi_limitato(&mut self, max: usize, done: Instant) -> Result<Option<pb::Message>, String> {
-        loop {
-            let mut peek = &self.buf[..];
-            if let Ok(len) = prost::encoding::decode_varint(&mut peek) {
-                if len > max as u64 {
-                    return Err(format!("frame is {len} bytes; limit for this message is {max} bytes"));
-                }
-            }
-            match try_decode_frame::<pb::Message>(&mut self.buf) {
-                Ok(Some(m)) => return Ok(Some(m)),
-                Ok(None) => {}
-                Err(e) => return Err(e.to_string()),
-            }
-            let resto = done.saturating_duration_since(Instant::now());
-            if resto.is_zero() {
-                return Err("deadline exceeded".into());
-            }
-            self.set_read_deadline(Some(resto));
-            let n = self.stream.read(&mut self.tmp).map_err(|e| e.to_string())?;
-            if n == 0 {
-                return if self.buf.is_empty() { Ok(None) } else { Err("connection closed mid-frame".into()) };
-            }
-            self.buf.extend_from_slice(&self.tmp[..n]);
-        }
+        let frame = self.read_frame(max, Some(done), None, |_| Ok(()))?;
+        frame.map(|(bytes, ())| pb::Message::decode(bytes.as_slice())).transpose().map_err(|e| e.to_string())
     }
 
     /// Next message. `Ok(None)` if the peer closed between messages.
     pub fn read(&mut self) -> Result<Option<pb::Message>, String> {
-        loop {
-            match try_decode_frame::<pb::Message>(&mut self.buf) {
-                Ok(Some(m)) => return Ok(Some(m)),
-                Ok(None) => {}
-                Err(e) => return Err(e.to_string()),
+        let frame = self.read_frame(MAX_FRAME_SIZE, None, None, |_| Ok(()))?;
+        frame.map(|(bytes, ())| pb::Message::decode(bytes.as_slice())).transpose().map_err(|e| e.to_string())
+    }
+
+    pub fn read_admitted(&mut self, budget: &Arc<IngressBudget>, wait: Duration, stream: pb::Stream, n_batch: usize) -> Result<Option<(pb::Message, IngressPermit)>, String> {
+        let frame = self.read_frame(MAX_FRAME_SIZE, None, Some(Duration::from_secs(30)), |len| {
+            // The payload, decoded byte fields (including Vec growth), and repeated fields
+            // can coexist. Each StepRow uses at least two wire bytes, each token at least one.
+            let repeated = match stream {
+                pb::Stream::Generation => (len / 2).min(n_batch).max(4) * (2 * size_of::<pb::StepRow>() + STEP_ROW_OVERHEAD),
+                pb::Stream::Prefill => len.min(n_batch).max(4) * 2 * size_of::<i32>(),
+                _ => 0,
+            };
+            budget.reserve(3 * len + repeated + INGRESS_EVENT_OVERHEAD, wait)
+        });
+        self.set_read_deadline(seconds(&T_LETTURA_S));
+        let Some((payload, mut permit)) = frame? else { return Ok(None) };
+        check_ingress(&payload, stream, n_batch).map_err(|e| e.to_string())?;
+        let message = pb::Message::decode(bytes::Bytes::from(payload)).map_err(|e| e.to_string())?;
+        let resident = INGRESS_EVENT_OVERHEAD + match message.body.as_ref() {
+            Some(Body::Step(step)) => step.state.capacity() + step.rows.capacity() * size_of::<pb::StepRow>() + STEP_ROW_OVERHEAD * step.rows.len(),
+            Some(Body::Block(block)) => block.state.capacity() + block.token.capacity() * size_of::<i32>(),
+            Some(Body::Confirmation(c)) => c.error.capacity() + c.timings_json.capacity(),
+            _ => 0,
+        };
+        permit.release(permit.bytes - resident);
+        Ok(Some((message, permit)))
+    }
+
+    fn read_chunk(&mut self, bytes: &mut [u8], deadline: Option<Instant>) -> Result<usize, String> {
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("deadline exceeded".into());
             }
-            let n = self.stream.read(&mut self.tmp).map_err(|e| e.to_string())?;
-            if n == 0 {
-                return if self.buf.is_empty() { Ok(None) } else { Err("connection closed mid-frame".into()) };
-            }
-            self.buf.extend_from_slice(&self.tmp[..n]);
+            self.set_read_deadline(Some(remaining));
         }
+        self.stream.read(bytes).map_err(|error| error.to_string())
+    }
+
+    fn read_frame<P>(&mut self, max: usize, deadline: Option<Instant>, body_timeout: Option<Duration>, reserve: impl FnOnce(usize) -> Result<P, String>) -> Result<Option<(Vec<u8>, P)>, String> {
+        let mut prefix = [0u8; 10];
+        for index in 0..prefix.len() {
+            if self.read_chunk(&mut prefix[index..=index], deadline)? == 0 {
+                return if index == 0 { Ok(None) } else { Err("connection closed in frame length".into()) };
+            }
+            if prefix[index] & 0x80 != 0 {
+                continue;
+            }
+            let len = prost::encoding::decode_varint(&mut &prefix[..=index]).map_err(|_| "invalid frame length")?;
+            if len > max as u64 {
+                return Err(format!("frame is {len} bytes; limit for this message is {max} bytes"));
+            }
+            let permit = reserve(len as usize)?;
+            let mut payload = vec![0; len as usize];
+            let deadline = deadline.or_else(|| body_timeout.map(|timeout| Instant::now() + timeout));
+            let mut offset = 0;
+            while offset < payload.len() {
+                let count = self.read_chunk(&mut payload[offset..], deadline)?;
+                if count == 0 {
+                    return Err("connection closed mid-frame".into());
+                }
+                offset += count;
+            }
+            return Ok(Some((payload, permit)));
+        }
+        Err("invalid frame length".into())
+    }
+}
+
+/// Inspect repeated field counts before prost allocates their vectors.
+fn check_ingress(mut payload: &[u8], stream: pb::Stream, n_batch: usize) -> Result<(), prost::DecodeError> {
+    use encoding::{decode_key, decode_varint, skip_field, DecodeContext, WireType};
+
+    fn delimited<'a>(wire: WireType, bytes: &mut &'a [u8]) -> Result<&'a [u8], prost::DecodeError> {
+        encoding::check_wire_type(WireType::LengthDelimited, wire)?;
+        let len = decode_varint(bytes)?;
+        if len > bytes.len() as u64 {
+            return Err(prost::DecodeError::new("truncated stage field"));
+        }
+        let (field, rest) = bytes.split_at(len as usize);
+        *bytes = rest;
+        Ok(field)
+    }
+
+    let mut count = 0;
+    let mut seen = false;
+    while !payload.is_empty() {
+        let (tag, wire) = decode_key(&mut payload)?;
+        match (stream, tag) {
+            (pb::Stream::Prefill, 3 | 4 | 8) |
+            (pb::Stream::Generation, 5) |
+            (pb::Stream::Control, 7) => seen = true,
+            (_, 1..=8) => return Err(prost::DecodeError::new("unexpected message on stage stream")),
+            _ => {}
+        }
+        if !matches!((stream, tag), (pb::Stream::Generation, 5) | (pb::Stream::Prefill, 4)) {
+            skip_field(wire, tag, &mut payload, DecodeContext::default())?;
+            continue;
+        }
+        let mut work = delimited(wire, &mut payload)?;
+        while !work.is_empty() {
+            let (field, wire) = decode_key(&mut work)?;
+            match (stream, field, wire) {
+                (pb::Stream::Generation, 3, _) => {
+                    delimited(wire, &mut work)?;
+                    count += 1;
+                }
+                (pb::Stream::Prefill, 12, WireType::Varint) => {
+                    decode_varint(&mut work)?;
+                    count += 1;
+                }
+                (pb::Stream::Prefill, 12, _) => {
+                    let mut tokens = delimited(wire, &mut work)?;
+                    while !tokens.is_empty() {
+                        decode_varint(&mut tokens)?;
+                        count += 1;
+                        if count > n_batch {
+                            return Err(prost::DecodeError::new("too many prefill token IDs"));
+                        }
+                    }
+                }
+                _ => skip_field(wire, field, &mut work, DecodeContext::default())?,
+            }
+            if count > n_batch {
+                return Err(prost::DecodeError::new("too many stage rows or prefill token IDs"));
+            }
+        }
+    }
+    if !seen {
+        return Err(prost::DecodeError::new("missing stage message body"));
+    }
+    Ok(())
+}
+
+pub struct IngressBudget {
+    used: Mutex<(usize, usize)>,
+    available: Condvar,
+    bytes: usize,
+    events: usize,
+}
+
+impl IngressBudget {
+    pub fn new(bytes: usize, events: usize) -> Arc<Self> {
+        Arc::new(Self { used: Mutex::new((0, 0)), available: Condvar::new(), bytes, events })
+    }
+
+    pub fn reserve(self: &Arc<Self>, bytes: usize, wait: Duration) -> Result<IngressPermit, String> {
+        if bytes > self.bytes {
+            return Err(format!("frame of {bytes} bytes exceeds the ingress budget of {} bytes", self.bytes));
+        }
+        let usage = self.used.lock().unwrap();
+        let (mut usage, _) = self.available.wait_timeout_while(usage, wait, |usage| {
+            bytes > self.bytes - usage.0 || usage.1 >= self.events
+        }).unwrap();
+        if bytes > self.bytes - usage.0 || usage.1 >= self.events {
+            return Err("ingress queue remained full".into());
+        }
+        usage.0 += bytes;
+        usage.1 += 1;
+        Ok(IngressPermit { budget: self.clone(), bytes })
+    }
+}
+
+pub struct IngressPermit {
+    budget: Arc<IngressBudget>,
+    bytes: usize,
+}
+
+impl IngressPermit {
+    fn release(&mut self, bytes: usize) {
+        let mut usage = self.budget.used.lock().unwrap();
+        self.bytes -= bytes;
+        usage.0 -= bytes;
+        self.budget.available.notify_all();
+    }
+}
+
+impl Drop for IngressPermit {
+    fn drop(&mut self) {
+        let mut usage = self.budget.used.lock().unwrap();
+        usage.0 -= self.bytes;
+        usage.1 -= 1;
+        self.budget.available.notify_all();
     }
 }
 
@@ -194,14 +347,13 @@ struct Budget {
 
 /// A writer drains a bounded byte queue off the compute thread. A send
 /// that would exceed the cap waits up to the write timeout for room.
-/// Readers hand off messages through unbounded channels so the network
-/// keeps draining even if every compute thread is waiting for a writer.
 pub struct Writer {
     tx: Option<Sender<Vec<u8>>>,
     fault: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
     name: String,
     budget: Arc<Budget>,
+    socket: Arc<TcpStream>,
 }
 
 impl Writer {
@@ -209,59 +361,71 @@ impl Writer {
         Self::con_tetto(stream, name, CODA_MAX_MIB.load(Ordering::Relaxed) << 20)
     }
 
-    fn con_tetto(mut stream: TcpStream, name: &str, tetto: usize) -> Self {
+    fn con_tetto(stream: TcpStream, name: &str, tetto: usize) -> Self {
         let _ = stream.set_write_timeout(seconds(&T_SCRITTURA_S));
+        let socket = Arc::new(stream);
+        let writer = socket.clone();
         let (tx, rx) = channel::<Vec<u8>>();
         let fault = Arc::new(AtomicBool::new(false));
         let budget = Arc::new(Budget { in_coda: Mutex::new(0), cv: Condvar::new(), tetto });
         let (g, b) = (fault.clone(), budget.clone());
         let n = name.to_string();
         let handle = std::thread::spawn(move || {
+            let mut stream = &*writer;
             for dati in rx {
                 let r = stream.write_all(&dati);
-                *b.in_coda.lock().unwrap() -= dati.len();
-                b.cv.notify_all();
+                let mut queued = b.in_coda.lock().unwrap();
+                *queued -= dati.len();
                 if let Err(e) = r {
                     eprintln!("[network] write to {n}: {e}");
                     g.store(true, Ordering::SeqCst);
                     b.cv.notify_all();
                     break;
                 }
+                b.cv.notify_all();
             }
             let _ = stream.flush();
             let _ = stream.shutdown(std::net::Shutdown::Write);
         });
-        Self { tx: Some(tx), fault, handle: Some(handle), name: name.to_string(), budget }
+        Self { tx: Some(tx), fault, handle: Some(handle), name: name.to_string(), budget, socket }
+    }
+
+    pub fn queue_timeout() -> Duration {
+        seconds(&T_SCRITTURA_S).unwrap_or(Duration::from_secs(600))
     }
 
     pub fn send(&self, m: &pb::Message) -> Result<(), String> {
-        let bytes = encode(m)?;
-        if self.fault.load(Ordering::SeqCst) {
-            return Err(format!("connection {} lost", self.name));
+        self.send_with_wait(m, Self::queue_timeout())
+    }
+
+    pub fn send_with_wait(&self, m: &pb::Message, limite: Duration) -> Result<(), String> {
+        if self.send_frame_with_wait(encode(m)?, limite)?.is_some() {
+            return Err(format!("connection {} too slow: queue limit {} bytes for more than {limite:?}", self.name, self.budget.tetto));
         }
+        Ok(())
+    }
+
+    /// Return the encoded frame if the queue is still full when the wait ends.
+    pub fn send_frame_with_wait(&self, bytes: Vec<u8>, limite: Duration) -> Result<Option<Vec<u8>>, String> {
         let n = bytes.len();
         {
-            let limite = seconds(&T_SCRITTURA_S).unwrap_or(Duration::from_secs(600));
             let done = Instant::now() + limite;
             let mut p = self.budget.in_coda.lock().unwrap();
-            // Admit a single message to an empty queue even if it exceeds the cap.
-            while *p > 0 && *p + n > self.budget.tetto {
+            loop {
                 if self.fault.load(Ordering::SeqCst) {
                     return Err(format!("connection {} lost", self.name));
                 }
+                // Admit a single message to an empty queue even if it exceeds the cap.
+                if *p == 0 || *p + n <= self.budget.tetto {
+                    *p += n;
+                    break;
+                }
                 let resto = done.saturating_duration_since(Instant::now());
                 if resto.is_zero() {
-                    return Err(format!(
-                        "connection {} too slow: {} queued bytes (limit {}) for more than {} s",
-                        self.name,
-                        *p,
-                        self.budget.tetto,
-                        limite.as_secs()
-                    ));
+                    return Ok(Some(bytes));
                 }
                 p = self.budget.cv.wait_timeout(p, resto).unwrap().0;
             }
-            *p += n;
         }
         let r = self.tx.as_ref().ok_or("writer closed").map_err(String::from);
         let r = r.and_then(|t| t.send(bytes).map_err(|_| format!("connection {} lost", self.name)));
@@ -269,7 +433,15 @@ impl Writer {
             *self.budget.in_coda.lock().unwrap() -= n;
             self.budget.cv.notify_all();
         }
-        r
+        r.map(|()| None)
+    }
+
+    pub fn failed(&self) -> bool {
+        self.fault.load(Ordering::SeqCst)
+    }
+
+    pub fn abort(&self) {
+        let _ = self.socket.shutdown(std::net::Shutdown::Both);
     }
 
     /// Drain the queue, close the write side and wait for the thread.
@@ -307,17 +479,42 @@ pub fn connect_with(sic: Option<&Arc<StageSecurity>>, address: &str, stream: pb:
     connect_advertising(sic, address, stream, timeout, epoch, false)
 }
 
+pub fn connect_forward(address: &str, timeout: Duration, epoch: &mut u32) -> Result<[(Reader, TcpStream); 3], String> {
+    let sic = security();
+    let done = Instant::now() + timeout;
+    loop {
+        let attempt = || {
+            let prefill = try_connect(sic.as_ref(), address, pb::Stream::Prefill, done, *epoch, false)?;
+            let gen = try_connect(sic.as_ref(), address, pb::Stream::Generation, done, *epoch, false)?;
+            let ctl = try_connect(sic.as_ref(), address, pb::Stream::Control, done, *epoch, false)?;
+            Ok([prefill, gen, ctl])
+        };
+        match attempt() {
+            Ok(streams) => return Ok(streams),
+            Err(ConnectAttempt::Riprova(e)) => {
+                if Instant::now() >= done {
+                    return Err(e);
+                }
+                // A partial handshake can retire the whole epoch at the peer.
+                *epoch = epoch.checked_add(1).ok_or("stage link epoch exhausted")?;
+                std::thread::sleep(Duration::from_millis(200).min(done.saturating_duration_since(Instant::now())));
+            }
+            Err(ConnectAttempt::Fatale(e)) => return Err(e),
+        }
+    }
+}
+
 fn connect_advertising(sic: Option<&Arc<StageSecurity>>, address: &str, stream: pb::Stream, timeout: Duration, epoch: u32, mtp: bool) -> Result<(Reader, TcpStream), String> {
     let done = Instant::now() + timeout;
     loop {
-        match try_connect(sic, address, stream, timeout, epoch, mtp) {
+        match try_connect(sic, address, stream, done, epoch, mtp) {
             Ok(r) => return Ok(r),
             // A proxy accepts immediately and closes if its destination is not ready, so retry.
             Err(ConnectAttempt::Riprova(e)) => {
                 if Instant::now() >= done {
-                    return Err(format!("cannot connect to {address} ({}): {e}", stream_name(stream)));
+                    return Err(e);
                 }
-                std::thread::sleep(Duration::from_millis(200));
+                std::thread::sleep(Duration::from_millis(200).min(done.saturating_duration_since(Instant::now())));
             }
             Err(ConnectAttempt::Fatale(e)) => return Err(e),
         }
@@ -329,15 +526,21 @@ enum ConnectAttempt {
     Fatale(String),
 }
 
-fn try_connect(sic: Option<&Arc<StageSecurity>>, address: &str, stream_kind: pb::Stream, timeout: Duration, epoch: u32, mtp: bool) -> Result<(Reader, TcpStream), ConnectAttempt> {
+fn try_connect(sic: Option<&Arc<StageSecurity>>, address: &str, stream_kind: pb::Stream, done: Instant, epoch: u32, mtp: bool) -> Result<(Reader, TcpStream), ConnectAttempt> {
     use ConnectAttempt::{Fatale, Riprova};
+    let retry = |e| Riprova(format!("cannot connect to {address} ({}): {e}", stream_name(stream_kind)));
+    let remaining = || {
+        let rest = done.saturating_duration_since(Instant::now());
+        if rest.is_zero() { Err(retry("deadline exceeded".into())) } else { Ok(rest) }
+    };
+    remaining()?;
     let risolti: Vec<_> = address.to_socket_addrs().map_err(|e| Fatale(format!("indirizzo {address}: {e}")))?.collect();
     // Without a deadline, `connect` may hang for minutes on an unresponsive host.
     let t_conn = seconds(&T_HELLO_S).unwrap_or(Duration::from_secs(10));
     let mut last = String::from("no address");
     let mut stream = None;
     for a in &risolti {
-        match TcpStream::connect_timeout(a, t_conn) {
+        match TcpStream::connect_timeout(a, t_conn.min(remaining()?)) {
             Ok(s) => {
                 stream = Some(s);
                 break;
@@ -345,38 +548,38 @@ fn try_connect(sic: Option<&Arc<StageSecurity>>, address: &str, stream_kind: pb:
             Err(e) => last = e.to_string(),
         }
     }
-    let stream = stream.ok_or(Riprova(last))?;
+    let stream = stream.ok_or_else(|| retry(last))?;
     let stream = match sic {
         // TLS: server must be our successor in the capability (or the head for Token).
         Some(sic) => {
             let expected = sic.expected_outgoing_peer(stream_kind).map_err(Fatale)?;
-            sic.wrap_client(stream, &expected, t_conn).map_err(|e| match e {
+            sic.wrap_client(stream, &expected, t_conn.min(remaining()?)).map_err(|e| match e {
                 TlsError::Identity(m) => Fatale(format!("{address} ({}): {m}", stream_name(stream_kind))),
-                TlsError::Rete(m) => Riprova(m),
+                TlsError::Rete(m) => retry(m),
             })?
         }
         None => stream,
     };
     imposta(&stream);
     let mut w = stream.try_clone().map_err(|e| Fatale(e.to_string()))?;
+    w.set_write_timeout(Some(remaining()?)).map_err(|e| retry(e.to_string()))?;
     write_sync(
         &mut w,
         &msg(Body::Hello(pb::Hello { protocol_major: WIRE_VERSION.0, protocol_minor: WIRE_VERSION.1, stream: stream_kind as i32, epoch, mtp })),
     )
-    .map_err(Riprova)?;
+    .map_err(&retry)?;
+    let _ = w.set_write_timeout(seconds(&T_SCRITTURA_S));
     let mut l = Reader::new(stream);
-    // An intermediate stage sends `HelloAck` only after connecting to its successor, so wait `timeout`.
-    l.set_read_deadline(Some(timeout.max(Duration::from_secs(1))));
-    let ack = l.read();
+    let ack = l.leggi_limitato(HELLO_FRAME_MAX, done);
     l.set_read_deadline(seconds(&T_LETTURA_S));
     match ack {
         Ok(Some(pb::Message { body: Some(Body::Ack(a)) })) if a.ok => Ok((l, w)),
         Ok(Some(pb::Message { body: Some(Body::Ack(a)) })) => {
             Err(Fatale(format!("{address} rejected {}: {}", stream_name(stream_kind), a.error)))
         }
-        Ok(None) => Err(Riprova("connection closed before HelloAck".into())),
+        Ok(None) => Err(retry("connection closed before HelloAck".into())),
         Ok(altro) => Err(Fatale(format!("{address}: unexpected reply to Hello: {altro:?}"))),
-        Err(e) => Err(Riprova(e)),
+        Err(e) => Err(retry(e)),
     }
 }
 
@@ -508,7 +711,20 @@ pub const MARGINE_FRAME: usize = 1024;
 
 /// Bound prefill rows by the wire frame limit and the encoded row width.
 pub fn max_block_tokens(width: usize, stream_count: usize, format: pb::StateFormat) -> usize {
-    (MAX_FRAME_SIZE - MARGINE_FRAME) / bytes_per_row(width, stream_count, format).max(1)
+    max_block_tokens_with_ids(width, stream_count, format, false)
+}
+
+pub fn max_block_tokens_with_ids(width: usize, stream_count: usize, format: pb::StateFormat, token_ids: bool) -> usize {
+    let bytes = bytes_per_row(width, stream_count, format) + if token_ids { 5 } else { 0 };
+    (MAX_FRAME_SIZE - MARGINE_FRAME) / bytes.max(1)
+}
+
+pub fn with_prefill_state(mut block: pb::PrefillBlock, state: &[f32], width: usize, streams: usize, format: pb::StateFormat) -> pb::PrefillBlock {
+    block.state = encode_state(state, width, streams, format);
+    block.n_embd = width as u32;
+    block.stream_count = declared_stream_count(format, streams);
+    block.format = format as i32;
+    block
 }
 
 /// Reject a prefill block that will not fit in one frame. Report the maximum
@@ -776,6 +992,102 @@ pub fn validate_step(p: &pb::Step, n_embd: usize, stream_count: usize, n_batch: 
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn ingress_budget_waits_only_for_bounded_capacity() {
+        let data = IngressBudget::new(10, 2);
+        let control = IngressBudget::new(10, 2);
+        let first = data.reserve(8, Duration::ZERO).unwrap();
+        assert!(data.reserve(3, Duration::from_millis(5)).is_err());
+        let second = data.reserve(1, Duration::ZERO).unwrap();
+        assert!(data.reserve(1, Duration::ZERO).is_err());
+        assert!(control.reserve(10, Duration::ZERO).is_ok());
+        let waiting = data.clone();
+        let reader = std::thread::spawn(move || waiting.reserve(8, Duration::from_secs(2)));
+        drop(first);
+        assert!(reader.join().unwrap().is_ok());
+        assert!(data.reserve(11, Duration::ZERO).is_err());
+        drop(second);
+        let mut decoded = data.reserve(10, Duration::ZERO).unwrap();
+        decoded.release(1);
+        assert!(data.reserve(2, Duration::ZERO).is_err());
+        drop(decoded);
+        assert!(data.reserve(10, Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn prefill_block_budget_keeps_medium_batches_and_fits_deepseek() {
+        for include_ids in [false, true] {
+            let medium = max_block_tokens_with_ids(2048, 1, pb::StateFormat::Fp16Le, include_ids);
+            assert_eq!(512.min(medium), 512);
+            let deepseek = max_block_tokens_with_ids(4096 * 4, 4, pb::StateFormat::Fp16Le, include_ids);
+            assert_eq!(deepseek, 511);
+            assert!(check_prefill_block_with_tokens(deepseek, 4096 * 4, 4, pb::StateFormat::Fp16Le).is_ok());
+            assert!(check_prefill_block(512, 4096 * 4, 4, pb::StateFormat::Fp16Le).is_err());
+        }
+    }
+
+    #[test]
+    fn admitted_reader_rejects_overload_before_reading_the_body_and_accepts_replay() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut old = TcpStream::connect(address).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let budget = IngressBudget::new(1024, 1);
+        let occupied = budget.reserve(1, Duration::ZERO).unwrap();
+        old.write_all(&[1]).unwrap();
+        let mut reader = Reader::new(socket);
+        let rejected = reader.read_admitted(&budget, Duration::from_millis(5), pb::Stream::Prefill, 4);
+        assert!(matches!(rejected, Err(error) if error == "ingress queue remained full"));
+        drop(reader);
+        drop(occupied);
+        let mut replay = TcpStream::connect(address).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let mut reader = Reader::new(socket);
+        let replayed = msg(Body::Block(block(2, 4, 0)));
+        write_sync(&mut replay, &replayed).unwrap();
+        assert_eq!(reader.read_admitted(&budget, Duration::ZERO, pb::Stream::Prefill, 4).unwrap().unwrap().0, replayed);
+    }
+
+    #[test]
+    fn work_is_rejected_on_control_and_step_rows_are_checked_before_decode() {
+        let step = msg(Body::Step(pb::Step {
+            rows: vec![pb::StepRow::default(); 3],
+            ..Default::default()
+        })).encode_to_vec();
+        assert!(check_ingress(&step, pb::Stream::Control, 0).unwrap_err().to_string().contains("unexpected message"));
+        assert!(check_ingress(&step, pb::Stream::Generation, 2).unwrap_err().to_string().contains("too many stage rows"));
+        check_ingress(&step, pb::Stream::Generation, 3).unwrap();
+        let confirmation = msg(Body::Confirmation(pb::Confirmation::default())).encode_to_vec();
+        check_ingress(&confirmation, pb::Stream::Control, 0).unwrap();
+    }
+
+    #[test]
+    fn queued_prefill_forwarding_preserves_replay_and_mtp_metadata() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let mut reader = Reader::new(socket);
+        let budget = IngressBudget::new(1024, 2);
+        let (tx, rx) = channel();
+        for last in [false, true] {
+            let mut original = block(2, 4, if last { 12 } else { 10 });
+            original.group_id = 3;
+            original.attempt_id = 7;
+            original.last = last;
+            original.first_token_step = if last { 5 } else { 0 };
+            original.draft_count = if last { 3 } else { 0 };
+            original.token = vec![101, 103];
+            write_sync(&mut peer, &msg(Body::Block(original.clone()))).unwrap();
+            tx.send(reader.read_admitted(&budget, Duration::ZERO, pb::Stream::Prefill, 4).unwrap().unwrap()).unwrap();
+            let (message, _permit) = rx.recv().unwrap();
+            let Some(Body::Block(received)) = message.body else { panic!("expected a prefill block") };
+            let forwarded = with_prefill_state(received, &[1.0; 8], 4, 1, pb::StateFormat::Fp16Le);
+            original.state = encode_state(&[1.0; 8], 4, 1, pb::StateFormat::Fp16Le);
+            original.format = pb::StateFormat::Fp16Le as i32;
+            assert_eq!(forwarded, original);
+        }
+    }
 
     fn block(n: u32, n_embd: u32, pos: u32) -> pb::PrefillBlock {
         pb::PrefillBlock {

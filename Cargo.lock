@@ -2924,16 +2924,17 @@ dependencies = [
 
 [[package]]
 name = "publicompute"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "crossterm",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "publicompute-agent"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2951,6 +2952,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "ring",
+ "rustix 1.1.6",
  "rustls",
  "serde",
  "serde_json",
@@ -2963,14 +2965,14 @@ dependencies = [
 
 [[package]]
 name = "publicompute-llama-sys"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bindgen",
 ]
 
 [[package]]
 name = "publicompute-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytes",
  "prost",
@@ -2981,7 +2983,7 @@ dependencies = [
 
 [[package]]
 name = "publicompute-stage"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytes",
  "prost",

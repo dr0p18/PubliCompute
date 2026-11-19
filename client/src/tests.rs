@@ -1,14 +1,15 @@
 use std::{
-    io::{BufRead, BufReader, Write},
-    os::unix::net::UnixListener,
+    io::{BufRead, BufReader, Read, Write},
+    os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
     sync::mpsc,
     thread,
+    time::Duration,
 };
 
 use serde_json::{json, Value};
 
-use crate::{command, command_with_uninstaller, render, run_uninstaller, sock::{self, Socket}, status::*};
+use crate::{command, command_with_uninstaller, follow_updates, render, run_uninstaller, sock::{self, Socket}, status::*, Msg};
 
 /// Fixture shaped like the agent's JSON status reply.
 fn sample_json() -> Value {
@@ -222,6 +223,152 @@ fn fake_agent(path: &PathBuf, reply: Value) -> mpsc::Receiver<Value> {
         writeln!(s, "{reply}").unwrap();
     });
     rx
+}
+
+fn accept_request(listener: &UnixListener, op: &str) -> UnixStream {
+    let (stream, _) = listener.accept().unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut line = String::new();
+    BufReader::new(&stream).read_line(&mut line).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["op"], op);
+    stream
+}
+
+#[test]
+fn silent_follow_falls_back_to_status_and_reports_down_if_also_silent() {
+    let path = temp_socket("silent-follow");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = thread::spawn(move || {
+        let _follow = accept_request(&listener, "follow");
+        let mut status = accept_request(&listener, "status");
+        assert_eq!(status.read(&mut [0]).unwrap(), 0);
+    });
+
+    let mut events = Vec::new();
+    assert!(follow_updates(&Socket::Explicit(path), Duration::from_millis(200), |event| {
+        events.push(event);
+        true
+    }));
+    assert!(matches!(events.as_slice(), [Msg::Down(why)] if why.contains("stopped sending")));
+    server.join().unwrap();
+}
+
+#[test]
+fn quiet_healthy_agent_keeps_panel_status_during_reconnect() {
+    let path = temp_socket("quiet-healthy");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = thread::spawn(move || {
+        let reply = json!({"ok": true, "status": sample_json()});
+        let mut follow = accept_request(&listener, "follow");
+        writeln!(follow, "{reply}").unwrap();
+        let mut status = accept_request(&listener, "status");
+        writeln!(status, "{reply}").unwrap();
+        let mut next = accept_request(&listener, "follow");
+        writeln!(next, "{reply}").unwrap();
+    });
+
+    let socket = Socket::Explicit(path);
+    let silence = Duration::from_millis(200);
+    let mut snapshots = Vec::new();
+    let mut emit = |event| {
+        let Msg::Status(status) = event else { panic!("healthy agent reported down") };
+        snapshots.push(status);
+        snapshots.len() < 3
+    };
+    assert!(follow_updates(&socket, silence, &mut emit));
+    assert!(!follow_updates(&socket, silence, &mut emit));
+    assert_eq!(snapshots.len(), 3);
+    assert!(snapshots.iter().all(|status| status.connected && !status.paused));
+    server.join().unwrap();
+}
+
+#[test]
+fn follow_watchdog_resets_for_snapshots_but_not_for_invalid_lines() {
+    let path = temp_socket("watchdog");
+    let listener = UnixListener::bind(&path).unwrap();
+    let (closed, wait) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let reply = json!({"ok": true, "status": sample_json()});
+        let mut follow = accept_request(&listener, "follow");
+        for _ in 0..3 {
+            writeln!(follow, "{reply}").unwrap();
+            thread::sleep(Duration::from_millis(250));
+        }
+        let invalid = [
+            json!({"ok": true, "status": {}}),
+            json!({"status": sample_json()}),
+            json!({"ok": true, "status": {"connected": true}}),
+            json!({"ok": true, "status": {"paused": false}}),
+        ];
+        for reply in invalid.iter().cycle().take(8) {
+            if writeln!(follow, "{reply}").is_err() {
+                return;
+            }
+            if wait.recv_timeout(Duration::from_millis(100)).is_ok() {
+                return;
+            }
+        }
+        panic!("invalid lines kept the follower open");
+    });
+
+    let mut snapshots = 0;
+    let result = sock::follow(&Socket::Explicit(path), Duration::from_millis(400), |_| {
+        snapshots += 1;
+        true
+    });
+    let _ = closed.send(());
+    assert_eq!(snapshots, 3);
+    assert!(result.unwrap_err().contains("stopped sending"));
+    server.join().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn queued_listener(path: &std::path::Path) -> (UnixListener, UnixStream) {
+    use rustix::net::{self, AddressFamily, SocketAddrUnix, SocketType};
+
+    let listener = net::socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    net::bind(&listener, &SocketAddrUnix::new(path).unwrap()).unwrap();
+    net::listen(&listener, 0).unwrap();
+    let queued = UnixStream::connect(path).unwrap();
+    (UnixListener::from(listener), queued)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn status_times_out_if_the_listen_queue_stays_full() {
+    let path = temp_socket("full-queue");
+    let (_listener, _queued) = queued_listener(&path);
+    let (done, wait) = mpsc::channel();
+    let client = thread::spawn(move || {
+        done.send(sock::get_status(&Socket::Explicit(path))).unwrap();
+    });
+    let err = wait.recv_timeout(Duration::from_secs(5)).unwrap().unwrap_err();
+    assert!(err.contains("cannot connect") && err.contains("timed out"), "{err}");
+    client.join().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn status_read_uses_only_the_time_left_after_connecting() {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+
+    let path = temp_socket("shared-budget");
+    let (listener, _queued) = queued_listener(&path);
+    let server = thread::spawn(move || {
+        thread::sleep(Duration::from_secs(2));
+        drop(listener.accept().unwrap());
+        let mut fds = [PollFd::new(&listener, PollFlags::IN)];
+        let timeout = Timespec::try_from(Duration::from_secs(3)).unwrap();
+        assert_ne!(poll(&mut fds, Some(&timeout)).unwrap(), 0, "status did not connect");
+        let mut status = accept_request(&listener, "status");
+        assert_eq!(status.read(&mut [0]).unwrap(), 0);
+    });
+
+    let start = std::time::Instant::now();
+    assert!(sock::get_status(&Socket::Explicit(path)).is_err());
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_secs(2) && elapsed < Duration::from_millis(4500), "{elapsed:?}");
+    server.join().unwrap();
 }
 
 #[test]

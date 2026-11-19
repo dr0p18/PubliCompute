@@ -1,6 +1,6 @@
 # Linux binary package
 
-Builds `publicompute-linux-x86_64-<version>.tar.zst` and `SHA256SUMS`, the files that `install.sh` downloads.
+Builds `publicompute-linux-x86_64-<version>.tar.zst` and `SHA256SUMS`. Remote installation also requires `SHA256SUMS.sig`.
 
 ## Contents
 
@@ -23,6 +23,34 @@ The package check uses a clean Ubuntu 22.04 container.
 
 The build is heavy (CUDA for four architectures plus a cargo release build). The full log goes to
 `tools/pacchetto/out/build.log`; the terminal only shows a summary.
+
+## Signing a release
+
+On the release signer's laptop, outside the build container, create the Ed25519 key once with a passphrase:
+
+    mkdir -p -m 700 ~/.config/publicompute/firma
+    ssh-keygen -t ed25519 -f ~/.config/publicompute/firma/publicompute-release
+
+Keep the private key on the laptop, separate from the release hosting account. Pin only the first two fields of the
+`.pub` file (`ssh-ed25519` and the key data) in the installer. After the final build and package checks, run
+`tools/pacchetto/firma.sh` from a terminal and enter the passphrase when prompted. It writes `SHA256SUMS.sig` next to
+the manifest. Publish the archive, `SHA256SUMS`, and `SHA256SUMS.sig` together, after the release preflight.
+
+For a local installation, an administrator can use `PUBLICOMPUTE_PACKAGE` with a separately trusted
+`PUBLICOMPUTE_PACKAGE_SHA256`; no release signature is required for that path.
+
+The installer compares numbered releases (major.minor.patch) with the active package's `VERSION` file. Pass
+`--allow-downgrade` to install an older release or switch between versions that cannot be ordered. Package
+verification still applies. When the active package has a recorded digest, a remote archive with the same version
+and a different digest also requires explicit approval via this flag.
+
+To keep an alternate model on upgrade, set `MODEL_PATH`, `MODEL_ID`, `QUANTIZATION`, `MODEL_SIZE` (bytes), and
+`MODEL_SHA256` together in the root-owned `/etc/publicompute-agent/agent.conf`. Get the expected size and digest from
+trusted model metadata. If the configured weights cannot be verified, the installer prepares the default model.
+
+The installer and uninstaller share a lock under `/run/publicompute-agent-lock`. During migration they also honor a
+valid root-owned lock under `/run/lock` when the directory protects that entry from replacement by other users.
+Use the updated scripts for both operations if the legacy lock path is occupied by an unrelated file.
 
 ## Output
 

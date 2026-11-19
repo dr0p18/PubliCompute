@@ -3,6 +3,7 @@
 pub mod llama;
 pub mod managed;
 pub mod mock;
+pub mod output;
 pub mod progress;
 pub mod stages;
 pub mod stats;
@@ -220,7 +221,7 @@ impl Engine {
         req: &InferenceRequest,
         top_k: u32,
         progress: &progress::Progress,
-        deltas: Option<tokio::sync::mpsc::UnboundedSender<stages::Delta>>,
+        deltas: Option<stages::DeltaSender>,
         cancel: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<Generation> {
         match self {

@@ -24,10 +24,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use publicompute_proto::node::{EngineHealth, LeaseRejectReason};
-use tokio::{
-    process::Child,
-    sync::{watch, OwnedMutexGuard},
-};
+use tokio::sync::{watch, OwnedMutexGuard};
 use tracing::{error, info, warn};
 
 use crate::gpu::{Device, DeviceState, Telemetria};
@@ -41,6 +38,8 @@ pub enum EngineState {
     Busy,
     /// Wait for an abandoned request to clear before accepting another lease.
     Settling,
+    /// The stage owns the GPU until its process has been reaped.
+    Parked,
     Recovering,
     Quarantined,
 }
@@ -98,7 +97,7 @@ pub struct Supervisor {
     handled_loss: AtomicU64,
     stopping: AtomicBool,
     gate: Arc<tokio::sync::Mutex<()>>,
-    child: tokio::sync::Mutex<Option<Child>>,
+    child: tokio::sync::Mutex<Option<managed::Process>>,
     restarts: Mutex<VecDeque<Instant>>,
     process_started: Mutex<Instant>,
     last_probe: Mutex<Instant>,
@@ -108,6 +107,32 @@ enum Restart {
     /// The child is still alive after forced termination.
     Unkillable(anyhow::Error),
     Failed(anyhow::Error),
+}
+
+/// Keep the engine gate through the switch, including shutdown of the stage.
+pub struct ParkedEngine {
+    sup: Arc<Supervisor>,
+    gate: OwnedMutexGuard<()>,
+    pub gpu: Option<String>,
+}
+
+impl ParkedEngine {
+    pub fn can_start_stage(&self) -> bool {
+        self.sup.state() == EngineState::Parked && self.sup.can_run()
+    }
+
+    pub fn returning(&self) {
+        self.sup.set_state(EngineState::Recovering);
+    }
+
+    pub fn unpark(self) {
+        self.returning();
+        tokio::spawn(async move {
+            let Self { sup, gate, .. } = self;
+            sup.resume_managed().await;
+            drop(gate);
+        });
+    }
 }
 
 impl Supervisor {
@@ -212,6 +237,55 @@ impl Supervisor {
         Ok(())
     }
 
+    pub fn try_park(self: &Arc<Self>) -> Option<ParkedEngine> {
+        let cfg = self.cfg.managed.as_ref()?;
+        let gate = self.gate.clone().try_lock_owned().ok()?;
+        // The GPU monitor can change availability without taking the gate.
+        if !self.state.send_if_modified(|state| {
+            if *state != EngineState::Ready || !self.can_run() {
+                return false;
+            }
+            *state = EngineState::Parked;
+            true
+        }) {
+            return None;
+        }
+        let gpu = self.gpu.as_ref().and_then(|gpu| match &gpu.device_rx().borrow().device {
+            Device::Ready(uuid) => Some(uuid.clone()),
+            _ => None,
+        }).or_else(|| cfg.gpu_index.clone());
+        Some(ParkedEngine { sup: self.clone(), gate, gpu })
+    }
+
+    async fn resume_managed(self: &Arc<Self>) {
+        let Some(cfg) = &self.cfg.managed else { return };
+        if !self.can_run() {
+            // The GPU monitor resumes the engine once the selected device returns.
+            return;
+        }
+        let start = async {
+            self.restart_child(cfg).await.map_err(|e| match e {
+                Restart::Unkillable(e) | Restart::Failed(e) => e,
+            })?;
+            self.bring_up().await.map_err(|e| match e {
+                BringUp::Fatal(e) | BringUp::Retry(e) => e,
+            })?;
+            self.check_child_running().await
+        };
+        let result = tokio::select! {
+            biased;
+            _ = self.wait_for_gpu_loss() => return,
+            result = start => result,
+        };
+        match result {
+            Ok(()) => self.set_state(EngineState::Ready),
+            Err(e) => {
+                warn!("could not resume llama-server: {e:#}");
+                self.recover(FaultCause::Process, false).await;
+            }
+        }
+    }
+
     fn can_run(&self) -> bool {
         !self.stopping.load(Ordering::Acquire) && self.gpu.as_ref().map_or(true, |gpu| {
             let rx = gpu.device_rx();
@@ -221,7 +295,7 @@ impl Supervisor {
         })
     }
 
-    fn spawn_child(&self, cfg: &managed::ManagedCfg) -> Result<Child> {
+    fn spawn_child(&self, cfg: &managed::ManagedCfg) -> Result<managed::Process> {
         if self.stopping.load(Ordering::Acquire) {
             bail!("agent is stopping");
         }
@@ -260,8 +334,14 @@ impl Supervisor {
                 return;
             }
             // Stop an unavailable GPU's child without waiting for a lease or recovery backoff.
-            self.set_state(EngineState::Recovering);
-            if state.loss_generation != handled {
+            self.state.send_if_modified(|engine| {
+                if matches!(engine, EngineState::Parked | EngineState::Recovering) {
+                    return false;
+                }
+                *engine = EngineState::Recovering;
+                true
+            });
+            if state.loss_generation != handled && self.state() != EngineState::Parked {
                 warn!("selected GPU unavailable; stopping llama-server");
                 if let Err(e) = self.stop_child().await {
                     error!("cannot stop llama-server after GPU loss: {e:#}");
@@ -295,10 +375,10 @@ impl Supervisor {
         }
     }
 
-    async fn stop_child(&self) -> Result<()> {
+    pub(crate) async fn stop_child(&self) -> Result<()> {
         let mut child = self.child.lock().await;
         if let (Some(cfg), Some(process)) = (&self.cfg.managed, child.as_mut()) {
-            managed::stop(process, cfg.stop_grace, cfg.kill_wait).await?;
+            managed::stop(process, cfg.stop_grace, cfg.kill_wait, "llama-server").await?;
             *child = None;
         }
         Ok(())
@@ -324,6 +404,7 @@ impl Supervisor {
             EngineState::Ready => Ok(()),
             EngineState::Busy => Err(Reject { reason: LeaseRejectReason::HostBusy, detail: "engine busy" }),
             EngineState::Settling => Err(Reject { reason: LeaseRejectReason::HostBusy, detail: "motore in assestamento" }),
+            EngineState::Parked => Err(Reject { reason: LeaseRejectReason::ModelNotReady, detail: "engine parked for a stage" }),
             EngineState::Recovering => Err(Reject { reason: LeaseRejectReason::HostBusy, detail: "recovering the engine" }),
             EngineState::Quarantined => Err(Reject { reason: LeaseRejectReason::HostBusy, detail: "engine quarantined" }),
         }
@@ -454,11 +535,7 @@ impl Supervisor {
     async fn wait_health(&self, initial: bool) -> Result<()> {
         let deadline = Instant::now() + self.cfg.start_timeout;
         loop {
-            if let Some(c) = self.child.lock().await.as_mut() {
-                if let Some(st) = c.try_wait()? {
-                    bail!("llama-server exited during startup ({st}); see its log");
-                }
-            }
+            self.check_child_running().await?;
             if self.engine.health().await.is_ok() {
                 return Ok(());
             }
@@ -469,13 +546,23 @@ impl Supervisor {
         }
     }
 
+    async fn check_child_running(&self) -> Result<()> {
+        let mut child = self.child.lock().await;
+        let c = child.as_mut().context("llama-server stopped during startup")?;
+        if let Some(st) = c.child.try_wait()? {
+            bail!("llama-server exited during startup ({st}); see its log");
+        }
+        Ok(())
+    }
+
     async fn restart_child(&self, m: &managed::ManagedCfg) -> std::result::Result<(), Restart> {
         let mut slot = self.child.lock().await;
         if let Some(c) = slot.as_mut() {
-            // Reap the child before another process can claim the same GPU.
-            managed::stop(c, m.stop_grace, m.kill_wait).await.map_err(Restart::Unkillable)?;
+            // Confirm the entire group has exited before reusing the GPU.
+            managed::stop(c, m.stop_grace, m.kill_wait, "llama-server").await.map_err(Restart::Unkillable)?;
         }
         *slot = None;
+        managed::ensure_port_free(m.port).await.map_err(Restart::Failed)?;
         let child = self.spawn_child(m).map_err(Restart::Failed)?;
         *slot = Some(child);
         *self.process_started.lock().unwrap() = Instant::now();
@@ -486,7 +573,7 @@ impl Supervisor {
     /// Return the tracked child PID for supervisor tests.
     #[cfg(test)]
     pub async fn child_pid_for_test(&self) -> u32 {
-        self.child.lock().await.as_ref().unwrap().id().unwrap()
+        self.child.lock().await.as_ref().unwrap().child.id().unwrap()
     }
 
     fn restarts_in_window(&self) -> usize {
@@ -562,7 +649,11 @@ impl Supervisor {
                 }
             }
             preventive = false;
-            match self.bring_up().await {
+            let ready = match self.bring_up().await {
+                Ok(()) if self.cfg.managed.is_some() => self.check_child_running().await.map_err(BringUp::Retry),
+                result => result,
+            };
+            match ready {
                 Ok(()) => {
                     info!(phase = "inference healthy", "engine recovered");
                     self.set_state(EngineState::Ready);
@@ -595,7 +686,7 @@ impl Supervisor {
                 continue;
             }
             let exited = match self.child.lock().await.as_mut() {
-                Some(c) => c.try_wait().ok().flatten(),
+                Some(c) => c.child.try_wait().ok().flatten(),
                 None => None,
             };
             if let Some(st) = exited {
@@ -734,7 +825,7 @@ mod tests {
     }
 
     async fn child_pid(sup: &Supervisor) -> u32 {
-        sup.child.lock().await.as_ref().unwrap().id().unwrap()
+        sup.child.lock().await.as_ref().unwrap().child.id().unwrap()
     }
 
     #[tokio::test]

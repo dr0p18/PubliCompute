@@ -14,11 +14,20 @@ unset PUBLICOMPUTE_LINK_CODE
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 
 relink=0
-case "$#:${1:-}" in
-    0:) ;;
-    1:--relink) relink=1 ;;
-    *) fail 'Usage: install.sh [--relink]' ;;
-esac
+allow_downgrade=0
+region=${PUBLICOMPUTE_REGION:-EU}
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --relink) relink=1 ;;
+        --allow-downgrade) allow_downgrade=1 ;;
+        --region)
+            [ "$#" -ge 2 ] || fail '--region requires a value.'
+            shift
+            region=$1 ;;
+        *) fail 'Usage: install.sh [--relink] [--allow-downgrade] [--region REGION]' ;;
+    esac
+    shift
+done
 
 started=$(date +%s)
 [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || fail 'PubliCompute requires Linux x86_64.'
@@ -65,7 +74,8 @@ if [ -n "$link_code" ]; then
     unset link_code
 fi
 
-version=${PUBLICOMPUTE_VERSION:-0.1.1}
+default_version=0.1.2
+version=${PUBLICOMPUTE_VERSION:-$default_version}
 case "$version" in
     ''|*[!A-Za-z0-9._-]*) fail 'Invalid package version.' ;;
 esac
@@ -87,7 +97,8 @@ if [ -n "$test_manifest" ]; then
     case "$test_manifest" in /*) ;; *) test_manifest=$PWD/$test_manifest ;; esac
 fi
 
-base_url=${PUBLICOMPUTE_BASE_URL:-https://github.com/dr0p18/PubliCompute/releases/download/v$version}
+release_url=https://github.com/dr0p18/PubliCompute/releases/download
+base_url=${PUBLICOMPUTE_BASE_URL:-$release_url/v$version}
 insecure=${PUBLICOMPUTE_TEST_INSECURE:-0}
 http_fixture=0
 case "$base_url" in
@@ -109,7 +120,7 @@ esac
 as_root sh -s -- "$started" "$downloader" "$version" "$base_url" \
     "$package" "${PUBLICOMPUTE_PACKAGE_SHA256:-}" "${PUBLICOMPUTE_COORDINATOR:-api.publicompute.com:7443}" \
     "${PUBLICOMPUTE_SERVER_NAME:-}" "$ca" "${PUBLICOMPUTE_SPEED_URL:-}" "$skip_gpu" "$test_manifest" \
-    "$link_file" "$relink" "${SUDO_USER:-$(id -un)}" "$http_fixture" <<'ROOT' &
+    "$link_file" "$relink" "${SUDO_USER:-$(id -un)}" "$http_fixture" "$allow_downgrade" "$region" <<'ROOT' &
 set -eu
 umask 022
 
@@ -117,7 +128,22 @@ fail() { printf '%s\n' "$*" >&2; exit 1; }
 
 started=$1 downloader=$2 version=$3 base_url=$4 package=$5 package_sha=$6 coordinator=$7 server_name=$8 ca=$9
 shift 9
-speed_url=$1 skip_gpu=$2 test_manifest=$3 link_file=$4 relink=$5 installer=$6 http_fixture=$7
+speed_url=$1 skip_gpu=$2 test_manifest=$3 link_file=$4 relink=$5 installer=$6 http_fixture=$7 allow_downgrade=$8 region=$9
+
+valid_region() {
+    printf '%s\n' "$1" | LC_ALL=C awk '/^[A-Za-z][A-Za-z0-9-]*$/ && length <= 32 { valid++ }
+        END { exit !(NR == 1 && valid == 1) }'
+}
+valid_region "$region" || fail 'Invalid region. Use a letter followed by up to 31 letters, digits or hyphens.'
+
+release_pubkey='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDv7F+43HnKvzUnfc8dADFSHP98ZKG5uKNvvvVD8oymj'
+if [ -z "$package" ]; then
+    case "$release_pubkey" in
+        'ssh-ed25519 '*) ;;
+        *) fail 'The PubliCompute release signing key is not configured in this installer.' ;;
+    esac
+    command -v ssh-keygen >/dev/null || fail 'Install OpenSSH with ssh-keygen -Y support to verify the release.'
+fi
 
 account=publicompute-agent
 prefix=/opt/$account
@@ -152,16 +178,36 @@ root_directory() {
     fi
 }
 
-# Keep a stable lock inode across install and uninstall so all invocations contend on the same lock.
-lock=/run/lock/publicompute-agent.lock
+root_directory /run
+lock_dir=/run/publicompute-agent-lock
+mkdir -m 0700 -- "$lock_dir" 2>/dev/null || :
+[ ! -L "$lock_dir" ] && [ -d "$lock_dir" ] && [ "$(stat -c %u:%a "$lock_dir")" = 0:700 ] ||
+    fail 'Invalid installer lock directory.'
+lock=$lock_dir/lock
 if [ ! -e "$lock" ]; then (umask 077; set -C; : > "$lock") 2>/dev/null || :; fi
-[ ! -L "$lock" ] && [ -f "$lock" ] && [ "$(stat -c %u "$lock")" = 0 ] || fail 'Invalid installer lock file.'
+[ ! -L "$lock" ] && [ -f "$lock" ] && [ "$(stat -c %u:%h "$lock")" = 0:1 ] || fail 'Invalid installer lock file.'
 exec 9>>"$lock"
-fd=/proc/$$/fd/9
-[ -f "$fd" ] && [ "$(stat -Lc %u:%h "$fd")" = 0:1 ] && [ ! -L "$lock" ] &&
-    [ "$(stat -Lc %d:%i "$fd")" = "$(stat -c %d:%i "$lock")" ] || fail 'Invalid opened installer lock file.'
-chmod 0600 "$fd"
+chmod 0600 "$lock"
 flock -x -w 120 9 || fail 'Timed out after 120 s waiting for the PubliCompute installer lock.'
+
+# Older installers and uninstallers still lock the root-owned file in /run/lock.
+legacy_dir=/run/lock
+legacy_lock=$legacy_dir/$account.lock
+if [ ! -L "$legacy_dir" ] && [ -d "$legacy_dir" ] && [ "$(stat -c %u "$legacy_dir")" = 0 ]; then
+    mode=$(stat -c %a "$legacy_dir")
+    if [ "$((0$mode & 022))" -eq 0 ] || [ "$((0$mode & 01000))" -ne 0 ]; then
+        if [ ! -e "$legacy_lock" ] && [ ! -L "$legacy_lock" ]; then
+            if legacy_temp=$(mktemp -- "$legacy_dir/.$account.XXXXXXXX"); then
+                ln -T -- "$legacy_temp" "$legacy_lock" 2>/dev/null || :
+                rm -f -- "$legacy_temp"
+            fi
+        fi
+        if [ ! -L "$legacy_lock" ] && [ -f "$legacy_lock" ] && [ "$(stat -c %u:%h "$legacy_lock")" = 0:1 ]; then
+            exec 8<"$legacy_lock"
+            flock -x -w 120 8 || fail 'Timed out after 120 s waiting for the legacy PubliCompute installer lock.'
+        fi
+    fi
+fi
 
 root_directory "$scratch"
 root_directory "$prefix"
@@ -230,6 +276,25 @@ cleanup() {
 trap cleanup 0
 trap 'exit 130' HUP INT TERM
 
+release_number() {
+    case "$1" in ''|*[!0-9.]*) return 1 ;; esac
+    printf '%s\n' "$1" | LC_ALL=C grep -Eq '^(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*)){2}$'
+}
+installed_version=
+if [ -d "$prefix" ] && [ "$allow_downgrade" = 0 ]; then
+    if [ -f "$prefix/VERSION" ] && [ ! -L "$prefix/VERSION" ]; then
+        installed_version=$(cat -- "$prefix/VERSION")
+    fi
+    if [ "$installed_version" != "$version" ]; then
+        if ! release_number "$installed_version" || ! release_number "$version"; then
+            fail 'Cannot order the installed and requested versions. Use --allow-downgrade to proceed.'
+        fi
+        first=$(printf '%s\n' "$installed_version" "$version" | LC_ALL=C sort -V | head -n 1)
+        [ "$first" = "$installed_version" ] ||
+            fail "Downgrade from $installed_version to $version requires --allow-downgrade."
+    fi
+fi
+
 case "$coordinator" in
     ''|*[!][A-Za-z0-9.:_-]*) fail 'Invalid coordinator address.' ;;
 esac
@@ -285,65 +350,16 @@ if [ -e "$link" ] || [ -L "$link" ]; then
         fail "$link belongs to another installation."
 fi
 
-install -d -m 0755 -o root -g root "$conf"
-if entry=$(getent passwd "$account"); then
-    sys_uid_max=$(awk '$1 == "UID_MIN" { min=$2 } $1 == "SYS_UID_MAX" { max=$2 }
-        END { print max ? max : (min ? min - 1 : 999) }' /etc/login.defs)
-    printf '%s\n' "$entry" | awk -F: -v home="$state" -v max="$sys_uid_max" '
-        $3 ~ /^[0-9]+$/ && $3 > 0 && $3 <= max && $6 == home &&
-        $7 ~ /^(\/usr)?\/s?bin\/nologin$/ { ok=1 }
-        END { exit !ok }' || fail "Existing $account must be a system account with home $state and a nologin shell."
-fi
-if ! getent group "$account" >/dev/null; then
-    groupadd --system "$account"
-    getent group "$account" | cut -d: -f3 > "$conf/group.gid"
-fi
-if [ -z "$entry" ]; then
-    useradd --system --gid "$account" --home-dir "$state" --no-create-home --shell /usr/sbin/nologin "$account"
-    id -u "$account" > "$conf/account.uid"
-fi
-install -d -m 0700 -o "$account" -g "$account" "$state"
-if [ -d "$state/models" ] && [ ! -L "$state/models" ] && [ "$(stat -c %u "$state/models")" = 0 ]; then
-    # Retained weights belong to root after uninstall so a recycled service UID cannot read them.
-    require_unmounted "$state/models"
-    chown -hR "$account:$account" "$state/models"
-fi
-as_agent() { runuser -u "$account" -- "$@"; }
-as_agent mkdir -p "$state/models"
-model=$state/models/$model_id-$quant.gguf
-part=$model.part
-
 hash_matches() {
-    expected=$(printf '%s' "$1" | tr 'A-F' 'a-f')
-    printf '%s  %s\n' "$expected" "$2" | sha256sum --check --status -
+    printf '%s  %s\n' "$1" "$2" | sha256sum --check --status -
 }
 
-model_ok() {
-    as_agent test ! -L "$1" && as_agent test -f "$1" && as_agent test "$(as_agent stat -c %s "$1")" = "$model_size" &&
-        printf '%s  %s\n' "$model_sha" "$1" | as_agent sha256sum --check --status -
-}
-
-# Reserve space for the compressed package, expanded files and temporary downloads.
-package_kb=$((2 * 1024 * 1024))
-model_kb=$((512 * 1024))
-need_model=1
-if model_ok "$model"; then
-    need_model=0
-elif ! model_ok "$part"; then
-    partial=$(as_agent stat -c %s "$part" 2>/dev/null || printf 0)
-    [ "$partial" -lt "$model_size" ] || partial=0
-    model_kb=$((model_kb + (model_size - partial + 1023) / 1024))
-fi
 check_space() {
     available=$(df -Pk "$1" | awk 'NR == 2 { print $4 }')
     [ "${available:-0}" -ge "$2" ] || fail "Insufficient free space on $1 (need $2 KiB)."
 }
-if [ "$(stat -c %d /opt)" = "$(stat -c %d "$state")" ]; then
-    check_space /opt "$((package_kb + model_kb))"
-else
-    check_space /opt "$package_kb"
-    check_space "$state" "$model_kb"
-fi
+# Reserve space for both the archive and the extracted package.
+check_space /opt "$((2 * 1024 * 1024))"
 
 download_seconds=0
 fetch() {
@@ -388,12 +404,23 @@ fetch() {
 
 printf '%s\n' 'Preparing the Linux package.'
 if [ -n "$package" ]; then
+    package_sha=$(printf '%s' "$package_sha" | tr 'A-F' 'a-f')
     cp -- "$package" "$scratch/package.tar.zst"
 else
     begin=$(date +%s)
     fetch "${base_url%/}/SHA256SUMS" "$scratch/SHA256SUMS" || fail 'Cannot download SHA256SUMS.'
+    fetch "${base_url%/}/SHA256SUMS.sig" "$scratch/SHA256SUMS.sig" || fail 'Cannot download SHA256SUMS.sig.'
+    printf 'publicompute-release %s\n' "$release_pubkey" > "$scratch/allowed-signers"
+    ssh-keygen -Y verify -f "$scratch/allowed-signers" -I publicompute-release -n publicompute-release \
+        -s "$scratch/SHA256SUMS.sig" < "$scratch/SHA256SUMS" || fail 'Invalid SHA256SUMS signature.'
     package_sha=$(awk -v name="$name.tar.zst" '$2 == name || $2 == "*" name { print $1 }' "$scratch/SHA256SUMS")
     valid_hash "$package_sha" || fail "No unique SHA-256 for $name.tar.zst in SHA256SUMS."
+    package_sha=$(printf '%s' "$package_sha" | tr 'A-F' 'a-f')
+    if [ "$installed_version" = "$version" ] &&
+        [ -f "$prefix/.release-sha256" ] && [ ! -L "$prefix/.release-sha256" ]; then
+        [ "$(cat -- "$prefix/.release-sha256")" = "$package_sha" ] ||
+            fail "Public release v$version has a different SHA-256 from the installed package. Publish it under a new version."
+    fi
     fetch "${base_url%/}/$name.tar.zst" "$scratch/package.tar.zst" || fail 'Cannot download the Linux package.'
     download_seconds=$((download_seconds + $(date +%s) - begin))
 fi
@@ -404,11 +431,111 @@ mv -T -- "$scratch/$name" "$stage"
 root_directory "$stage"
 require_unmounted "$stage"
 chmod -R go-w "$stage"
+[ -f "$stage/VERSION" ] && [ ! -L "$stage/VERSION" ] && [ "$(cat -- "$stage/VERSION")" = "$version" ] ||
+    fail "Package VERSION does not match $version."
 for binary in publicompute-agent publicompute-stage publicompute llama-server; do
     [ -x "$stage/bin/$binary" ] || fail "Package is missing bin/$binary."
 done
 [ -f "$stage/share/$unit" ] || fail "Package is missing share/$unit."
 install -m 0755 "$stage/share/uninstall.sh" "$stage/uninstall.sh"
+printf '%s\n' "$package_sha" > "$scratch/release-sha256"
+install -m 0644 "$scratch/release-sha256" "$stage/.release-sha256"
+
+install -d -m 0755 -o root -g root "$conf"
+if entry=$(getent passwd "$account"); then
+    sys_uid_max=$(awk '$1 == "UID_MIN" { min=$2 } $1 == "SYS_UID_MAX" { max=$2 }
+        END { print max ? max : (min ? min - 1 : 999) }' /etc/login.defs)
+    printf '%s\n' "$entry" | awk -F: -v home="$state" -v max="$sys_uid_max" '
+        $3 ~ /^[0-9]+$/ && $3 > 0 && $3 <= max && $6 == home &&
+        $7 ~ /^(\/usr)?\/s?bin\/nologin$/ { ok=1 }
+        END { exit !ok }' || fail "Existing $account must be a system account with home $state and a nologin shell."
+fi
+if ! getent group "$account" >/dev/null; then
+    groupadd --system "$account"
+    getent group "$account" | cut -d: -f3 > "$conf/group.gid"
+fi
+if [ -z "$entry" ]; then
+    useradd --system --gid "$account" --home-dir "$state" --no-create-home --shell /usr/sbin/nologin "$account"
+    id -u "$account" > "$conf/account.uid"
+fi
+install -d -m 0700 -o "$account" -g "$account" "$state"
+if [ -d "$state/models" ] && [ ! -L "$state/models" ] && [ "$(stat -c %u "$state/models")" = 0 ]; then
+    # Retained weights belong to root after uninstall so a recycled service UID cannot read them.
+    require_unmounted "$state/models"
+    chown -hR "$account:$account" "$state/models"
+fi
+as_agent() { runuser -u "$account" -- "$@"; }
+as_agent mkdir -p "$state/models"
+model=$state/models/$model_id-$quant.gguf
+part=$model.part
+
+gguf_header_ok() {
+    # A GGUF v2 or v3 fixed header is 24 bytes. The magic bytes are endian-independent.
+    [ "$2" -ge 24 ] || return 1
+    header=$(as_agent od -An -N8 -tx1 -- "$1") || return 1
+    case "$header" in
+        ' 47 47 55 46 02 00 00 00'|' 47 47 55 46 03 00 00 00'|' 47 47 55 46 00 00 00 03') return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+model_ok() {
+    as_agent test ! -L "$1" && as_agent test -f "$1" || return 1
+    checked_size=$(as_agent stat -c %s -- "$1") || return 1
+    [ -z "$2" ] || [ "$checked_size" = "$2" ] || return 1
+    # Legacy configurations need a format check before recording the measured metadata.
+    if [ -z "$2" ] || [ -z "$3" ]; then
+        gguf_header_ok "$1" "$checked_size" || return 1
+    fi
+    checksum=$(as_agent sh -c 'sha256sum < "$1"' sh "$1") || return 1
+    checked_sha=${checksum%% *}
+    [ -z "$3" ] || [ "$checked_sha" = "$3" ]
+}
+
+config_value() {
+    sed -n "s/^$1=//p" "$conf/agent.conf" | head -n 1
+}
+
+trusted_config() {
+    [ -f "$conf/agent.conf" ] && [ ! -L "$conf/agent.conf" ] &&
+        [ "$(stat -c %u "$conf/agent.conf")" = 0 ] || return 1
+    mode=$(stat -c %a "$conf/agent.conf")
+    [ "$((0$mode & 022))" -eq 0 ]
+}
+
+configured_model() {
+    trusted_config || return 1
+    old_path=$(config_value MODEL_PATH)
+    old_id=$(config_value MODEL_ID)
+    old_quant=$(config_value QUANTIZATION)
+    old_size=$(config_value MODEL_SIZE)
+    old_sha=$(config_value MODEL_SHA256)
+    case "$old_path" in "$state"/models/*.gguf) ;; *) return 1 ;; esac
+    case "$old_id:$old_quant" in *[!A-Za-z0-9._:-]*|:*|*:) return 1 ;; esac
+    [ "$old_path" != "$model" ] || return 1
+    old_sha=$(printf '%s' "$old_sha" | tr 'A-F' 'a-f')
+    if [ "$old_size" = 0 ] || ! model_ok "$old_path" "$old_size" "$old_sha"; then
+        printf 'Could not verify the configured model %s %s. Using the default model %s %s.\n' \
+            "$old_id" "$old_quant" "$model_id" "$quant" >&2
+        return 1
+    fi
+    printf 'Keeping the configured model %s %s.\n' "$old_id" "$old_quant"
+    model=$old_path model_id=$old_id quant=$old_quant model_size=$checked_size model_sha=$checked_sha
+}
+
+# Check model space after the verified package has been extracted.
+model_kb=0
+need_model=0
+if ! configured_model && ! model_ok "$model" "$model_size" "$model_sha"; then
+    need_model=1
+    model_kb=$((512 * 1024))
+    if ! model_ok "$part" "$model_size" "$model_sha"; then
+        partial=$(as_agent stat -c %s "$part" 2>/dev/null || printf 0)
+        [ "$partial" -lt "$model_size" ] || partial=0
+        model_kb=$((model_kb + (model_size - partial + 1023) / 1024))
+    fi
+fi
+check_space "$state" "$model_kb"
 
 if [ -n "$ca" ]; then
     install -m 0644 -- "$ca" "$scratch/ca.pem"
@@ -470,7 +597,7 @@ fi
 
 if [ "$need_model" = 1 ]; then
     printf 'Preparing %s %s.\n' "$model_id" "$quant"
-    if ! model_ok "$part"; then
+    if ! model_ok "$part" "$model_size" "$model_sha"; then
         as_agent test ! -L "$part" || fail 'Model partial file must not be a symbolic link.'
         partial=$(as_agent stat -c %s "$part" 2>/dev/null || printf 0)
         if [ "$partial" -ge "$model_size" ]; then as_agent rm -f -- "$part"; fi
@@ -482,7 +609,7 @@ if [ "$need_model" = 1 ]; then
                 fail 'Model download failed. Rerun to resume.' ;;
         esac
         download_seconds=$((download_seconds + $(date +%s) - begin))
-        if ! model_ok "$part"; then
+        if ! model_ok "$part" "$model_size" "$model_sha"; then
             as_agent rm -f -- "$part"
             fail 'Model size or SHA-256 mismatch.'
         fi
@@ -490,24 +617,21 @@ if [ "$need_model" = 1 ]; then
     as_agent mv -fT -- "$part" "$model"
 fi
 
-# An upgrade keeps the model the node already serves: the agent verifies its
-# weights at startup, and the default model is only for new installs.
-if [ -f "$conf/agent.conf" ] && [ ! -L "$conf/agent.conf" ]; then
-    old_path=$(sed -n 's/^MODEL_PATH=//p' "$conf/agent.conf" | head -n 1)
-    old_id=$(sed -n 's/^MODEL_ID=//p' "$conf/agent.conf" | head -n 1)
-    old_quant=$(sed -n 's/^QUANTIZATION=//p' "$conf/agent.conf" | head -n 1)
-    case "$old_path" in
-        "$state"/models/*.gguf)
-            if [ "$old_path" != "$model" ] && [ -n "$old_id" ] && [ -n "$old_quant" ] &&
-                as_agent test -f "$old_path" && as_agent test ! -L "$old_path"; then
-                printf 'Keeping the configured model %s %s.\n' "$old_id" "$old_quant"
-                model=$old_path model_id=$old_id quant=$old_quant
-            fi ;;
+printf 'COORDINATOR=%s\nSERVER_NAME=%s\nMODEL_PATH=%s\nMODEL_ID=%s\nQUANTIZATION=%s\nMODEL_SIZE=%s\nMODEL_SHA256=%s\n' \
+    "$coordinator" "$server_name" "$model" "$model_id" "$quant" "$model_size" "$model_sha" > "$scratch/agent.conf"
+if trusted_config; then
+    old_region=$(config_value PUBLICOMPUTE_REGION | sed 's/^[[:blank:]]*//; s/[[:blank:]]*$//')
+    # EnvironmentFile accepts either style of quotes around the region.
+    case "$old_region" in
+        \"*\") old_region=${old_region#\"}; old_region=${old_region%\"} ;;
+        \'*\') old_region=${old_region#\'}; old_region=${old_region%\'} ;;
     esac
+    if [ -n "$old_region" ]; then
+        valid_region "$old_region" || fail 'Invalid existing PUBLICOMPUTE_REGION in agent.conf.'
+        region=$old_region
+    fi
 fi
-
-printf 'COORDINATOR=%s\nSERVER_NAME=%s\nMODEL_PATH=%s\nMODEL_ID=%s\nQUANTIZATION=%s\n' \
-    "$coordinator" "$server_name" "$model" "$model_id" "$quant" > "$scratch/agent.conf"
+printf 'PUBLICOMPUTE_REGION=%s\nPUBLICOMPUTE_RELAY=https://relay.publicompute.com:8443\n' "$region" >> "$scratch/agent.conf"
 if [ -n "$gpu_uuid" ]; then printf 'PUBLICOMPUTE_GPU_UUID=%s\n' "$gpu_uuid" >> "$scratch/agent.conf"; fi
 backup_file() {
     if [ -e "$1" ] || [ -L "$1" ]; then

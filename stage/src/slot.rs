@@ -10,7 +10,6 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 /// Monotonic time since stage startup. Can be injected for tests.
@@ -51,56 +50,6 @@ impl ManualClock {
 impl Clock for ManualClock {
     fn adesso(&self) -> Duration {
         self.0.get()
-    }
-}
-
-/// Result of [`CodaEventi::prossimo`].
-#[derive(Debug, PartialEq, Eq)]
-pub enum Prossimo<E> {
-    Event(E),
-    /// Timed out without an event.
-    Vuoto,
-    /// All senders disconnected.
-    Chiuso,
-}
-
-/// Check slot expiry only after draining pending events. Long computation
-/// can delay a block that arrived before its reservation expired. Let the
-/// queued block renew the slot before deciding it has gone idle.
-pub struct EventQueue<E> {
-    rx: Receiver<E>,
-    davanti: Option<E>,
-}
-
-impl<E> EventQueue<E> {
-    pub fn new(rx: Receiver<E>) -> Self {
-        Self { rx, davanti: None }
-    }
-
-    /// Next event, waiting up to `timeout`.
-    pub fn prossimo(&mut self, timeout: Duration) -> Prossimo<E> {
-        if let Some(e) = self.davanti.take() {
-            return Prossimo::Event(e);
-        }
-        match self.rx.recv_timeout(timeout) {
-            Ok(e) => Prossimo::Event(e),
-            Err(RecvTimeoutError::Timeout) => Prossimo::Vuoto,
-            Err(RecvTimeoutError::Disconnected) => Prossimo::Chiuso,
-        }
-    }
-
-    /// `true` if no event is waiting. Only then may the caller expire slots.
-    pub fn nessuno_in_attesa(&mut self) -> bool {
-        if self.davanti.is_some() {
-            return false;
-        }
-        match self.rx.try_recv() {
-            Ok(e) => {
-                self.davanti = Some(e);
-                false
-            }
-            Err(_) => true,
-        }
     }
 }
 
@@ -230,8 +179,8 @@ impl<C: Clock> Slots<C> {
 
     /// Forget conversations **without a slot** untouched for `ttl_filigrana`. If the map is over its cap,
     /// remove the oldest closed ones until it fits. Leave conversations with a slot alone until that slot
-    /// expires and they become closed. Called by `scadenze()`.
-    fn pulisci(&mut self) {
+    /// expires and they become closed.
+    pub fn pulisci(&mut self) {
         let adesso = self.orologio.adesso();
         let ttl = self.ttl_filigrana;
         let sopra_tetto = self.conv.len() > self.conv_max;
@@ -270,7 +219,7 @@ impl<C: Clock> Slots<C> {
     }
 
     pub fn posti_in_uso(&self) -> usize {
-        self.conv.values().filter(|c| c.slot.is_some()).count()
+        self.proprietari.len()
     }
 
     /// `Open` that rejects a sequence still owned by another live conversation (`EsitoApri::Occupato`).
@@ -428,27 +377,32 @@ impl<C: Clock> Slots<C> {
     /// Free expired slots and set their watermarks to the slot attempts. The caller clears memory and sends
     /// an error `Confirmation` to the head.
     pub fn scadenze(&mut self) -> Vec<Scaduto> {
+        let scaduti = self.expire_except(|_, _| false);
+        self.pulisci();
+        scaduti
+    }
+
+    pub fn expire_except(&mut self, pending: impl Fn(u64, u32) -> bool) -> Vec<Scaduto> {
         let adesso = self.orologio.adesso();
         let mut v = Vec::new();
-        for (&id, c) in self.conv.iter_mut() {
-            if let Some(p) = c.slot {
-                if adesso >= p.scadenza {
-                    c.last = adesso;
-                    c.watermark = c.watermark.max(p.tentativo);
-                    c.slot = None;
-                    if self.proprietari.get(&p.seq).is_some_and(|&(a, _)| a == id) {
-                        self.proprietari.remove(&p.seq);
-                    }
-                    v.push(Scaduto {
-                        conversation_id: id,
-                        liberato: Freed { seq: p.seq, tentativo: p.tentativo },
-                        era_riservato: p.state == Status::Riservato,
-                    });
-                }
+        // Closed conversations can outnumber occupied slots by orders of magnitude.
+        self.proprietari.retain(|&seq, &mut (id, tentativo)| {
+            let c = self.conv.get_mut(&id).unwrap();
+            let p = c.slot.unwrap();
+            if adesso < p.scadenza || pending(id, tentativo) {
+                return true;
             }
-        }
+            c.last = adesso;
+            c.watermark = c.watermark.max(tentativo);
+            c.slot = None;
+            v.push(Scaduto {
+                conversation_id: id,
+                liberato: Freed { seq, tentativo },
+                era_riservato: p.state == Status::Riservato,
+            });
+            false
+        });
         v.sort_by_key(|s| s.conversation_id);
-        self.pulisci();
         v
     }
 }
@@ -719,46 +673,26 @@ mod test {
     }
 
     #[test]
-    fn queued_block_survives_long_compute_without_slot_expiry() {
-        // A block can arrive during computation that outlasts its reservation.
-        // Dispatch the queued block before running expiry.
-        let orologio = ManualClock::default();
-        let mut p = Slots::new(orologio.clone(), Deadlines { riserva: 30 * S, inattivo: 120 * S });
-        let (tx, rx) = std::sync::mpsc::channel::<(u64, u32)>();
-        let mut tail = EventQueue::new(rx);
-        p.open(1, 1, 0, 0);
-        p.open(2, 1, 1, 0);
-        tx.send((1, 16)).unwrap();
-        tx.send((2, 16)).unwrap();
-        let mut scaduti = Vec::new();
-        let mut calcolati = Vec::new();
-        let mut primo = true;
-        while let Prossimo::Event((id, n)) = tail.prossimo(Duration::from_millis(1)) {
-            assert_eq!(p.block(id, 1, 0, n), WorkOutcome::Compute);
-            calcolati.push(id);
-            if primo {
-                orologio.avanza(35 * S);
-                primo = false;
-            }
-            if tail.nessuno_in_attesa() {
-                scaduti.extend(p.scadenze());
-            }
-        }
-        assert_eq!(calcolati, vec![1, 2]);
-        assert!(scaduti.is_empty(), "{scaduti:?}");
-        assert_eq!(p.posti_in_uso(), 2);
+    fn queued_work_preserves_only_the_matching_slot_attempt() {
+        let clock = ManualClock::default();
+        let mut slots = Slots::new(clock.clone(), Deadlines { riserva: 30 * S, inattivo: 120 * S });
+        slots.open(1, 2, 0, 0);
+        slots.open(2, 1, 1, 0);
+        slots.open(3, 1, 2, 0);
+        clock.avanza(35 * S);
+        let pending = [(1, 2), (2, 2)];
+        let expired = slots.expire_except(|id, attempt| pending.contains(&(id, attempt)));
+        assert_eq!(expired.iter().map(|slot| slot.conversation_id).collect::<Vec<_>>(), [2, 3]);
+        assert_eq!(slots.block(1, 2, 0, 16), WorkOutcome::Compute);
+        assert!(slots.scadenze().is_empty());
     }
 
     #[test]
     fn reserved_slot_expires_without_queued_block() {
         let orologio = ManualClock::default();
         let mut p = Slots::new(orologio.clone(), Deadlines { riserva: 30 * S, inattivo: 120 * S });
-        let (_tx, rx) = std::sync::mpsc::channel::<u8>();
-        let mut tail = EventQueue::new(rx);
         p.open(1, 1, 0, 0);
         orologio.avanza(35 * S);
-        assert_eq!(tail.prossimo(Duration::from_millis(1)), Prossimo::Vuoto);
-        assert!(tail.nessuno_in_attesa());
         let s = p.scadenze();
         assert_eq!(s.len(), 1);
         assert!(s[0].era_riservato);

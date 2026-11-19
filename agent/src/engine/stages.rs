@@ -1,4 +1,4 @@
-//! The stage backend forwards one lease to the head's service socket. The
+//! The stage backend forwards one lease to the local head. The
 //! head receives the complete conversation and owns prompt formatting and
 //! trimming. It also receives the sampling cutoffs and stop strings. Local
 //! sampling uses the cutoffs there, while a remote tail receives temperature
@@ -17,10 +17,11 @@ use publicompute_proto::{
     node::{ChatRole, FinishReason, InferenceRequest, RequestFailureCode, SamplingParams},
     service as pb,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{
     fault,
+    output::{self, OutputSender, OutputSize, OutputStalled, Queued},
     progress::{Phase, Progress},
     prompt_tokens_sha256, request_error, FaultCause, Generation, Limits, TokenProbs,
 };
@@ -41,6 +42,18 @@ pub struct Delta {
     pub index: u32,
     pub text: String,
     pub token_ids: Vec<u32>,
+}
+
+impl OutputSize for Delta {
+    fn bytes(&self) -> usize {
+        self.text.capacity() + self.token_ids.capacity() * size_of::<u32>()
+    }
+}
+
+pub type DeltaSender = OutputSender<Delta>;
+
+pub fn delta_channel() -> (DeltaSender, mpsc::Receiver<Queued<Delta>>, watch::Receiver<bool>) {
+    output::channel(256, 4 << 20)
 }
 
 pub struct StadiEngine {
@@ -108,14 +121,14 @@ impl StadiEngine {
     }
 
     /// Run a chat using the shared engine progress counter.
-    pub async fn chat(&self, req: &InferenceRequest, deltas: Option<mpsc::UnboundedSender<Delta>>, cancel: Option<oneshot::Receiver<()>>) -> Result<Generation> {
+    pub async fn chat(&self, req: &InferenceRequest, deltas: Option<DeltaSender>, cancel: Option<oneshot::Receiver<()>>) -> Result<Generation> {
         self.chat_lease(req, &self.progress, deltas, cancel).await
     }
 
     /// Give this chat its own progress counter and optionally stream text as it
     /// arrives. Also update shared progress for supervision. Cancellation or
     /// loss of its sender sends a cancel message to the head and ends the lease.
-    pub async fn chat_lease(&self, req: &InferenceRequest, progress: &Progress, deltas: Option<mpsc::UnboundedSender<Delta>>, mut cancel: Option<oneshot::Receiver<()>>) -> Result<Generation> {
+    pub async fn chat_lease(&self, req: &InferenceRequest, progress: &Progress, deltas: Option<DeltaSender>, mut cancel: Option<oneshot::Receiver<()>>) -> Result<Generation> {
         let Some(link) = self.stages.head() else {
             return Err(request_error(RequestFailureCode::EngineError, "no chain head is ready on this node"));
         };
@@ -162,6 +175,13 @@ impl StadiEngine {
                     }
                     Ok(None) => {
                         link.dimentica(id);
+                        if rx.saturated() {
+                            if let Some(deltas) = &deltas {
+                                deltas.fail();
+                            }
+                            link.cancel(id).await;
+                            return Err(OutputStalled.into());
+                        }
                         return Err(fault(FaultCause::Connection, "connection to the head lost mid-response"));
                     }
                     Ok(Some(OutgoingLink::Token(t))) => {
@@ -177,7 +197,11 @@ impl StadiEngine {
                         // Include tokens with no text in the next displayable fragment so token offsets stay aligned.
                         if !t.text.is_empty() || t.eog {
                             if let Some(d) = &deltas {
-                                let _ = d.send(Delta { index: primo_indice, text: t.text, token_ids: std::mem::take(&mut in_attesa) });
+                                if let Err(error) = d.send(Delta { index: primo_indice, text: t.text, token_ids: std::mem::take(&mut in_attesa) }) {
+                                    link.dimentica(id);
+                                    link.cancel(id).await;
+                                    return Err(error.into());
+                                }
                             }
                             in_attesa.clear();
                             primo_indice = token_ids.len() as u32;
@@ -196,6 +220,12 @@ impl StadiEngine {
         };
         link.dimentica(id);
         let finish_reason = match done.reason.as_str() {
+            "output_stalled" => {
+                if let Some(deltas) = &deltas {
+                    deltas.fail();
+                }
+                return Err(OutputStalled.into());
+            }
             "error" => {
                 // The head includes this phrase in both context overflow messages.
                 let code = if done.error.contains("the slot context") { RequestFailureCode::ContextTooLong } else { RequestFailureCode::EngineError };
@@ -210,7 +240,7 @@ impl StadiEngine {
         text.push_str(&done.remaining_text);
         if let Some(d) = &deltas {
             if !done.remaining_text.is_empty() || !in_attesa.is_empty() {
-                let _ = d.send(Delta { index: primo_indice, text: done.remaining_text.clone(), token_ids: std::mem::take(&mut in_attesa) });
+                d.send(Delta { index: primo_indice, text: done.remaining_text.clone(), token_ids: std::mem::take(&mut in_attesa) })?;
             }
         }
         let prompt: Vec<u32> = done.prompt_token.iter().map(|&t| t as u32).collect();
