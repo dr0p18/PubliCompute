@@ -11,6 +11,8 @@ mod economics;
 mod engine;
 mod enroll;
 mod nat;
+mod network;
+mod peer_echo;
 mod bridge;
 #[cfg(test)]
 mod fake_llama;
@@ -19,6 +21,8 @@ mod gpu;
 mod hardware;
 mod identity;
 mod logic;
+mod model_change;
+mod models;
 mod session;
 mod stages;
 mod transport;
@@ -30,6 +34,8 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use publicompute_proto::common::{EngineKind, ModelRef, Money};
 use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
+
+const MODEL_SWITCH_EXIT_CODE: i32 = 75;
 
 #[derive(Clone, Copy, ValueEnum)]
 enum EngineArg {
@@ -260,13 +266,16 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
-    if let Err(e) = run_command(args) {
-        error!("{e:#}");
-        std::process::exit(1);
+    match run_command(args) {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            error!("{e:#}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn run_command(args: Args) -> Result<()> {
+fn run_command(args: Args) -> Result<i32> {
     let local = if args.command.is_none() {
         if args.ca.is_none() {
             bail!("--ca is required for the coordinator QUIC certificate");
@@ -284,7 +293,7 @@ fn run_command(args: Args) -> Result<()> {
         match &args.command {
             Some(Command::NatCheck) => {
                 println!("{}", nat::classifica(&stun_config(&args)).await);
-                Ok(())
+                Ok(0)
             }
             Some(Command::CoordinatorCheck) => {
                 let t = coordinator_transport(&args).await?;
@@ -292,10 +301,10 @@ fn run_command(args: Args) -> Result<()> {
                     .await.context("coordinator QUIC check timed out")??;
                 conn.close(0u32.into(), b"");
                 println!("Coordinator reachable over QUIC");
-                Ok(())
+                Ok(0)
             }
             #[cfg(target_os = "linux")]
-            Some(Command::SwapInstall { staging, installed }) => swap_install(staging, installed),
+            Some(Command::SwapInstall { staging, installed }) => swap_install(staging, installed).map(|()| 0),
             None => {
                 let (listener, live) = local.expect("agent control state");
                 run(args, listener, live).await
@@ -351,30 +360,51 @@ fn read_owner_token(file: Option<&std::path::Path>, fallback: Option<String>) ->
     Ok(Some(token.to_string()))
 }
 
-async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Live>) -> Result<()> {
-    let mut model = model_metadata(&args)?;
-    let modo = contribution::PreferenceMode::parse(&args.modo)?;
-    let modello_scelto = match args.modello_scelto.as_deref() {
-        None => contribution::ModelSelection { id: model.model_id.clone(), quant: model.quantization.clone() },
-        Some(m) => match m.split_once(':') {
-            Some((id, quant)) => contribution::ModelSelection { id: id.to_string(), quant: quant.to_string() },
-            None => contribution::ModelSelection { id: m.to_string(), quant: model.quantization.clone() },
-        },
+async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Live>) -> Result<i32> {
+    // An externally managed engine can keep serving its old weights after this agent restarts.
+    let can_switch = cfg!(unix) && !matches!((args.engine, args.llama_mode), (EngineArg::Llama, LlamaMode::External));
+    let mut model_error = None;
+    let weights = Arc::new(models::Store::new(&args.data_dir));
+    let store = if can_switch {
+        match weights.prepare() {
+            Ok(()) => Some(weights.clone()),
+            Err(err) => {
+                let text = format!("cannot open the model directory: {err:#}");
+                warn!("{text}");
+                model_error = Some(text);
+                None
+            }
+        }
+    } else {
+        None
     };
+    let configured = model_metadata(&args);
+    let modo = contribution::PreferenceMode::parse(&args.modo)?;
+    let selected = |model: &ModelRef, override_model: Option<&str>| match override_model {
+        Some(m) => match m.split_once(':') {
+            Some((id, quant)) => contribution::ModelSelection { id: id.into(), quant: quant.into() },
+            None => contribution::ModelSelection { id: m.into(), quant: model.quantization.clone() },
+        },
+        None => contribution::ModelSelection { id: model.model_id.clone(), quant: model.quantization.clone() },
+    };
+    let initial = configured.as_ref().cloned().unwrap_or_default();
     let contribution = contribution::Contribution::open(&args.data_dir, contribution::Preference {
-        modo, model: (modo == contribution::PreferenceMode::Usage).then(|| modello_scelto.clone()), revision: 0,
+        modo,
+        model: (modo == contribution::PreferenceMode::Usage).then(|| selected(&initial, args.modello_scelto.as_deref())),
+        revision: 0,
     })?;
-    contribution.align_model(modello_scelto)?;
     let telemetria_gpu = Arc::new(gpu::Telemetria::default());
     let (engine_state, engine_rx) = tokio::sync::watch::channel(engine::supervisor::EngineState::Starting);
-    listener.serve(control::Control::new(
+    let control = control::Control::new(
         contribution.clone(),
         telemetria_gpu.clone(),
         live.clone(),
         engine_rx,
-        model.clone(),
+        initial,
         args.model_path.clone(),
-    ))?;
+    ).with_models(store.clone(), model_error.clone());
+    control.verifying_weights(store.is_some() || args.model_path.is_some());
+    listener.serve(control.clone())?;
 
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let (uscita_tx, mut uscita_rx) = tokio::sync::watch::channel(false);
@@ -383,10 +413,53 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
     tokio::spawn(inoltra_segnali(segnali_tx));
     tokio::spawn(arresto(segnali_rx, uscita_tx, stop_tx, session::ATTESA_USCITA + Duration::from_secs(5)));
 
+    let configured_path = args.model_path.clone();
+    let restore = store.is_some();
+    let verify = async {
+        tokio::select! {
+            verified = tokio::task::spawn_blocking(move || verify_startup_weights(&weights, restore, configured, configured_path)) => {
+                verified?.map(Some)
+            }
+            _ = uscita_rx.wait_for(|stop| *stop) => Ok(None),
+        }
+    };
+    let StartupWeights { model, path, restored, error, needs_repair } =
+        match while_offline(&live, store.as_ref(), &contribution, verify).await {
+            None => return Ok(MODEL_SWITCH_EXIT_CODE),
+            Some(Ok(None)) => return Ok(0),
+            Some(Ok(Some(verified))) => verified,
+            Some(Err(err)) => return Err(err),
+        };
+    args.model_path = path;
+    if let Some(error) = error {
+        model_error = Some(model_error.map_or_else(|| error.clone(), |prior| format!("{prior}; {error}")));
+    }
+    {
+        let _commands = live.changes.commands.lock().await;
+        let modello_scelto = selected(&model, args.modello_scelto.as_deref().filter(|_| restored.is_none()));
+        if let Some(active) = restored {
+            let pref = contribution.preference();
+            if pref.modo == contribution::PreferenceMode::Free && active.use_revision == Some(pref.revision) {
+                contribution.imposta(contribution::PreferenceMode::Usage, Some(modello_scelto.clone()))?;
+            }
+        }
+        contribution.align_model(modello_scelto)?;
+        control.model_verified(model.clone(), args.model_path.clone(), model_error, needs_repair);
+    }
+    if needs_repair {
+        // Keep the socket available for a repair or another model choice.
+        let stop = uscita_rx.wait_for(|stop| *stop);
+        return Ok(if while_offline(&live, store.as_ref(), &contribution, stop).await.is_none() {
+            MODEL_SWITCH_EXIT_CODE
+        } else {
+            0
+        });
+    }
+
     args.owner_token = read_owner_token(args.owner_token_file.as_deref(), args.owner_token.take())?;
     let t = tokio::select! {
         t = coordinator_transport(&args) => t?,
-        _ = uscita_rx.wait_for(|stop| *stop) => return Ok(()),
+        _ = uscita_rx.wait_for(|stop| *stop) => return Ok(0),
     };
     let cuda_devices = std::env::var_os("CUDA_VISIBLE_DEVICES");
     let gpu_index = args.gpu.as_deref().filter(|gpu| gpu.parse::<u32>().is_ok());
@@ -407,20 +480,22 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
     let first = gpu::read(gpu_uuid.as_deref()).await;
     let detected = first.as_deref().unwrap_or_default().to_vec();
     gpu::avvia_campionatore(telemetria_gpu.clone(), first, track_gpu, gpu_uuid).await;
-    if let Some(path) = args.model_path.clone() {
-        info!(path = %path.display(), "hashing model weights");
-        model.weights_sha256 = tokio::select! {
-            hash = tokio::task::spawn_blocking(move || sha256_file(&path)) => hash??,
-            _ = uscita_rx.wait_for(|stop| *stop) => return Ok(()),
-        };
-    }
-
     if track_gpu && identity::load(&args.data_dir)?.is_none() {
         // Initial enrollment requires an inventory. An enrolled node can reconnect while paused.
         let mut device = telemetria_gpu.device_rx();
-        tokio::select! {
-            ready = device.wait_for(|state| matches!(state.device, gpu::Device::Ready(_))) => { ready?; }
-            _ = uscita_rx.wait_for(|stop| *stop) => return Ok(()),
+        let wait = async {
+            tokio::select! {
+                ready = device.wait_for(|state| matches!(state.device, gpu::Device::Ready(_))) => { ready?; }
+                _ = uscita_rx.wait_for(|stop| *stop) => {}
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        match while_offline(&live, store.as_ref(), &contribution, wait).await {
+            None => return Ok(MODEL_SWITCH_EXIT_CODE),
+            Some(result) => result?,
+        }
+        if *uscita_rx.borrow() {
+            return Ok(0);
         }
     }
     let selected = if track_gpu { telemetria_gpu.letture() } else { detected };
@@ -555,16 +630,21 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
     );
     // Check the engine before connecting so the first advertised state reflects its readiness.
     // Recovery continues in the background if the initial probe does not pass.
-    let started = tokio::select! {
-        result = sup.start() => result,
-        _ = uscita_rx.wait_for(|stop| *stop) => {
-            sup.shutdown().await;
-            return Ok(());
+    let start_engine = async {
+        tokio::select! {
+            result = sup.start() => result,
+            _ = uscita_rx.wait_for(|stop| *stop) => Ok(()),
         }
     };
-    if let Err(e) = started {
-        sup.shutdown().await;
-        return Err(e);
+    match while_offline(&live, store.as_ref(), &contribution, start_engine).await {
+        Some(Ok(())) if !*uscita_rx.borrow() => {}
+        outcome => {
+            sup.shutdown().await;
+            return match outcome {
+                Some(result) => result.map(|()| 0),
+                None => Ok(MODEL_SWITCH_EXIT_CODE),
+            };
+        }
     }
     // Report runtime and launch settings for observational verification. Launch settings
     // are available only when the agent owns the engine process.
@@ -623,15 +703,18 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
         model_path: args.model_path.clone(),
         output: uscita_rx,
         live,
+        model_store: store,
     };
     let shared = Arc::new(session::Shared::default());
 
+    let live = cfg.live.clone();
     let result = connect_loop(&args, &t, cfg, &engine, &shared, stop_rx).await;
     if let Some(p) = &bridge {
         p.close().await;
     }
     sup.shutdown().await;
-    result
+    result?;
+    Ok(if live.changes.committed() { MODEL_SWITCH_EXIT_CODE } else { 0 })
 }
 
 async fn connect_loop(
@@ -643,11 +726,87 @@ async fn connect_loop(
     stop_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let mut backoff = Duration::from_secs(1);
+    let live = cfg.live.clone();
+    loop {
+        let store = cfg.model_store.clone();
+        let contribution = cfg.contribution.clone();
+        let attempt = connect(args, t, &mut cfg, engine, &stop_rx, &mut backoff);
+        let Some(result) = while_offline(&live, store.as_ref(), &contribution, attempt).await else {
+            return Ok(());
+        };
+        let Some((conn, id)) = result? else { return Ok(()) };
+        info!(node = %id.node_id, "connected to the coordinator");
+        if let Some(s) = &cfg.stages {
+            // Share the enrolled identity with stage processes for mutual TLS.
+            if let Err(e) = s.set_identity(&id) {
+                warn!("could not write stage TLS files: {e:#}");
+            }
+        }
+        backoff = Duration::from_secs(1);
+        match session::run(conn, &cfg, engine.clone(), shared.clone(), stop_rx.clone()).await {
+            session::SessionEnd::Shutdown => return Ok(()),
+            session::SessionEnd::Reconnect => continue,
+            session::SessionEnd::SwitchModel(change) => {
+                if cfg.commit_model(change).await {
+                    return Ok(());
+                }
+            }
+            session::SessionEnd::Banned => bail!("coordinator banned this node"),
+            session::SessionEnd::TroppoVecchio(msg) => bail!("{msg}"),
+            session::SessionEnd::Unauthenticated => {
+                warn!("coordinator did not recognize the node; enrolling again");
+                identity::forget(&args.data_dir)?;
+            }
+            session::SessionEnd::Lost(e) => {
+                warn!("session lost: {e:#}");
+                let sleep = sleep_or_stop(&stop_rx, &cfg.output, &mut backoff);
+                if while_offline(&live, cfg.model_store.as_ref(), &cfg.contribution, sleep).await.is_none() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+// The caller owns the connection and engine lifecycle. Between sessions there is no work to drain.
+async fn while_offline<T>(
+    live: &control::Live,
+    store: Option<&Arc<models::Store>>,
+    contribution: &contribution::Contribution,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let Some(store) = store else { return Some(work.await) };
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            change = live.changes.wait_switch() => {
+                if live.changes.claim(&change).await {
+                    let committed = live.changes.commit(change, store.clone(), contribution).await;
+                    live.notify();
+                    if committed {
+                        return None;
+                    }
+                }
+            }
+            result = &mut work => return Some(result),
+        }
+    }
+}
+
+async fn connect(
+    args: &Args,
+    t: &transport::Transport,
+    cfg: &mut session::NodeConfig,
+    engine: &Arc<engine::Engine>,
+    stop_rx: &tokio::sync::watch::Receiver<bool>,
+    backoff: &mut Duration,
+) -> Result<Option<(quinn::Connection, identity::Identity)>> {
     let mut leaving = cfg.output.clone();
     loop {
         // Between sessions there is no active connection to notify of shutdown.
         if *stop_rx.borrow() || *cfg.output.borrow() {
-            return Ok(());
+            return Ok(None);
         }
         if cfg.gpu_profile_missing() && cfg.sup.state() == engine::supervisor::EngineState::Ready {
             let cards = cfg.gpu.letture();
@@ -662,19 +821,19 @@ async fn connect_loop(
                     let mut state = cfg.sup.subscribe();
                     tokio::select! {
                         ready = state.wait_for(|state| *state == engine::supervisor::EngineState::Ready) => { ready?; }
-                        _ = leaving.wait_for(|stop| *stop) => return Ok(()),
+                        _ = leaving.wait_for(|stop| *stop) => return Ok(None),
                     }
                     continue;
                 }
                 let result = tokio::select! {
                     id = enroll::enroll(t, &args.data_dir, cfg.hardware.clone(), args.owner_token.as_deref()) => id,
-                    _ = leaving.wait_for(|stop| *stop) => return Ok(()),
+                    _ = leaving.wait_for(|stop| *stop) => return Ok(None),
                 };
                 match result {
                     Ok(id) => id,
                     Err(e) => {
                         warn!("enrollment failed: {e:#}");
-                        sleep_or_stop(&stop_rx, &cfg.output, &mut backoff).await;
+                        sleep_or_stop(stop_rx, &cfg.output, backoff).await;
                         continue;
                     }
                 }
@@ -682,38 +841,17 @@ async fn connect_loop(
         };
         let conn = tokio::select! {
             conn = t.connect(&id) => conn,
-            _ = leaving.wait_for(|stop| *stop) => return Ok(()),
+            _ = leaving.wait_for(|stop| *stop) => return Ok(None),
         };
         let conn = match conn {
             Ok(c) => c,
             Err(e) => {
                 warn!("connection failed: {e:#}");
-                sleep_or_stop(&stop_rx, &cfg.output, &mut backoff).await;
+                sleep_or_stop(stop_rx, &cfg.output, backoff).await;
                 continue;
             }
         };
-        info!(node = %id.node_id, "connected to the coordinator");
-        if let Some(s) = &cfg.stages {
-            // Share the enrolled identity with stage processes for mutual TLS.
-            if let Err(e) = s.set_identity(&id) {
-                warn!("could not write stage TLS files: {e:#}");
-            }
-        }
-        backoff = Duration::from_secs(1);
-        match session::run(conn, &cfg, engine.clone(), shared.clone(), stop_rx.clone()).await {
-            session::SessionEnd::Shutdown => return Ok(()),
-            session::SessionEnd::GpuReady => continue,
-            session::SessionEnd::Banned => bail!("coordinator banned this node"),
-            session::SessionEnd::TroppoVecchio(msg) => bail!("{msg}"),
-            session::SessionEnd::Unauthenticated => {
-                warn!("coordinator did not recognize the node; enrolling again");
-                identity::forget(&args.data_dir)?;
-            }
-            session::SessionEnd::Lost(e) => {
-                warn!("session lost: {e:#}");
-                sleep_or_stop(&stop_rx, &cfg.output, &mut backoff).await;
-            }
-        }
+        return Ok(Some((conn, id)));
     }
 }
 
@@ -776,6 +914,53 @@ async fn sleep_or_stop(stop: &tokio::sync::watch::Receiver<bool>, output: &tokio
         _ = output.changed() => {}
     }
     *backoff = (*backoff * 2).min(Duration::from_secs(60));
+}
+
+struct StartupWeights {
+    model: ModelRef,
+    path: Option<PathBuf>,
+    restored: Option<models::ActiveModel>,
+    error: Option<String>,
+    needs_repair: bool,
+}
+
+fn verify_startup_weights(
+    store: &models::Store,
+    restore: bool,
+    configured: Result<ModelRef>,
+    path: Option<PathBuf>,
+) -> Result<StartupWeights> {
+    let mut error = None;
+    if restore {
+        match store.active() {
+            Ok(Some((model, active))) => return Ok(StartupWeights {
+                model: model.reference(), path: Some(store.path(model)), restored: Some(active), error: None, needs_repair: false,
+            }),
+            Ok(None) => {}
+            Err(err) => {
+                let text = format!("cannot restore the active model: {err:#}");
+                warn!("{text}; using the configured model");
+                error = Some(text);
+            }
+        }
+    }
+    let mut model = configured?;
+    let mut needs_repair = false;
+    if let Some(path) = &path {
+        if let Some(known) = store.model_at(path) {
+            model = known.reference();
+            if let Err(err) = store.verify(known, || true) {
+                let text = format!("cannot verify configured model weights: {err:#}");
+                warn!("{text}");
+                error = Some(error.map_or_else(|| text.clone(), |prior| format!("{prior}; {text}")));
+                needs_repair = true;
+            }
+        } else {
+            info!(path = %path.display(), "hashing model weights");
+            model.weights_sha256 = sha256_file(path)?;
+        }
+    }
+    Ok(StartupWeights { model, path, restored: None, error, needs_repair })
 }
 
 fn model_metadata(args: &Args) -> Result<ModelRef> {

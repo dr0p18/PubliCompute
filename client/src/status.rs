@@ -44,6 +44,23 @@ pub struct Summary {
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct Network {
+    pub download_bits_per_sec: u64,
+    pub upload_bits_per_sec: u64,
+    pub bandwidth_measured_at: Option<u64>,
+    pub coordinator_rtt_micros: Option<u32>,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct Download {
+    id: String,
+    state: String,
+    bytes: u64,
+    total_bytes: u64,
+    error: Option<String>,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq)]
 pub struct Status {
     pub connected: bool,
     pub paused: bool,
@@ -52,6 +69,9 @@ pub struct Status {
     #[serde(default)]
     pub engine: String,
     pub loaded_model: Option<String>,
+    pub loaded_quant: Option<String>,
+    pub download: Option<Download>,
+    pub model_error: Option<String>,
     #[serde(default)]
     pub active_leases: u32,
     pub chain_id: Option<String>,
@@ -60,6 +80,22 @@ pub struct Status {
     pub gpu_lost: bool,
     pub contribution: Option<Contribution>,
     pub summary: Option<Summary>,
+    pub network: Option<Network>,
+}
+
+impl Status {
+    pub fn download_line(&self) -> Option<String> {
+        let d = self.download.as_ref()?;
+        let gib = |bytes| bytes as f64 / (1u64 << 30) as f64;
+        Some(match d.state.as_str() {
+            "failed" => format!("download: {} failed: {}", d.id, d.error.as_deref().unwrap_or("unknown error")),
+            "switching" => format!("switching to {} after current work finishes", d.id),
+            _ => {
+                let verification = if d.state == "verifying" { " (verifying)" } else { "" };
+                format!("download: {} {:.1}/{:.1} GiB{verification}", d.id, gib(d.bytes), gib(d.total_bytes))
+            }
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -75,12 +111,45 @@ const HOT_CELSIUS: u32 = 85;
 /// Evaluate the status conditions in priority order and display the first match.
 pub const GPU_LOST: &str = "GPU not available: check the driver, then sudo systemctl restart publicompute-agent";
 
+pub fn status_text(status: &Status, now: u64) -> String {
+    let mut text = status_line(status).0;
+    if let Some(detail) = status.download_line() {
+        text.push('\n');
+        text.push_str(&detail);
+    }
+    if let Some(error) = &status.model_error {
+        text.push_str(&format!("\n{error}"));
+    }
+    let Some(network) = &status.network else { return text };
+    let rate = |bits: u64| {
+        if bits == 0 { "?".into() } else { format!("{:.1}", bits as f64 / 1e6) }
+    };
+    let rtt = network.coordinator_rtt_micros.map_or_else(|| "?".into(), |micros| format!("{:.1}", f64::from(micros) / 1000.0));
+    text.push_str(&format!(
+        "\nnetwork: {}/{} Mbit/s, {rtt} ms",
+        rate(network.download_bits_per_sec), rate(network.upload_bits_per_sec)
+    ));
+    let fresh = network.bandwidth_measured_at
+        .and_then(|at| now.checked_sub(at))
+        .is_some_and(|age| age <= 8 * 86400);
+    if !fresh || network.download_bits_per_sec.min(network.upload_bits_per_sec) < 100_000_000 {
+        text.push_str("\nchains: below the network standard (100 Mbit/s up and down)");
+    }
+    text
+}
+
 pub fn status_line(s: &Status) -> (String, Tone) {
     use Tone::*;
     let loaded = s.loaded_model.clone().unwrap_or_else(|| "the model".into());
     let chosen = s.preference.model.clone().unwrap_or_else(|| loaded.clone());
     if s.gpu_lost {
         return (GPU_LOST.into(), Warn);
+    }
+    if s.engine == "verifying weights" {
+        return ("Verifying weights".into(), Plain);
+    }
+    if s.engine == "weights error" {
+        return ("Model weights unavailable".into(), Warn);
     }
     if s.engine == "starting" {
         return (format!("Starting {chosen}"), Plain);

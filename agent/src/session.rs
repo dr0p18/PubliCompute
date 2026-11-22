@@ -19,7 +19,7 @@ use publicompute_proto::{
         AgentFeature, Availability, AvailabilityUpdate, Completion, ContributionStatus, ContributionSummary, CoordinatorMessage,
         GoodbyeReason, Heartbeat, Hello, InstalledModel, LeaseAccept, Leaving, ModelDirective, ModelDirectiveStatus, RejectReason,
         LeaseComplete, LeaseProgress, LeaseReject, LeaseRejectReason, LeaseRelease, LeaseReleaseReason, LeaseRevokeReason, LogicCommitment,
-        MeasurementPong, ModelInventory, ModelStatus, NodeMessage, PositionLogprobs, RequestFailure, RequestFailureCode, RequestResult,
+        MeasurementPong, ModelInventory, ModelStatus, NodeMessage, PeerProbeReady, PositionLogprobs, RequestFailure, RequestFailureCode, RequestResult,
         StageStatus, Telemetry, Timing, TokenDelta, TokenLogprob, Usage, VerifyResult, VerifyTask, WorkOffer, WorkStreamCoordinatorMessage,
         WorkStreamNodeMessage, WorkStreamOpen,
     },
@@ -42,6 +42,7 @@ use crate::{
     framed::{self, FrameReader},
     gpu::Telemetria,
     logic,
+    network,
     transport,
 };
 
@@ -74,9 +75,17 @@ pub struct NodeConfig {
     pub output: watch::Receiver<bool>,
     /// Session-owned state exposed by the local control socket.
     pub live: Arc<crate::control::Live>,
+    pub model_store: Option<Arc<crate::models::Store>>,
 }
 
 impl NodeConfig {
+    pub async fn commit_model(&self, change: crate::model_change::Change) -> bool {
+        let store = self.model_store.as_ref().expect("switch needs a model store");
+        let committed = self.live.changes.commit(change, store.clone(), &self.contribution).await;
+        self.live.notify();
+        committed
+    }
+
     pub fn gpu_profile_missing(&self) -> bool {
         self.hardware.gpus.is_empty() && self.gpu.monitored()
     }
@@ -94,6 +103,7 @@ pub struct Shared {
 /// Grace period requested from the coordinator and limit on waiting for departure.
 pub const GRAZIA_USCITA_S: u32 = 60;
 pub const ATTESA_USCITA: Duration = Duration::from_secs(65);
+const CLOSE_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Return the file size in bytes, or zero when it cannot be measured.
 fn dimensione_modello(path: &Option<std::path::PathBuf>) -> u64 {
@@ -102,16 +112,18 @@ fn dimensione_modello(path: &Option<std::path::PathBuf>) -> u64 {
 
 /// Build the weights inventory with the measured file size and slot count.
 fn inventory(cfg: &NodeConfig, engine: &Engine) -> ModelInventory {
-    ModelInventory {
-        models: vec![InstalledModel {
-            model: Some(cfg.model.clone()),
-            status: ModelStatus::Ready as i32,
-            loaded: !matches!(engine, Engine::Stages(_)) && single_loaded(cfg),
-            size_bytes: dimensione_modello(&cfg.model_path),
-            slots: capacita(cfg, engine) as u32,
-            downloaded_bytes: 0,
-        }],
+    let mut models = vec![InstalledModel {
+        model: Some(cfg.model.clone()),
+        status: ModelStatus::Ready as i32,
+        loaded: !matches!(engine, Engine::Stages(_)) && single_loaded(cfg),
+        size_bytes: dimensione_modello(&cfg.model_path),
+        slots: capacita(cfg, engine) as u32,
+        downloaded_bytes: 0,
+    }];
+    if let Some(transfer) = cfg.live.changes.inventory() {
+        models.push(transfer);
     }
+    ModelInventory { models }
 }
 
 fn single_loaded(cfg: &NodeConfig) -> bool {
@@ -126,13 +138,20 @@ fn features(cfg: &NodeConfig) -> Vec<i32> {
     if cfg.stage_engine.is_some() {
         features.push(AgentFeature::EngineSwitch as i32);
     }
+    if cfg.live.network.enabled() {
+        features.push(AgentFeature::NetworkMeasurement as i32);
+    }
+    if cfg.stages.as_ref().and_then(|s| s.bridge()).is_some() {
+        features.push(AgentFeature::PeerEcho as i32);
+    }
     features
 }
 
 #[derive(Debug)]
 pub enum SessionEnd {
     Shutdown,
-    GpuReady,
+    SwitchModel(crate::model_change::Change),
+    Reconnect,
     /// The coordinator rejects the identity, so the agent must enroll again.
     Unauthenticated,
     Banned,
@@ -240,16 +259,27 @@ async fn run_inner(
 
     // A single writer assigns sequence numbers to match the order on the wire.
     let (out_tx, mut out_rx) = mpsc::channel::<node_message::Body>(64);
+    let (probe_tx, mut probe_rx) = mpsc::channel::<node_message::Body>(2);
     let writer = tokio::spawn(async move {
         let mut send = send;
         let mut seq = 0u64;
-        while let Some(body) = out_rx.recv().await {
+        loop {
+            let body = tokio::select! {
+                biased;
+                body = out_rx.recv() => match body {
+                    Some(body) => body,
+                    None => break,
+                },
+                Some(body) = probe_rx.recv() => body,
+            };
             seq += 1;
             if framed::write(&mut send, &NodeMessage { seq, body: Some(body) }).await.is_err() {
                 break;
             }
         }
-        let _ = send.finish();
+        if send.finish().is_ok() {
+            let _ = send.stopped().await;
+        }
     });
     let out = Out(out_tx);
 
@@ -287,7 +317,21 @@ async fn run_inner(
     }))
     .await?;
 
-    let welcome = match in_rx.recv().await.and_then(|m| m.body) {
+    let welcome = loop {
+        tokio::select! {
+            biased;
+            message = in_rx.recv() => break message.and_then(|m| m.body),
+            change = cfg.live.changes.wait_switch() => {
+                if cfg.live.changes.claim(&change).await {
+                    drop(out);
+                    let _ = tokio::time::timeout(CLOSE_IO_TIMEOUT, writer).await;
+                    conn.close(0u32.into(), b"");
+                    return Ok(SessionEnd::SwitchModel(change));
+                }
+            }
+        }
+    };
+    let welcome = match welcome {
         Some(coordinator_message::Body::Welcome(w)) => w,
         Some(coordinator_message::Body::Error(e)) => bail!("coordinator rejected the session: {} ({:?})", e.message, e.code()),
         _ => bail!("expected Welcome"),
@@ -309,14 +353,16 @@ async fn run_inner(
     if !minor2 {
         info!("coordinator accepts preferences only in Hello; free placement is unavailable");
     }
+    let local_time = network::unix_seconds() as i64;
+    let clock_offset = crate::stages::clock_offset_from_welcome(welcome.server_time.as_ref(), local_time);
+    let bridge = welcome.peer_probes.then(|| cfg.stages.as_ref().and_then(|s| s.bridge())).flatten();
     if let Some(s) = &cfg.stages {
         // Use the handshake's signing key to verify capabilities for stage assignments.
         if let Err(e) = s.set_capability_key(&welcome.capability_pub) {
             warn!("could not save the capability signing key: {e:#}");
         }
         // Correct for clock skew when stages check capability expiry.
-        let ora_locale = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-        let scarto = crate::stages::clock_offset_from_welcome(welcome.server_time.as_ref(), ora_locale);
+        let scarto = clock_offset;
         s.set_clock_offset(scarto);
         info!(clock_offset_s = scarto, "clock offset relative to the coordinator");
         if scarto.abs() > 60 {
@@ -336,6 +382,7 @@ async fn run_inner(
     state_rx.mark_changed();
     let mut pause_rx = cfg.live.pause_rx();
     pause_rx.mark_changed();
+    let mut model_rx = cfg.live.changes.subscribe();
     // Subscribe to preference changes only when the peer supports updates.
     let mut pref_rx = cfg.contribution.subscribe();
     pref_rx.mark_unchanged();
@@ -355,9 +402,43 @@ async fn run_inner(
     if let Some(s) = &cfg.stages {
         s.connect_peer(stage_tx);
     }
-    // Keep cleanup outside this block so control-stream errors also stop the stage.
-    let result = async {
+    let mut echo = tokio::task::JoinSet::new();
+    let mut bandwidth = tokio::task::JoinSet::new();
+    let mut rtt_tick = tokio::time::interval(Duration::from_millis(500));
+    rtt_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut bandwidth_tick = tokio::time::interval(Duration::from_secs(30));
+    bandwidth_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut rtt = [0; network::RTT_SAMPLES];
+    let mut rtt_count = 0;
+    cfg.live.network.begin_session(network::unix_seconds());
+    let mut model_departure = None;
+    let mut leave_ok = false;
+    let mut pending_stage_status = None;
+    // Race the full control loop against the switch deadline. A full output
+    // queue can suspend any branch, including heartbeats and inventory updates.
+    let run_control = async {
         loop {
+            let change = cfg.live.changes.switching();
+            let chain_active = cfg.stages.as_ref().is_some_and(|s| s.has_chain());
+            let idle = lease.is_empty() && !chain_active;
+            if let Some(change) = change {
+                if minor2 && model_departure.is_none() && output.is_none() {
+                    let deadline = change.deadline().unwrap();
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let grazia_s = remaining.as_secs().min(u64::from(GRAZIA_USCITA_S)) as u32;
+                    out.send(node_message::Body::Leaving(Leaving { grazia_s })).await?;
+                    model_departure = Some(deadline);
+                }
+                if output.is_none() && idle && (leave_ok || !minor2) && cfg.live.changes.claim(&change).await {
+                    break Ok(SessionEnd::SwitchModel(change));
+                }
+            } else if let Some(deadline) = model_departure {
+                // Leaving is irrevocable on this connection. Reconnect if the
+                // operator cancels or replaces the request during the drain.
+                if output.is_none() && (leave_ok && idle || deadline <= tokio::time::Instant::now()) {
+                    break Ok(SessionEnd::Reconnect);
+                }
+            }
             let generation = gpu_rx.borrow_and_update().loss_generation;
             if let Some(s) = &cfg.stages {
                 if generation != loss_generation {
@@ -375,7 +456,7 @@ async fn run_inner(
             if cfg.gpu_profile_missing() {
                 if cfg.sup.state() == EngineState::Ready {
                     // Reconnect to refresh the coordinator inventory because the hardware profile is sent in Hello.
-                    break Ok(SessionEnd::GpuReady);
+                    break Ok(SessionEnd::Reconnect);
                 }
             } else {
                 // Let a terminal StageStatus reach the scheduler before the
@@ -393,15 +474,22 @@ async fn run_inner(
             }
             send_releases(&out, released, LeaseReleaseReason::EngineFailure).await?;
             if draining && lease.is_empty() {
-                out.send(goodbye(GoodbyeReason::HostStopped)).await?;
                 break Ok(SessionEnd::Shutdown);
             }
             let scadenza_uscita = output
                 .map(|t| tokio::time::Instant::from_std(t + ATTESA_USCITA))
                 .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
+            let idle = last_avail == Availability::Idle && lease.is_empty()
+                && !cfg.live.has_chain() && !draining && output.is_none();
+            if !idle {
+                bandwidth.abort_all();
+            }
             tokio::select! {
                 m = in_rx.recv() => {
                     let Some(m) = m else { break Err(anyhow::anyhow!("control stream closed")) };
+                    if matches!(m.body.as_ref(), Some(coordinator_message::Body::WorkOffer(_) | coordinator_message::Body::StageAssign(_))) {
+                        bandwidth.abort_all();
+                    }
                     match m.body {
                         Some(coordinator_message::Body::WorkOffer(offer)) => {
                             let engine = if cfg.stages.as_ref().and_then(|s| s.switch_state()) == Some(EngineState::Parked) {
@@ -409,7 +497,7 @@ async fn run_inner(
                             } else {
                                 &engine
                             };
-                            handle_offer(conn, cfg, engine, &shared, &out, &done_tx, &mut lease, draining || output.is_some() || waiting_for_single, offer).await?;
+                            handle_offer(conn, cfg, engine, &shared, &out, &done_tx, &mut lease, draining || output.is_some() || model_departure.is_some() || waiting_for_single, offer).await?;
                             cfg.live.set_leases(lease.attive() as u32);
                         }
                         Some(coordinator_message::Body::LeaseUpdate(u)) => {
@@ -429,7 +517,8 @@ async fn run_inner(
                         }
                         Some(coordinator_message::Body::StageAssign(a)) => match &cfg.stages {
                             Some(s) if cfg.stage_engine.is_some() => {
-                                let allow_new = !(cfg.live.is_paused() || cfg.gpu.unavailable() || draining || output.is_some());
+                                let allow_new = !(cfg.live.is_paused() || cfg.gpu.unavailable() || draining || output.is_some()
+                                    || model_departure.is_some() || cfg.live.changes.switching().is_some());
                                 match s.queue_switch(a, &cfg.sup, allow_new) {
                                     Ok(()) => cfg.live.set_chain(s.serving_chain()),
                                     Err(status) => out.send(node_message::Body::StageStatus(status)).await?,
@@ -441,6 +530,15 @@ async fn run_inner(
                                     assign_epoch: a.assign_epoch,
                                     state: StageState::Failed as i32,
                                     error: "agent paused by host".into(),
+                                    ..Default::default()
+                                })).await?;
+                            }
+                            Some(s) if (model_departure.is_some() || cfg.live.changes.switching().is_some()) && !s.matches_active(&a) => {
+                                out.send(node_message::Body::StageStatus(StageStatus {
+                                    chain_id: a.chain_id,
+                                    assign_epoch: a.assign_epoch,
+                                    state: StageState::Stopped as i32,
+                                    error: "agent is changing models".into(),
                                     ..Default::default()
                                 })).await?;
                             }
@@ -473,7 +571,21 @@ async fn run_inner(
                             }
                         }
                         Some(coordinator_message::Body::MeasurementPing(p)) => {
-                            out.send(node_message::Body::MeasurementPong(MeasurementPong { probe_id: p.probe_id, nonce: p.nonce })).await?;
+                            let _ = probe_tx.try_send(node_message::Body::MeasurementPong(MeasurementPong { probe_id: p.probe_id, nonce: p.nonce }));
+                        }
+                        Some(coordinator_message::Body::PeerProbe(p)) => {
+                            if let (Some(bridge), Some(request)) = (&bridge, crate::peer_echo::Request::from_proto(&p, clock_offset)) {
+                                if p.receive {
+                                    if let Ok(slot) = probe_tx.try_reserve() {
+                                        if bridge.echo.prepare(request) {
+                                            slot.send(node_message::Body::PeerProbeReady(PeerProbeReady { nonce: p.nonce }));
+                                        }
+                                    }
+                                } else if echo.is_empty() {
+                                    let bridge = bridge.clone();
+                                    echo.spawn(async move { bridge.probe(request).await });
+                                }
+                            }
                         }
                         Some(coordinator_message::Body::Drain(d)) => {
                             info!(reason = %d.reason, "coordinator requested shutdown");
@@ -511,8 +623,10 @@ async fn run_inner(
                         }
                         Some(coordinator_message::Body::LeaveOk(l)) => {
                             info!(interrupted_leases = l.lease_interrotte, "coordinator confirmed departure");
-                            ferma_subito(&out, &mut lease).await?;
-                            break Ok(SessionEnd::Shutdown);
+                            leave_ok = true;
+                            if output.is_some() {
+                                break Ok(SessionEnd::Shutdown);
+                            }
                         }
                         Some(other) => debug!(?other, "unhandled message"),
                         None => {}
@@ -520,6 +634,33 @@ async fn run_inner(
                 }
                 _ = heartbeat.tick() => {
                     out.send(node_message::Body::Heartbeat(heartbeat_msg(&lease, cfg, &shared))).await?;
+                }
+                _ = rtt_tick.tick(), if cfg.live.network.enabled() && rtt_count < rtt.len() => {
+                    rtt[rtt_count] = network::micros(conn.rtt());
+                    rtt_count += 1;
+                    if rtt_count == rtt.len() {
+                        let (median, _) = network::median_and_p95(&mut rtt);
+                        cfg.live.network.record_rtt(median, network::unix_seconds());
+                        cfg.live.notify();
+                    }
+                }
+                _ = bandwidth_tick.tick(), if cfg.live.network.enabled() => {
+                    if idle && bandwidth.is_empty() && cfg.live.network.due(network::unix_seconds())
+                        && !cfg.stages.as_ref().is_some_and(|s| s.network_busy())
+                    {
+                        bandwidth.spawn(network::measure());
+                    }
+                }
+                Some(result) = bandwidth.join_next() => {
+                    if let Ok(result) = result {
+                        cfg.live.network.record_bandwidth(result, network::unix_seconds());
+                        cfg.live.notify();
+                    }
+                }
+                Some(result) = echo.join_next() => {
+                    if let Ok(result) = result {
+                        let _ = probe_tx.try_send(node_message::Body::PeerProbeResult(result));
+                    }
                 }
                 _ = pref_rx.changed() => {
                     if minor2 {
@@ -538,11 +679,15 @@ async fn run_inner(
                             warn!("shutting down within {GRAZIA_USCITA_S} s; press Ctrl-C again to exit now");
                             output = Some(Instant::now());
                             conto.reset();
-                            out.send(node_message::Body::Leaving(Leaving { grazia_s: GRAZIA_USCITA_S })).await?;
+                            if leave_ok {
+                                break Ok(SessionEnd::Shutdown);
+                            }
+                            if model_departure.is_none() {
+                                out.send(node_message::Body::Leaving(Leaving { grazia_s: GRAZIA_USCITA_S })).await?;
+                            }
                         }
                         Ok(()) => {
                             // If the peer cannot acknowledge departure, take the immediate shutdown path.
-                            ferma_subito(&out, &mut lease).await?;
                             break Ok(SessionEnd::Shutdown);
                         }
                     }
@@ -554,11 +699,18 @@ async fn run_inner(
                 }
                 _ = tokio::time::sleep_until(scadenza_uscita), if output.is_some() => {
                     warn!("departure acknowledgment timed out; exiting");
-                    ferma_subito(&out, &mut lease).await?;
                     break Ok(SessionEnd::Shutdown);
                 }
                 _ = state_rx.changed() => {}
                 _ = pause_rx.changed() => {}
+                _ = model_rx.changed() => {}
+                _ = async {
+                    if let Some(deadline) = model_departure {
+                        tokio::time::sleep_until(deadline).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }, if cfg.live.changes.switching().is_none() && output.is_none() => {}
                 _ = gpu_rx.changed() => {}
                 Some(st) = stage_rx.recv(), if cfg.stages.is_some() => {
                     let terminal = matches!(st.state(), StageState::Stopped | StageState::Failed);
@@ -567,7 +719,9 @@ async fn run_inner(
                     if current {
                         cfg.live.set_chain((!terminal).then(|| st.chain_id.clone()));
                     }
+                    pending_stage_status = Some(st.clone());
                     out.send(node_message::Body::StageStatus(st)).await?;
+                    pending_stage_status = None;
                     if current && terminal {
                         if cfg.stage_engine.is_some() && !waiting_for_single {
                             waiting_for_single = true;
@@ -582,41 +736,103 @@ async fn run_inner(
                     cfg.live.set_leases(lease.attive() as u32);
                 }
                 _ = shutdown.changed() => {
-                    ferma_subito(&out, &mut lease).await?;
                     break Ok(SessionEnd::Shutdown);
                 }
             }
         }
-    }.await;
-    cfg.live.set_connected(false);
-    cfg.live.set_leases(0);
-    cfg.live.set_chain(None);
-    // Dropping the guard on disconnect marks in-flight work as abandoned so the
-    // engine can settle before accepting another lease.
-    for l in lease.map.values() {
-        l.task.abort();
-    }
-    drop(lease);
-    // Drain stage updates while stopping so a full reporting queue can't
-    // prevent the worker from reaping the stage on disconnect.
-    if let Some(s) = &cfg.stages {
-        let stop = s.stop_all();
-        tokio::pin!(stop);
+    };
+    let result = {
+        tokio::pin!(run_control);
         loop {
             tokio::select! {
-                _ = &mut stop => break,
-                Some(st) = stage_rx.recv() => {
-                    let _ = out.0.try_send(node_message::Body::StageStatus(st));
+                biased;
+                change = cfg.live.changes.wait_deadline() => {
+                    if cfg.live.changes.claim(&change).await {
+                        warn!("model switch deadline reached; releasing active work");
+                        break Ok(SessionEnd::SwitchModel(change));
+                    }
                 }
+                result = &mut run_control => break result,
             }
         }
-        while let Ok(st) = stage_rx.try_recv() {
-            let _ = out.0.try_send(node_message::Body::StageStatus(st));
-        }
+    };
+    // Stop network work on every exit path, including the model switch deadline.
+    drop(bandwidth);
+    drop(echo);
+    drop(probe_tx);
+    if let Some(bridge) = bridge {
+        bridge.echo.clear();
     }
-    drop(out);
-    // Give queued shutdown messages time to reach the peer.
-    let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
+    let graceful = result.is_ok();
+    let released = if graceful {
+        abort_leases(&mut lease, LeaseOutcome::Shutdown)
+    } else {
+        // Dropping the guard on disconnect marks work as abandoned.
+        for l in lease.map.values() {
+            l.task.abort();
+        }
+        Vec::new()
+    };
+    drop(lease);
+    cfg.live.set_leases(0);
+    cfg.live.set_chain(None);
+
+    let confirm_departure = async {
+        if !minor2 || !matches!(result, Ok(SessionEnd::SwitchModel(_))) || leave_ok {
+            return CLOSE_IO_TIMEOUT;
+        }
+        let start = Instant::now();
+        let ack = async {
+            if model_departure.is_none() && output.is_none() {
+                out.send(node_message::Body::Leaving(Leaving { grazia_s: 0 })).await?;
+            }
+            while let Some(message) = in_rx.recv().await {
+                if matches!(message.body, Some(coordinator_message::Body::LeaveOk(_))) {
+                    break;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let _ = tokio::time::timeout(CLOSE_IO_TIMEOUT, ack).await;
+        CLOSE_IO_TIMEOUT.saturating_sub(start.elapsed())
+    };
+    // Collect the terminal reports before Goodbye, which ends the coordinator's
+    // control reader. Drain the queue while stopping so the worker can report.
+    let stop_stages = async {
+        let mut updates: Vec<_> = pending_stage_status.into_iter().collect();
+        if let Some(s) = &cfg.stages {
+            let stop = s.stop_all();
+            tokio::pin!(stop);
+            loop {
+                tokio::select! {
+                    _ = &mut stop => break,
+                    Some(st) = stage_rx.recv() => updates.push(st),
+                }
+            }
+            while let Ok(st) = stage_rx.try_recv() {
+                updates.push(st);
+            }
+        }
+        updates
+    };
+    let (close_budget, stage_updates) = tokio::join!(confirm_departure, stop_stages);
+    cfg.live.set_connected(false);
+    let close_stream = async {
+        send_releases(&out, released, LeaseReleaseReason::Shutdown).await?;
+        for st in stage_updates {
+            out.send(node_message::Body::StageStatus(st)).await?;
+        }
+        if graceful && !cfg.stages.as_ref().is_some_and(|s| s.has_chain()) {
+            out.send(goodbye(GoodbyeReason::HostStopped)).await?;
+        }
+        drop(out);
+        // Wait for the transport to acknowledge the queued frames before closing.
+        writer.await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    if !matches!(tokio::time::timeout(close_budget, close_stream).await, Ok(Ok(()))) {
+        debug!("control stream closed before departure messages were flushed");
+    }
     conn.close(0u32.into(), b"");
     result
 }
@@ -631,13 +847,6 @@ impl Out {
 
 fn goodbye(r: GoodbyeReason) -> node_message::Body {
     node_message::Body::Goodbye(publicompute_proto::node::Goodbye { reason: r as i32 })
-}
-
-/// Release in-flight leases and send a goodbye without waiting for departure acknowledgment.
-async fn ferma_subito(out: &Out, lease: &mut Leases) -> Result<()> {
-    let released = abort_leases(lease, LeaseOutcome::Shutdown);
-    send_releases(out, released, LeaseReleaseReason::Shutdown).await?;
-    out.send(goodbye(GoodbyeReason::HostStopped)).await
 }
 
 fn gpu_loss_leases(generation: u64, seen: &mut u64, lease: &mut Leases, live: &crate::control::Live) -> Vec<String> {
@@ -685,7 +894,7 @@ async fn send_releases(out: &Out, released: Vec<String>, reason: LeaseReleaseRea
 
 /// Provide the advertised weights fingerprint when encoding a contribution preference.
 fn modelli_di(inv: &ModelInventory) -> Vec<ModelRef> {
-    inv.models.iter().filter_map(|m| m.model.clone()).collect()
+    inv.models.iter().filter(|m| m.status() == ModelStatus::Ready).filter_map(|m| m.model.clone()).collect()
 }
 
 /// A directive can confirm the weights the engine is already serving.
@@ -816,6 +1025,7 @@ fn heartbeat_msg(lease: &Leases, cfg: &NodeConfig, shared: &Shared) -> Heartbeat
         node_time: Some(Timestamp::from(std::time::SystemTime::now())),
         telemetry: Some(Telemetry { gpus: cfg.gpu.gpus(), recent_tokens_per_sec: tps, engine: Some(cfg.sup.health()) }),
         leases,
+        network: cfg.live.network.report(),
     }
 }
 
@@ -938,6 +1148,9 @@ async fn handle_offer(
         info!(lease = %lease_id, ?reason, detail, "lease offer rejected");
         node_message::Body::LeaseReject(LeaseReject { lease_id: lease_id.clone(), reason: reason as i32, detail: detail.to_string() })
     };
+    if cfg.live.changes.switching().is_some() {
+        return out.send(reject(LeaseRejectReason::HostBusy, "agent is changing models")).await;
+    }
     if cfg.live.is_paused() || cfg.gpu.unavailable() || cfg.gpu_profile_missing() {
         return out.send(reject(LeaseRejectReason::HostBusy, "host unavailable")).await;
     }
@@ -1012,6 +1225,7 @@ async fn handle_offer(
     out.send(node_message::Body::Heartbeat(Heartbeat {
         node_time: Some(Timestamp::from(std::time::SystemTime::now())),
         telemetry: None,
+        network: None,
         leases: vec![lease_progress(&lease_id, &LeaseCounters::default(), own.as_deref().unwrap_or(&cfg.sup.progress).snapshot())],
     }))
     .await?;
@@ -1401,7 +1615,7 @@ mod tests {
             progress,
         );
         sup.start().await.unwrap();
-        let cfg = NodeConfig { model: ModelRef::default(), costs: None, hardware: Default::default(), sup, stages: None, stage_engine: None, region: String::new(), nat_class: String::new(), iroh_node_id: String::new(), slots: 1, contribution: contributo_prova("nodo"), gpu: Default::default(), model_path: None, output: watch::channel(false).1, live: crate::control::Live::new() };
+        let cfg = NodeConfig { model: ModelRef::default(), costs: None, hardware: Default::default(), sup, stages: None, stage_engine: None, region: String::new(), nat_class: String::new(), iroh_node_id: String::new(), slots: 1, contribution: contributo_prova("nodo"), gpu: Default::default(), model_path: None, output: watch::channel(false).1, live: crate::control::Live::new(), model_store: None };
         (f, cfg)
     }
 
@@ -1652,7 +1866,7 @@ mod tests {
         );
         sup.start().await.unwrap();
         let model = ModelRef { model_id: "m".into(), quantization: "q".into(), weights_sha256: vec![7; 32] };
-        (NodeConfig { model, costs: None, hardware: Default::default(), sup, stages: Some(stages.clone()), stage_engine: None, region: String::new(), nat_class: String::new(), iroh_node_id: String::new(), slots: 1, contribution: contributo_prova(name), gpu: Default::default(), model_path: None, output: watch::channel(false).1, live: crate::control::Live::new() }, engine, stages)
+        (NodeConfig { model, costs: None, hardware: Default::default(), sup, stages: Some(stages.clone()), stage_engine: None, region: String::new(), nat_class: String::new(), iroh_node_id: String::new(), slots: 1, contribution: contributo_prova(name), gpu: Default::default(), model_path: None, output: watch::channel(false).1, live: crate::control::Live::new(), model_store: None }, engine, stages)
     }
 
     fn offerta_chat(cfg: &NodeConfig, request_id: &str, text: &str, max_tokens: u32) -> WorkOffer {
@@ -2278,7 +2492,11 @@ mod tests {
 
     impl Finta {
         async fn start(cfg: NodeConfig, welcome: Welcome) -> (Finta, Arc<Shared>) {
-            let (client, server) = loopback().await;
+            Self::start_with_window(cfg, welcome, None).await
+        }
+
+        async fn start_with_window(cfg: NodeConfig, welcome: Welcome, window: Option<u32>) -> (Finta, Arc<Shared>) {
+            let (client, server) = loopback_with_window(window).await;
             let engine = cfg.sup.engine.clone();
             let (stop_tx, stop_rx) = watch::channel(false);
             let shared = Arc::new(Shared::default());
@@ -2322,6 +2540,40 @@ mod tests {
         async fn done(self) -> SessionEnd {
             tokio::time::timeout(Duration::from_secs(5), self.task).await.expect("the session should end").unwrap()
         }
+
+        async fn acknowledge_leaving(&mut self, remaining: u32) {
+            let grace = self.attendi(3000, |msg| match msg {
+                node_message::Body::Leaving(l) => Some(l.grazia_s),
+                _ => None,
+            }).await.expect("model switch must announce departure");
+            assert_eq!(grace, GRAZIA_USCITA_S);
+            self.manda(coordinator_message::Body::LeaveOk(LeaveOk { lease_interrotte: remaining })).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saved_bandwidth_stays_out_of_hello_on_legacy_reconnect() {
+        let dir = tempdir("legacy-network");
+        let live = crate::control::Live::open(&dir).unwrap();
+        live.network.record_bandwidth(network::Bandwidth::Measured {
+            down: 120_000_000, up: 40_000_000, complete: true,
+        }, network::unix_seconds());
+        for _ in 0..2 {
+            let (_fake, mut cfg) = node(1000).await;
+            cfg.live = live.clone();
+            let (mut peer, _) = Finta::start(cfg, welcome(None, "", 25)).await;
+            assert!(peer.hello.hardware.as_ref().unwrap().network.is_none());
+            let up = peer.attendi(2000, |body| match body {
+                node_message::Body::Heartbeat(h) => h.network.as_ref().map(|n| n.upload_bits_per_sec),
+                _ => None,
+            }).await;
+            assert_eq!(up, Some(40_000_000));
+            peer.stop_tx.send(true).unwrap();
+            peer.done().await;
+        }
+        drop(live);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     async fn dual_node(name: &str, stage_env: &[(&str, &str)], llama_args: &[&str]) -> (NodeConfig, std::path::PathBuf, u16) {
@@ -2379,6 +2631,7 @@ mod tests {
             region: "EU".into(), nat_class: String::new(), iroh_node_id: String::new(),
             contribution: contributo_prova(name), gpu, model_path: Some(model_path), output: watch::channel(false).1,
             live: crate::control::Live::new(),
+            model_store: None,
         }, dir, port)
     }
 
@@ -2644,6 +2897,167 @@ mod tests {
         assert!(p.model.is_none());
         assert!(p.revision > rev0);
         let _ = fin.stop_tx.send(true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hello_only_advertises_the_active_model_as_ready() {
+        use crate::models::{find, tests::fixture_store};
+        let (_f, cfg) = nodo_con_modello("hello-download").await;
+        let store = fixture_store("hello-download");
+        let download = find("qwen3.5-9b", None).unwrap();
+        std::fs::File::create(store.partial(download)).unwrap().set_len(download.bytes - 1).unwrap();
+        let (sent, ready) = oneshot::channel();
+        cfg.live.changes.request(&cfg.live, &store, download, Some(ready)).unwrap();
+        let active = cfg.model.clone();
+        let live = cfg.live.clone();
+        let (peer, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        let models = &peer.hello.models.as_ref().unwrap().models;
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].model.as_ref(), Some(&active));
+        assert_eq!(models[0].status(), ModelStatus::Ready);
+        assert_eq!(models[1].model.as_ref(), Some(&download.reference()));
+        assert_eq!(models[1].status(), ModelStatus::Downloading);
+        assert!(!models[1].loaded);
+        live.changes.cancel();
+        let _ = sent.send(());
+        peer.stop_tx.send(true).unwrap();
+        assert!(matches!(peer.done().await, SessionEnd::Shutdown));
+    }
+
+    #[cfg(unix)]
+    async fn drain_for_model_switch(force: bool) {
+        use crate::models::{find, tests::{cached_weights, fixture_store}};
+        let name = if force { "switch-deadline" } else { "switch-drain" };
+        let (_f, mut cfg) = nodo_con_modello(name).await;
+        let store = fixture_store(name);
+        let model = find("qwen3.6-35b-a3b", None).unwrap();
+        cached_weights(&store, model);
+        let mut new = offerta_chat(&cfg, "r2", "second chat", 4);
+        new.lease.as_mut().unwrap().lease_id = "L-next".into();
+        let first = offerta_chat(&cfg, "r1", "first chat", 4);
+        let live = cfg.live.clone();
+        let pref = cfg.contribution.clone();
+        cfg.model_store = Some(store.clone());
+        let (mut peer, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        peer.accept_chat(first).await;
+        live.changes.request(&live, &store, model, None).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), live.changes.wait_switch()).await.unwrap();
+        peer.acknowledge_leaving(1).await;
+        peer.manda(coordinator_message::Body::WorkOffer(new)).await;
+        let rejected = peer.attendi(3000, |msg| match msg {
+            node_message::Body::LeaseReject(r) if r.lease_id == "L-next" => Some(r.clone()),
+            _ => None,
+        }).await.unwrap();
+        assert_eq!(rejected.detail, "agent is changing models");
+        assert!(store.active().unwrap().is_none());
+        assert!(!peer.task.is_finished());
+        if force {
+            live.changes.expire_switch();
+            let released = peer.attendi(3000, |msg| match msg {
+                node_message::Body::LeaseRelease(r) if r.lease_id == "L-chat" => Some(r.clone()),
+                _ => None,
+            }).await.unwrap();
+            assert_eq!(released.reason(), LeaseReleaseReason::Shutdown);
+        } else {
+            peer.update_lease(lease_update::Status::Revoked(LeaseRevokeReason::Cancelled as i32)).await;
+        }
+        let SessionEnd::SwitchModel(change) = peer.done().await else { panic!("expected to leave for the model switch") };
+        assert!(live.changes.commit(change, store.clone(), &pref).await);
+        assert_eq!(store.active().unwrap().unwrap().0.id, model.id);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn switch_waits_for_the_existing_lease_and_refuses_new_offers() {
+        drain_for_model_switch(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn switch_waits_for_a_chain_even_without_a_local_chat() {
+        use crate::models::{find, tests::{cached_weights, fixture_store}};
+        let (cfg, _, _) = nodo_testa("chain-model-switch", vec![]).await;
+        let store = fixture_store("chain-model-switch-weights");
+        let model = find("qwen3.6-35b-a3b", None).unwrap();
+        cached_weights(&store, model);
+        let live = cfg.live.clone();
+        let (mut peer, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        peer.manda(coordinator_message::Body::MeasurementPing(Default::default())).await;
+        peer.attendi(3000, |msg| matches!(msg, node_message::Body::MeasurementPong(_)).then_some(())).await.unwrap();
+        live.changes.request(&live, &store, model, None).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), live.changes.wait_switch()).await.unwrap();
+        peer.acknowledge_leaving(0).await;
+
+        peer.manda(coordinator_message::Body::StageAssign(assignment("new", 1, 1, 2, 0))).await;
+        assert_eq!(peer.stage(State::Stopped).await.error, "agent is changing models");
+        assert!(!peer.task.is_finished());
+        peer.manda(coordinator_message::Body::StageRelease(publicompute_proto::node::StageRelease {
+            chain_id: "catena-x".into(), assign_epoch: 1, reason: "chain finished".into(),
+        })).await;
+        assert!(matches!(peer.done().await, SessionEnd::SwitchModel(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn switch_deadline_reports_terminal_stage_before_goodbye() {
+        use crate::models::{find, tests::{cached_weights, fixture_store}};
+        let (cfg, _, _) = dual_node("chain-switch-terminal", &[], &[]).await;
+        let supervisor = cfg.sup.clone();
+        let store = fixture_store("chain-switch-terminal-weights");
+        let model = find("qwen3.6-35b-a3b", None).unwrap();
+        cached_weights(&store, model);
+        let live = cfg.live.clone();
+        let (mut peer, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        peer.manda(coordinator_message::Body::StageAssign(assignment("ad", 1, 1, 2, 0))).await;
+        peer.stage(State::Ready).await;
+        live.changes.request(&live, &store, model, None).unwrap();
+        peer.acknowledge_leaving(0).await;
+        assert!(peer.read(100).await.is_none_or(|msg| !matches!(msg, node_message::Body::Goodbye(_))));
+        assert!(!peer.task.is_finished());
+        live.changes.expire_switch();
+        let terminal_first = peer.attendi(3000, |msg| match msg {
+            node_message::Body::StageStatus(s) if s.chain_id == "ad" && s.state() == State::Stopped => Some(true),
+            node_message::Body::Goodbye(_) => Some(false),
+            _ => None,
+        }).await;
+        assert_eq!(terminal_first, Some(true));
+        peer.attendi(3000, |msg| matches!(msg, node_message::Body::Goodbye(_)).then_some(())).await.expect("Goodbye");
+        assert!(matches!(peer.done().await, SessionEnd::SwitchModel(_)));
+        supervisor.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn switch_deadline_interrupts_control_send_when_peer_does_not_read() {
+        use crate::models::{find, tests::{cached_weights, fixture_store}};
+        let (_fake, cfg) = nodo_con_modello("switch-backpressure").await;
+        let first = offerta_chat(&cfg, "r1", "first chat", 4);
+        let store = fixture_store("switch-backpressure");
+        let model = find("qwen3.6-35b-a3b", None).unwrap();
+        cached_weights(&store, model);
+        let live = cfg.live.clone();
+        let (mut peer, _) = Finta::start_with_window(cfg, welcome(Some(2), "", 60_000), Some(1024)).await;
+        peer.accept_chat(first).await;
+        live.changes.request(&live, &store, model, None).unwrap();
+        peer.acknowledge_leaving(1).await;
+        // Pongs overflow the receive window and the bounded writer queue.
+        for _ in 0..160 {
+            peer.manda(coordinator_message::Body::MeasurementPing(publicompute_proto::node::MeasurementPing {
+                nonce: vec![1; 256], ..Default::default()
+            })).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!peer.task.is_finished());
+        live.changes.expire_switch();
+        let end = tokio::time::timeout(CLOSE_IO_TIMEOUT + Duration::from_secs(1), &mut peer.task).await.unwrap().unwrap();
+        assert!(matches!(end, SessionEnd::SwitchModel(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn switch_releases_existing_work_when_the_deadline_expires() {
+        drain_for_model_switch(true).await;
     }
 
     #[tokio::test]

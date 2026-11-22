@@ -2,9 +2,13 @@
 # Install the Linux package, configure the agent service and enroll a node.
 # The privileged phase stages and verifies a candidate before replacing the
 # active installation. Use PUBLICOMPUTE_CA_FILE for a private coordinator.
-# The loopback HTTP, manifest and GPU overrides are for installer tests.
+# The loopback HTTP, manifest and hardware overrides are for installer tests.
 set +x
 set -eu
+
+# The CUDA package targets the 535 driver branch and needs 570 for Blackwell.
+MIN_DRIVER=535
+MIN_DRIVER_BLACKWELL=570
 
 # Keep the link code out of the environment inherited by child processes.
 unset link_code
@@ -74,7 +78,7 @@ if [ -n "$link_code" ]; then
     unset link_code
 fi
 
-default_version=0.1.2
+default_version=0.1.3
 version=${PUBLICOMPUTE_VERSION:-$default_version}
 case "$version" in
     ''|*[!A-Za-z0-9._-]*) fail 'Invalid package version.' ;;
@@ -91,6 +95,8 @@ case "$ca" in
 esac
 # Allow the service fixture to supply its own unit and credential root.
 skip_gpu=${PUBLICOMPUTE_SKIP_GPU_CHECK:-0}
+cpuinfo=${PUBLICOMPUTE_TEST_CPUINFO:-/proc/cpuinfo}
+case "$cpuinfo" in /*) ;; *) cpuinfo=$PWD/$cpuinfo ;; esac
 test_manifest=${PUBLICOMPUTE_TEST_MODEL_MANIFEST:-}
 if [ -n "$test_manifest" ]; then
     [ "$skip_gpu" = 1 ] || fail 'The test model requires PUBLICOMPUTE_SKIP_GPU_CHECK=1.'
@@ -120,7 +126,8 @@ esac
 as_root sh -s -- "$started" "$downloader" "$version" "$base_url" \
     "$package" "${PUBLICOMPUTE_PACKAGE_SHA256:-}" "${PUBLICOMPUTE_COORDINATOR:-api.publicompute.com:7443}" \
     "${PUBLICOMPUTE_SERVER_NAME:-}" "$ca" "${PUBLICOMPUTE_SPEED_URL:-}" "$skip_gpu" "$test_manifest" \
-    "$link_file" "$relink" "${SUDO_USER:-$(id -un)}" "$http_fixture" "$allow_downgrade" "$region" <<'ROOT' &
+    "$link_file" "$relink" "${SUDO_USER:-$(id -un)}" "$http_fixture" "$allow_downgrade" "$region" \
+    "$MIN_DRIVER" "$MIN_DRIVER_BLACKWELL" "$cpuinfo" <<'ROOT' &
 set -eu
 umask 022
 
@@ -129,12 +136,41 @@ fail() { printf '%s\n' "$*" >&2; exit 1; }
 started=$1 downloader=$2 version=$3 base_url=$4 package=$5 package_sha=$6 coordinator=$7 server_name=$8 ca=$9
 shift 9
 speed_url=$1 skip_gpu=$2 test_manifest=$3 link_file=$4 relink=$5 installer=$6 http_fixture=$7 allow_downgrade=$8 region=$9
+MIN_DRIVER=${10} MIN_DRIVER_BLACKWELL=${11} cpuinfo=${12}
 
 valid_region() {
     printf '%s\n' "$1" | LC_ALL=C awk '/^[A-Za-z][A-Za-z0-9-]*$/ && length <= 32 { valid++ }
         END { exit !(NR == 1 && valid == 1) }'
 }
 valid_region "$region" || fail 'Invalid region. Use a letter followed by up to 31 letters, digits or hyphens.'
+
+# The packaged binaries are built for x86-64-v3 and use these instructions on
+# any core. A fake cpuinfo is accepted only with the loopback test fixture.
+[ "$http_fixture" = 1 ] || cpuinfo=/proc/cpuinfo
+[ -f "$cpuinfo" ] && [ -r "$cpuinfo" ] || fail "Cannot read $cpuinfo to check the CPU."
+if missing_cpu_flags=$(LC_ALL=C awk '
+    BEGIN { count = split("ssse3 sse4_1 sse4_2 popcnt cx16 avx avx2 fma f16c bmi1 bmi2 abm movbe", required) }
+    /^flags[[:space:]]*:/ {
+        seen++
+        sub(/^flags[[:space:]]*:/, "")
+        gsub(/[[:space:]]+/, " ")
+        flags = " " $0 " "
+        for (i = 1; i <= count; i++)
+            if (!index(flags, " " required[i] " ")) missing[i] = 1
+    }
+    END {
+        for (i = 1; i <= count; i++) {
+            if (!seen || missing[i]) {
+                printf "%s%s", separator, required[i]
+                separator = " "
+            }
+        }
+    }
+' 2>/dev/null < "$cpuinfo"); then
+    [ -z "$missing_cpu_flags" ] || fail "This CPU lacks $missing_cpu_flags. PubliCompute needs a CPU with AVX2 (Intel Core from 2013 or newer, or AMD Ryzen or newer). Most Pentium and Celeron models lack it."
+else
+    fail "Cannot read $cpuinfo to check the CPU."
+fi
 
 release_pubkey='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDv7F+43HnKvzUnfc8dADFSHP98ZKG5uKNvvvVD8oymj'
 if [ -z "$package" ]; then
@@ -316,12 +352,64 @@ else
     PATH=$PATH:/usr/lib/wsl/lib
     export PATH
     command -v nvidia-smi >/dev/null || fail 'nvidia-smi is missing. Install the NVIDIA driver.'
-    cards=$(LC_ALL=C timeout 10 nvidia-smi --query-gpu=memory.total,uuid --format=csv,noheader,nounits) ||
+    # Older drivers can reject the compute capability field.
+    cards=$(LC_ALL=C timeout 10 nvidia-smi --query-gpu=memory.total,uuid,driver_version,compute_cap \
+        --format=csv,noheader,nounits 2>/dev/null) ||
+    cards=$(LC_ALL=C timeout 10 nvidia-smi --query-gpu=memory.total,uuid,driver_version --format=csv,noheader,nounits) ||
         fail 'nvidia-smi failed or timed out. Check the NVIDIA driver.'
-    gpu_uuid=$(printf '%s\n' "$cards" | awk -F, '$1 ~ /^[[:space:]]*[0-9]+[[:space:]]*$/ && $1 >= 8192 {
-        gsub(/[[:space:]]/, "", $2); if ($2 ~ /^GPU-[a-fA-F0-9-]+$/) {print $2; exit}
-    }')
-    [ -n "$gpu_uuid" ] || fail 'At least one NVIDIA GPU with 8 GiB of VRAM is required.'
+    gpu_check=$(printf '%s\n' "$cards" | LC_ALL=C awk -F, -v min_driver="$MIN_DRIVER" -v blackwell_driver="$MIN_DRIVER_BLACKWELL" '
+        function version_at_least(version, minimum, actual, required, n, m, i) {
+            n = split(version, actual, /\./)
+            m = split(minimum, required, /\./)
+            for (i = 1; i <= n || i <= m; i++) {
+                if (actual[i] + 0 != required[i] + 0) return actual[i] + 0 > required[i] + 0
+            }
+            return 1
+        }
+        BEGIN { failure = "vram" }
+        {
+            for (i = 1; i <= NF; i++) gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i)
+            if ($1 !~ /^[0-9]+$/) {
+                if (failure == "vram") failure = "unavailable"
+                next
+            }
+            if ($1 + 0 < 8192) next
+            if ($4 !~ /^[0-9]+\.[0-9]+$/) {
+                reason = "unavailable"
+            } else if ($4 !~ /^(7\.5|8\.[6-9]|12\.[0-9]+)$/) {
+                reason = "unsupported " $4
+            } else if ($2 !~ /^GPU-[a-fA-F0-9-]+$/ || $3 !~ /^[0-9]+(\.[0-9]+)*$/) {
+                reason = "unavailable"
+            } else {
+                minimum = ($4 ~ /^12\./) ? blackwell_driver : min_driver
+                if (version_at_least($3, minimum)) {
+                    selected = $2
+                    exit
+                }
+                reason = "old " $3 " " minimum
+            }
+            # When no card works, report the one with the most VRAM.
+            if ($1 + 0 > largest) {
+                largest = $1 + 0
+                failure = reason
+            }
+        }
+        END { print selected != "" ? "ok " selected : failure }
+    ')
+    IFS=' ' read -r gpu_status gpu_value gpu_minimum <<GPU
+$gpu_check
+GPU
+    case "$gpu_status" in
+        ok)
+            gpu_uuid=$gpu_value
+            printf 'Using NVIDIA GPU %s.\n' "$gpu_uuid" ;;
+        vram) fail 'At least one NVIDIA GPU with 8 GiB of VRAM is required.' ;;
+        unsupported) fail "Unsupported NVIDIA GPU (compute capability $gpu_value)." ;;
+        unavailable) fail 'NVIDIA GPU data unavailable. Update the NVIDIA driver.' ;;
+        old) fail "NVIDIA driver $gpu_value is too old for this GPU. PubliCompute needs $gpu_minimum or newer.
+Ubuntu: run sudo ubuntu-drivers install or install the nvidia-driver-570 package.
+WSL: update the Windows NVIDIA driver." ;;
+    esac
 fi
 
 model_manifest='qwen3.5-9b Q4_K_M 5680522464 03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8 https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/3885219b6810b007914f3a7950a8d1b469d598a5/Qwen3.5-9B-Q4_K_M.gguf'
@@ -462,11 +550,12 @@ install -d -m 0700 -o "$account" -g "$account" "$state"
 if [ -d "$state/models" ] && [ ! -L "$state/models" ] && [ "$(stat -c %u "$state/models")" = 0 ]; then
     # Retained weights belong to root after uninstall so a recycled service UID cannot read them.
     require_unmounted "$state/models"
-    chown -hR "$account:$account" "$state/models"
+    find "$state/models" -name '*.agent.part' -prune -o -exec chown -h "$account:$account" -- {} +
 fi
 as_agent() { runuser -u "$account" -- "$@"; }
 as_agent mkdir -p "$state/models"
 model=$state/models/$model_id-$quant.gguf
+# The service keeps its own partial downloads across package upgrades.
 part=$model.part
 
 gguf_header_ok() {

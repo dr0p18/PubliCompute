@@ -73,9 +73,10 @@ message NetworkInfo {
   // Bandwidth measured locally.
   uint64 upload_bits_per_sec = 1;
   uint64 download_bits_per_sec = 2;
-  // Host-measured latency to relay endpoints. The coordinator can verify
+  // Host-measured latency to network endpoints. The coordinator can verify
   // latency independently before using it to determine location.
   repeated LatencySample latencies = 3;
+  google.protobuf.Timestamp bandwidth_measured_at = 4;
 }
 
 message LatencySample {

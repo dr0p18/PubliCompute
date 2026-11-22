@@ -441,6 +441,7 @@ pub struct TlsFiles {
 struct Interno {
     tx: Option<mpsc::Sender<StageStatus>>,
     attivo: Option<Attivo>,
+    pending_assignments: usize,
     switching: Option<EngineSwitch>,
     // Renewals can arrive after the stage exits and Llama is ready again.
     closed: HashSet<(String, u64)>,
@@ -467,7 +468,9 @@ impl Stages {
         tokio::spawn(async move {
             while let Some(c) = rx.recv().await {
                 match c {
-                    Cmd::Assegna(a, sup) => s2.assign(a, sup).await,
+                    Cmd::Assegna(a, sup) => {
+                        s2.assign(a, sup).await;
+                    }
                     Cmd::Renew(a) => s2.renew_switch(&a).await,
                     Cmd::Rilascia(r) => s2.release(r).await,
                     Cmd::FermaTutto(fatto) => {
@@ -503,13 +506,17 @@ impl Stages {
         self.interno.lock().unwrap().bridge = Some(bridge);
     }
 
+    pub fn bridge(&self) -> Option<Arc<crate::bridge::Bridge>> {
+        self.interno.lock().unwrap().bridge.clone()
+    }
+
     /// Give each bridged outgoing link a loopback listener and pass its address
     /// to the stage. Register incoming streams against the stage's own listeners.
     /// An assignment with direct links needs no listeners or routes. Keep the
     /// guard alive until the stage exits.
     async fn connect_bridge(&self, a: &StageAssign, role: Role) -> Result<(StageAssign, Option<crate::bridge::LinkGuard>)> {
         use crate::bridge::Direction;
-        let bridge = self.interno.lock().unwrap().bridge.clone();
+        let bridge = self.bridge();
         let (forward, token) = (role != Role::Tail && !a.next_node_id.is_empty(), role == Role::Tail && !a.head_token_node_id.is_empty());
         let Some(bridge) = bridge else {
             if forward || token {
@@ -611,7 +618,24 @@ impl Stages {
     }
 
     pub fn queue_assignment(&self, a: StageAssign) {
-        let _ = self.cmd.send(Cmd::Assegna(a, None));
+        let mut i = self.interno.lock().unwrap();
+        if self.cmd.send(Cmd::Assegna(a, None)).is_ok() {
+            i.pending_assignments += 1;
+        }
+    }
+
+    pub fn network_busy(&self) -> bool {
+        self.interno.try_lock().map_or(true, |i| i.pending_assignments > 0 || i.attivo.is_some() || i.switching.is_some())
+    }
+
+    pub fn has_chain(&self) -> bool {
+        let i = self.interno.lock().unwrap();
+        i.pending_assignments > 0 || i.attivo.is_some() || i.switching.as_ref().is_some_and(|s| s.parked.is_some())
+    }
+
+    pub fn matches_active(&self, a: &StageAssign) -> bool {
+        let i = self.interno.lock().unwrap();
+        i.attivo.as_ref().is_some_and(|s| s.chain_id == a.chain_id && s.epoch == a.assign_epoch && !s.closing)
     }
 
     /// Reserve the single engine before returning to the session's offer loop.
@@ -768,6 +792,9 @@ impl Stages {
 
     async fn assign(self: &Arc<Self>, a: StageAssign, sup: Option<Arc<Supervisor>>) {
         let status = self.start_assignment(&a, sup.as_ref()).await;
+        if sup.is_none() {
+            self.interno.lock().unwrap().pending_assignments -= 1;
+        }
         if let Some(status) = status {
             self.finish_assignment(&a);
             self.report(status).await;
@@ -852,9 +879,8 @@ impl Stages {
         tokio::spawn(async move {
             let status = s2.vita(&a, role, args, gpu.as_deref(), ferma_rx).await;
             drop(guard);
-            s2.pulisci(&a);
             s2.finish_assignment(&a);
-            s2.report(status).await;
+            s2.report_exit(&a, status).await;
             let _ = fin_tx.send(true);
         });
         None
@@ -1046,11 +1072,22 @@ impl Stages {
         }
     }
 
-    fn pulisci(&self, a: &StageAssign) {
+    async fn report_exit(&self, a: &StageAssign, status: StageStatus) {
+        let tx = self.interno.lock().unwrap().tx.clone();
+        info!(chain = %status.chain_id, epoch = status.assign_epoch, state = ?status.state(), error = %status.error, "stage status");
+        let slot = match tx {
+            Some(tx) => tx.reserve_owned().await.ok(),
+            None => None,
+        };
+        // Once the session sees the assignment is gone, its terminal status
+        // must already be in the reporting queue.
         let mut i = self.interno.lock().unwrap();
         if i.attivo.as_ref().is_some_and(|x| x.chain_id == a.chain_id && x.epoch == a.assign_epoch) {
             i.attivo = None;
             i.link = None;
+        }
+        if let Some(slot) = slot {
+            slot.send(status);
         }
     }
 
@@ -1224,6 +1261,25 @@ async fn start(cfg: &StagesConfig, args: &[String], log_path: &Path, use_pipes: 
 pub(crate) mod tests {
     use super::*;
     use publicompute_proto::common::ModelRef;
+
+    #[tokio::test]
+    async fn stage_only_is_busy_for_network_before_the_worker_reports_loading() {
+        let dir = tempdir("pending-stage-network");
+        let stages = Stages::new(cfg_test(&dir));
+        let (tx, mut rx) = mpsc::channel(8);
+        stages.connect_peer(tx);
+        assert!(!stages.network_busy());
+        stages.queue_assignment(assignment("pending", 1, 3, 3, porta_libera().unwrap()));
+        assert!(stages.network_busy());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(prossimo(&mut rx).await.state(), State::Loading);
+        assert_eq!(prossimo(&mut rx).await.state(), State::Ready);
+        assert!(stages.network_busy());
+        stages.stop_all().await;
+        assert_eq!(prossimo(&mut rx).await.state(), State::Stopped);
+        assert!(!stages.network_busy());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// Use the fixture binary built alongside the tests.
     pub fn fake_stage() -> PathBuf {

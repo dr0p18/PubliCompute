@@ -201,6 +201,7 @@ pub struct Bridge {
     router: Router,
     relay: RelayUrl,
     dentro: Arc<IncomingState>,
+    pub echo: crate::peer_echo::Echo,
 }
 
 /// Dropping the assignment guard closes its listeners, interrupts active
@@ -314,13 +315,21 @@ impl Bridge {
             accettate: AtomicU64::new(0),
             entrate: Mutex::new(HashMap::new()), registro: Mutex::new(Vec::new()),
         });
-        let router = Router::builder(ep).accept(ALPN, Accetta { dentro: dentro.clone() }).spawn();
-        Ok(Arc::new(Bridge { router, relay: url, dentro }))
+        let echo = crate::peer_echo::Echo::default();
+        let router = Router::builder(ep)
+            .accept(ALPN, Accetta { dentro: dentro.clone() })
+            .accept(crate::peer_echo::ALPN, echo.clone())
+            .spawn();
+        Ok(Arc::new(Bridge { router, relay: url, dentro, echo }))
     }
 
     /// Return the public endpoint ID used in the handshake and stage assignments.
     pub fn id(&self) -> String {
         self.router.endpoint().id().to_string()
+    }
+
+    pub async fn probe(&self, request: crate::peer_echo::Request) -> publicompute_proto::node::PeerProbeResult {
+        crate::peer_echo::probe(self.router.endpoint().clone(), self.relay.clone(), request).await
     }
 
     /// Wait up to the given deadline for relay connectivity.

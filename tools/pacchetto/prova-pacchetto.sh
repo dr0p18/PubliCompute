@@ -30,15 +30,33 @@ cp -- "$ARCHIVE" "$SCRATCH/package.tar.zst"
 cat > "$SCRATCH/check.sh" <<'INNER'
 set -euo pipefail
 apt-get update -qq
-apt-get install -y -qq --no-install-recommends zstd >/dev/null
+apt-get install -y -qq --no-install-recommends binutils zstd >/dev/null
 mkdir /pkg
 tar --zstd -xf /in/package.tar.zst -C /pkg --strip-components=1
 for binary in publicompute publicompute-agent publicompute-stage llama-server; do
     test -x "/pkg/bin/$binary"
 done
-for lib in libllama.so libggml-cuda.so; do
+for lib in libllama.so libggml-cpu.so libggml-cuda.so; do
     test -f "/pkg/lib/$lib"
 done
+
+# EVEX also encodes AVX-512 instructions that only use xmm or ymm registers.
+if ! command -v objdump >/dev/null; then
+    echo 'SKIP libggml-cpu AVX-512 check (objdump is missing)'
+elif LC_ALL=C objdump -dw -M att /pkg/lib/libggml-cpu.so | awk -F '\t' '
+    $1 ~ /^[[:space:]]*[[:xdigit:]]+:$/ &&
+        ($2 ~ /^[[:space:]]*((26|2e|36|3e|64|65|67)[[:space:]]+)*62[[:space:]]/ ||
+         $3 ~ /%(zmm|k)[0-9]+([^[:alnum:]_]|$)/) {
+        if (!found) print
+        found = 1
+    }
+    END { exit found }
+'; then
+    echo 'PASS libggml-cpu has no AVX-512 instructions'
+else
+    echo 'FAIL libggml-cpu AVX-512 check' >&2
+    exit 1
+fi
 
 for file in /pkg/bin/* /pkg/lib/*.so*; do
     dependencies=$(ldd "$file")
@@ -67,7 +85,45 @@ check_startup /pkg/bin/publicompute-stage compare /empty.jsonl /empty.jsonl --bi
 check_startup /pkg/bin/llama-server --version
 INNER
 
-if "$ENGINE" run --rm -v "$SCRATCH:/in:ro,Z" docker.io/library/ubuntu:22.04 bash /in/check.sh > "$LOG" 2>&1; then
+cat > "$SCRATCH/check-sass.sh" <<'INNER'
+set -euo pipefail
+if ! command -v cuobjdump >/dev/null; then
+    echo 'SKIP libggml-cuda SASS check (cuobjdump is missing)'
+    exit 0
+fi
+pkg=$(mktemp -d)
+trap 'rm -rf -- "$pkg"' EXIT
+tar --zstd -xf "$1" -C "$pkg" --strip-components=1 --wildcards '*/lib/libggml-cuda.so*'
+if ! sass=$(cuobjdump --list-elf "$pkg/lib/libggml-cuda.so"); then
+    echo 'FAIL libggml-cuda SASS check (cuobjdump failed)' >&2
+    exit 1
+fi
+for arch in 75 86 89 120; do
+    pattern=$arch
+    if [ "$arch" = 120 ]; then pattern='120a?'; fi
+    # Match the architecture suffix of each ELF record, not any part of its name.
+    if grep -Eq "^ELF file.*\.sm_${pattern}\.cubin$" <<< "$sass"; then
+        echo "PASS libggml-cuda SASS for sm_$arch"
+    else
+        echo "FAIL libggml-cuda missing SASS for sm_$arch" >&2
+        exit 1
+    fi
+done
+INNER
+
+check_sass() {
+    # The clean runtime image has no CUDA toolkit. The build image includes it.
+    if command -v cuobjdump >/dev/null && command -v zstd >/dev/null; then
+        bash "$SCRATCH/check-sass.sh" "$SCRATCH/package.tar.zst"
+    elif "$ENGINE" image inspect publicompute-build >/dev/null 2>&1; then
+        "$ENGINE" run --rm -v "$SCRATCH:/in:ro,Z" publicompute-build bash /in/check-sass.sh /in/package.tar.zst
+    else
+        echo 'SKIP libggml-cuda SASS check (cuobjdump unavailable without a local CUDA build image or host CUDA tools)'
+    fi
+}
+
+if "$ENGINE" run --rm -v "$SCRATCH:/in:ro,Z" docker.io/library/ubuntu:22.04 bash /in/check.sh > "$LOG" 2>&1 &&
+    check_sass >> "$LOG" 2>&1; then
     grep -E '^(PASS|SKIP)' "$LOG"
 else
     rc=$?

@@ -41,6 +41,7 @@ const FOLLOW_POLL: Duration = Duration::from_secs(10);
 /// Changes to the shared session state advance the tick counter to wake
 /// status followers. The same state holds the local pause switch.
 pub struct Live {
+    pub network: crate::network::Store,
     connected: AtomicBool,
     leases: AtomicU32,
     chain: Mutex<Option<String>>,
@@ -52,6 +53,7 @@ pub struct Live {
     #[cfg(all(test, unix))]
     after_rename: Mutex<Option<Box<dyn FnOnce() -> Result<()> + Send>>>,
     tick: watch::Sender<u64>,
+    pub changes: crate::model_change::Changes,
 }
 
 impl Live {
@@ -64,6 +66,7 @@ impl Live {
     pub fn open(data_dir: &Path) -> Result<Arc<Self>> {
         let file = PauseFile::open(data_dir)?;
         let mut live = Self::with_pause(file.read()?);
+        live.network = crate::network::Store::open(file.directory());
         live.pause_file = Some(file);
         Ok(Arc::new(live))
     }
@@ -72,11 +75,14 @@ impl Live {
     pub fn open(data_dir: &Path) -> Result<Arc<Self>> {
         let path = data_dir.join("paused.json");
         let paused = read_pause(fs::File::open(&path)).with_context(|| format!("read {}", path.display()))?;
-        Ok(Arc::new(Self::with_pause(paused)))
+        let mut live = Self::with_pause(paused);
+        live.network = crate::network::Store::open(Arc::new(data_dir.to_owned()));
+        Ok(Arc::new(live))
     }
 
     fn with_pause(paused: bool) -> Self {
         Self {
+            network: Default::default(),
             connected: AtomicBool::new(false),
             leases: AtomicU32::new(0),
             chain: Mutex::new(None),
@@ -88,6 +94,7 @@ impl Live {
             #[cfg(all(test, unix))]
             after_rename: Mutex::new(None),
             tick: watch::channel(0).0,
+            changes: Default::default(),
         }
     }
 
@@ -117,6 +124,10 @@ impl Live {
         }
     }
 
+    pub fn has_chain(&self) -> bool {
+        self.chain.lock().unwrap().is_some()
+    }
+
     pub fn is_paused(&self) -> bool {
         *self.paused.borrow()
     }
@@ -131,7 +142,14 @@ impl Live {
         let Ok(lock) = self.pause_lock.clone().try_lock_owned() else {
             return json!({"ok": false, "error": "busy", "text": "a pause state change is in progress"});
         };
+        let commands = self.changes.commands.clone().lock_owned().await;
+        if v {
+            if let Err(err) = self.changes.can_cancel() {
+                return json!({"ok": false, "error": "model_change_failed", "text": err.to_string()});
+            }
+        }
         let live = self.clone();
+        // Keep both locks through publication even if the request is cancelled.
         tokio::task::spawn_blocking(move || {
             let sync = if let Some(file) = &live.pause_file {
                 if let Err(err) = file.replace(v) {
@@ -149,7 +167,11 @@ impl Live {
             };
             // The new value is visible after rename, including when directory sync fails.
             live.publish_pause(v);
-            // The worker owns the lock through publication even if the request is cancelled.
+            if v {
+                live.changes.cancel();
+                live.notify();
+            }
+            drop(commands);
             drop(lock);
             match sync {
                 Ok(()) => json!({"ok": true}),
@@ -191,7 +213,7 @@ fn read_pause(file: io::Result<fs::File>) -> Result<bool> {
 }
 
 #[cfg(unix)]
-mod pause_file {
+pub(crate) mod pause_file {
     use super::*;
     use std::{io::Write, os::unix::fs::MetadataExt};
 
@@ -203,7 +225,7 @@ mod pause_file {
     const NAME: &str = "paused.json";
 
     pub(super) struct PauseFile {
-        dir: fs::File,
+        dir: Arc<fs::File>,
         path: PathBuf,
     }
 
@@ -218,40 +240,46 @@ mod pause_file {
                 unix_fs::fchmod(&dir, Mode::from_bits_truncate(0o700))?;
                 Ok(dir)
             })().with_context(|| format!("open data-dir {}", path.display()))?;
-            Ok(Self { dir, path: path.join(NAME) })
+            Ok(Self { dir: Arc::new(dir), path: path.join(NAME) })
+        }
+
+        pub(super) fn directory(&self) -> Arc<fs::File> {
+            self.dir.clone()
         }
 
         pub(super) fn read(&self) -> Result<bool> {
             let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-            let file = unix_fs::openat(&self.dir, NAME, flags, Mode::empty());
+            let file = unix_fs::openat(&*self.dir, NAME, flags, Mode::empty());
             read_pause(file.map(fs::File::from).map_err(io::Error::from))
                 .with_context(|| format!("read {}", self.path.display()))
         }
 
         pub(super) fn replace(&self, paused: bool) -> Result<()> {
-            let tmp = format!(".paused-{:016x}.tmp", rand::random::<u64>());
-            let mode = Mode::from_bits_truncate(0o600);
-            let save = || -> io::Result<()> {
-                let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC;
-                let mut output = fs::File::from(unix_fs::openat(&self.dir, &tmp, flags, mode)?);
-                let result = (|| -> io::Result<()> {
-                    unix_fs::fchmod(&output, mode)?;
-                    writeln!(output, "{paused}")?;
-                    output.sync_all()?;
-                    unix_fs::renameat(&self.dir, &tmp, &self.dir, NAME)?;
-                    Ok(())
-                })();
-                if result.is_err() {
-                    let _ = unix_fs::unlinkat(&self.dir, &tmp, AtFlags::empty());
-                }
-                result
-            };
-            save().with_context(|| format!("save pause state to {}", self.path.display()))
+            replace_state_file(&self.dir, NAME, if paused { b"true\n" } else { b"false\n" })
+                .with_context(|| format!("save pause state to {}", self.path.display()))
         }
 
         pub(super) fn sync(&self) -> Result<()> {
             self.dir.sync_all().with_context(|| format!("sync data-dir after replacing {}", self.path.display()))
         }
+    }
+
+    pub(crate) fn replace_state_file(dir: &fs::File, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let tmp = format!(".{name}-{:016x}.tmp", rand::random::<u64>());
+        let mode = Mode::from_bits_truncate(0o600);
+        let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC;
+        let mut output = fs::File::from(unix_fs::openat(dir, &tmp, flags, mode)?);
+        let result = (|| -> io::Result<()> {
+            unix_fs::fchmod(&output, mode)?;
+            output.write_all(bytes)?;
+            output.sync_all()?;
+            unix_fs::renameat(dir, &tmp, dir, name)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = unix_fs::unlinkat(dir, &tmp, AtFlags::empty());
+        }
+        result
     }
 }
 
@@ -312,6 +340,9 @@ struct Status {
     preference: PreferenceView,
     engine: &'static str,
     loaded_model: Option<String>,
+    loaded_quant: Option<String>,
+    download: Option<crate::model_change::DownloadView>,
+    model_error: Option<String>,
     active_leases: u32,
     chain_id: Option<String>,
     gpu: Option<GpuView>,
@@ -319,6 +350,7 @@ struct Status {
     gpu_lost_reason: Option<&'static str>,
     contribution: Option<ContributionView>,
     summary: Option<SummaryView>,
+    network: Option<crate::network::Reading>,
 }
 
 #[derive(Serialize, Clone)]
@@ -338,9 +370,17 @@ pub struct Control {
     pub gpu: Arc<Telemetria>,
     pub live: Arc<Live>,
     pub engine: watch::Receiver<EngineState>,
-    pub model: ModelRef,
-    pub model_path: Option<PathBuf>,
+    model: Mutex<ModelState>,
     last_change: Mutex<Option<Instant>>,
+    store: Option<Arc<crate::models::Store>>,
+}
+
+struct ModelState {
+    reference: ModelRef,
+    path: Option<PathBuf>,
+    error: Option<String>,
+    verifying: bool,
+    needs_repair: bool,
 }
 
 fn mode_name(m: PreferenceMode) -> &'static str {
@@ -401,23 +441,53 @@ impl Control {
         engine: watch::Receiver<EngineState>,
         model: ModelRef,
         model_path: Option<PathBuf>,
-    ) -> Arc<Self> {
-        Arc::new(Self { contribution, gpu, live, engine, model, model_path, last_change: Mutex::new(None) })
+    ) -> Self {
+        Self {
+            contribution, gpu, live, engine, last_change: Mutex::new(None), store: None,
+            model: Mutex::new(ModelState {
+                reference: model, path: model_path, error: None, verifying: false, needs_repair: false,
+            }),
+        }
     }
 
-    /// Selection is limited to the weights the agent has loaded.
+    pub fn with_models(mut self, store: Option<Arc<crate::models::Store>>, error: Option<String>) -> Arc<Self> {
+        self.store = store;
+        self.model.get_mut().unwrap().error = error;
+        Arc::new(self)
+    }
+
+    pub fn verifying_weights(&self, verifying: bool) {
+        self.model.lock().unwrap().verifying = verifying;
+        self.live.notify();
+    }
+
+    pub fn model_verified(&self, reference: ModelRef, path: Option<PathBuf>, error: Option<String>, needs_repair: bool) {
+        *self.model.lock().unwrap() = ModelState { reference, path, error, verifying: false, needs_repair };
+        self.live.notify();
+    }
+
     fn models(&self) -> Vec<LocalModel> {
-        if self.model.model_id.is_empty() {
-            return vec![];
-        }
-        let bytes = self.model_path.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len()).unwrap_or(0);
         let engine = *self.engine.borrow();
-        let loaded = model_loaded(engine, self.gpu.loss().is_none());
-        vec![LocalModel { id: self.model.model_id.clone(), quant: self.model.quantization.clone(), state: if loaded { "ready" } else { engine_name(engine) }, loaded, bytes }]
+        let active = self.model.lock().unwrap();
+        let model = &active.reference;
+        let loaded = !active.needs_repair && model_loaded(engine, self.gpu.loss().is_none());
+        let mut models = Vec::new();
+        if !model.model_id.is_empty() {
+            let bytes = active.path.as_ref().and_then(|p| std::fs::symlink_metadata(p).ok()).filter(|m| m.is_file()).map(|m| m.len()).unwrap_or(0);
+            models.push(LocalModel { id: model.model_id.clone(), quant: model.quantization.clone(),
+                state: if loaded { "ready" } else { active.engine_name(engine) }, loaded, bytes });
+        }
+        if self.store.is_some() {
+            models.extend(crate::models::MANIFEST.iter()
+                .filter(|m| m.id != model.model_id || m.quant != model.quantization)
+                .map(|m| LocalModel { id: m.id.clone(), quant: m.quant.clone(), state: "available", loaded: false, bytes: m.bytes }));
+        }
+        models
     }
 
     fn status(&self) -> Status {
         let engine = *self.engine.borrow();
+        let model = self.model.lock().unwrap();
         let p = self.contribution.preference();
         let gpu = self.gpu.letture().into_iter().next().map(|l| GpuView {
             name: l.name,
@@ -426,6 +496,7 @@ impl Control {
             temperature_celsius: l.temperature,
         });
         let gpu_loss = self.gpu.loss();
+        let loaded = !model.needs_repair && !model.reference.model_id.is_empty() && model_loaded(engine, gpu_loss.is_none());
         Status {
             version: env!("CARGO_PKG_VERSION"),
             connected: self.live.connected.load(Ordering::Relaxed),
@@ -436,9 +507,11 @@ impl Control {
                 quant: p.model.as_ref().map(|m| m.quant.clone()),
                 revision: p.revision,
             },
-            engine: engine_name(engine),
-            loaded_model: (!self.model.model_id.is_empty() && model_loaded(engine, gpu_loss.is_none()))
-                .then(|| self.model.model_id.clone()),
+            engine: model.engine_name(engine),
+            loaded_model: loaded.then(|| model.reference.model_id.clone()),
+            loaded_quant: loaded.then(|| model.reference.quantization.clone()),
+            download: self.live.changes.view(),
+            model_error: model.error.clone(),
             active_leases: self.live.leases.load(Ordering::Relaxed),
             chain_id: self.live.chain.lock().unwrap().clone(),
             gpu,
@@ -446,45 +519,75 @@ impl Control {
             gpu_lost_reason: gpu_loss.map(crate::gpu::ReadFailure::reason),
             contribution: self.contribution.state().as_ref().map(contribution_view),
             summary: self.contribution.summary().as_ref().map(summary_view),
+            network: self.live.network.enabled().then(|| self.live.network.reading().unwrap_or_default()),
         }
     }
 
-    fn set_preference(&self, mode: &str, model: Option<String>, quant: Option<String>) -> Result<Value, Refusal> {
+    async fn set_preference(&self, mode: &str, model: Option<String>, quant: Option<String>, reply: Option<tokio::sync::oneshot::Receiver<()>>) -> Result<Value, Refusal> {
         let bad = |t: &str| Refusal("bad_request", t.to_string());
-        let (modo, scelto) = match mode {
+        let internal = |e: anyhow::Error| Refusal("model_change_failed", format!("{e:#}"));
+        let _commands = self.live.changes.commands.lock().await;
+        let mut last = self.last_change.lock().unwrap();
+        let (mode, selected) = match mode {
             "free" => (PreferenceMode::Free, None),
             "use" => {
                 let id = model.ok_or_else(|| bad("mode use needs a model"))?;
-                let local = self.models();
-                let found = local.iter().find(|m| m.id == id && quant.as_deref().is_none_or(|q| q == m.quant));
-                let Some(found) = found else {
-                    return Err(Refusal("not_installed", format!("model {id} is not installed on this machine")));
+                let (active_id, active_quant, needs_repair) = {
+                    let active = self.model.lock().unwrap();
+                    (active.reference.model_id.clone(), active.reference.quantization.clone(), active.needs_repair)
                 };
-                (PreferenceMode::Usage, Some(ModelSelection { id: found.id.clone(), quant: found.quant.clone() }))
+                if needs_repair || id != active_id || quant.as_ref().is_some_and(|q| *q != active_quant) {
+                    let Some((store, model)) = self.store.as_ref().zip(crate::models::find(&id, quant.as_deref())) else {
+                        return Err(Refusal("not_installed", format!("model {id} is not installed on this machine")));
+                    };
+                    let (installed, missing) = self.live.changes.request(&self.live, store, model, reply).map_err(internal)?;
+                    return Ok(if installed {
+                        json!({"ok": true, "state": "switching", "text": format!("switching to {id}")})
+                    } else {
+                        let gib = crate::models::gib(missing);
+                        json!({"ok": true, "state": "downloading", "missing_bytes": missing,
+                            "text": format!("downloading {id} ({gib:.1} GiB remaining), see publicompute status")})
+                    });
+                }
+                (PreferenceMode::Usage, Some(ModelSelection { id, quant: active_quant }))
             }
             other => return Err(Refusal("bad_request", format!("unknown mode \"{other}\": use or free"))),
         };
-        // Apply the cooldown after validation so rejected requests do not consume it.
-        let mut last = self.last_change.lock().unwrap();
-        if last.is_some_and(|t| t.elapsed() < PREFERENCE_GAP) {
+        let pending = self.live.changes.can_cancel().map_err(internal)?;
+        // Allow the host to override a pending switch even during the preference cooldown.
+        if !pending && last.is_some_and(|t| t.elapsed() < PREFERENCE_GAP) {
             return Err(Refusal("too_soon", "preference changed a moment ago: wait a few seconds".into()));
         }
-        let p = self.contribution.imposta(modo, scelto).map_err(|e| Refusal("internal", format!("{e:#}")))?;
+        let text = selected.as_ref().map_or_else(|| "FARM mode: set".into(), |m| format!("using {}", m.id));
+        let p = self.contribution.imposta(mode, selected).map_err(internal)?;
+        self.live.changes.cancel();
         *last = Some(Instant::now());
         self.live.notify();
-        Ok(json!({"ok": true, "revision": p.revision}))
+        Ok(json!({"ok": true, "revision": p.revision, "text": text}))
     }
 
     /// Handle requests that complete with a single reply.
     #[cfg(unix)]
-    async fn handle(&self, req: Request) -> Value {
+    async fn handle(&self, req: Request, reply: Option<tokio::sync::oneshot::Receiver<()>>) -> Value {
         let refused = |r: Refusal| json!({"ok": false, "error": r.0, "text": r.1});
         match req {
             Request::Status => json!({"ok": true, "status": self.status()}),
             Request::Models => json!({"ok": true, "models": self.models()}),
             Request::Pause { active } => self.live.save_pause(active).await,
-            Request::Preference { mode, model, quant } => self.set_preference(&mode, model, quant).unwrap_or_else(refused),
+            Request::Preference { mode, model, quant } => self.set_preference(&mode, model, quant, reply).await.unwrap_or_else(refused),
             Request::Follow => unreachable!("follow is served by `follow`"),
+        }
+    }
+}
+
+impl ModelState {
+    fn engine_name(&self, engine: EngineState) -> &'static str {
+        if self.verifying {
+            "verifying weights"
+        } else if self.needs_repair {
+            "weights error"
+        } else {
+            engine_name(engine)
         }
     }
 }
@@ -662,6 +765,7 @@ mod unix {
         let mut reader = BufReader::new(r);
         let mut line = Vec::with_capacity(MAX_REQUEST_LINE);
         while let Ok(Ok(true)) = time::timeout(IO_TIMEOUT, read_request(&mut reader, &mut line)).await {
+            let (sent, ready) = tokio::sync::oneshot::channel();
             let reply = match serde_json::from_slice::<Request>(&line) {
                 Ok(Request::Follow) => {
                     let Ok(_slot) = followers.try_acquire() else {
@@ -677,10 +781,12 @@ mod unix {
                     }
                     return;
                 }
-                Ok(req) => control.handle(req).await,
+                Ok(req) => control.handle(req, Some(ready)).await,
                 Err(e) => json!({"ok": false, "error": "bad_request", "text": e.to_string()}),
             };
-            if send(&mut w, &reply).await.is_err() {
+            let result = send(&mut w, &reply).await;
+            let _ = sent.send(());
+            if result.is_err() {
                 return;
             }
         }
@@ -746,7 +852,7 @@ mod tests {
         let contribution = Contribution::open(dir, pref).unwrap();
         let (engine_tx, engine_rx) = watch::channel(EngineState::Ready);
         let model = ModelRef { model_id: "qwen".into(), quantization: "Q4_K_M".into(), weights_sha256: vec![] };
-        let control = Control::new(contribution, Arc::new(Telemetria::default()), Live::new(), engine_rx, model, Some(dir.join("model.gguf")));
+        let control = Arc::new(Control::new(contribution, Arc::new(Telemetria::default()), Live::new(), engine_rx, model, Some(dir.join("model.gguf"))));
         (control, engine_tx)
     }
 
@@ -982,6 +1088,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pause_and_farm_cancel_a_pending_download() {
+        let store = crate::models::tests::fixture_store("control-model-cancel");
+        let model = crate::models::find("qwen3.5-9b", None).unwrap();
+        fs::File::create(store.partial(model)).unwrap().set_len(model.bytes - 1).unwrap();
+        let dir = super::pause_tests::data_dir("control-model-cancel");
+        let (test, _) = test_control(&dir);
+        let control = Control::new(test.contribution.clone(), test.gpu.clone(), test.live.clone(),
+            test.engine.clone(), test.model.lock().unwrap().reference.clone(), None).with_models(Some(store), None);
+        for command in [
+            Request::Pause { active: true },
+            Request::Preference { mode: "free".into(), model: None, quant: None },
+        ] {
+            let (sent, ready) = tokio::sync::oneshot::channel();
+            let response = control.handle(Request::Preference {
+                mode: "use".into(), model: Some("qwen3.5-9b".into()), quant: None,
+            }, Some(ready)).await;
+            assert_eq!(response["state"], "downloading");
+            assert_eq!(control.live.changes.inventory().unwrap().status(), publicompute_proto::node::ModelStatus::Downloading);
+            assert_eq!(control.handle(command, None).await["ok"], true);
+            assert!(control.status().download.is_none());
+            let _ = sent.send(());
+        }
+        assert!(control.live.is_paused());
+        assert_eq!(control.contribution.preference().modo, PreferenceMode::Free);
+    }
+
+    #[tokio::test]
     async fn pause_toggles() {
         let r = rig("pause");
         let mut c = Client::connect(&r.sock).await;
@@ -1061,7 +1194,7 @@ mod pause_tests {
         let contribution = Contribution::open(&dir, Preference { modo: PreferenceMode::Free, model: None, revision: 0 }).unwrap();
         let (_engine, engine_rx) = watch::channel(EngineState::Ready);
         let control = Control::new(contribution, Arc::new(Telemetria::default()), live.clone(), engine_rx, ModelRef::default(), None);
-        assert_eq!(control.handle(Request::Pause { active: true }).await["ok"], true);
+        assert_eq!(control.handle(Request::Pause { active: true }, None).await["ok"], true);
 
         let rx = live.pause_rx();
         let tick = live.tick.subscribe();
@@ -1069,7 +1202,7 @@ mod pause_tests {
         let backup = dir.join("paused.bak");
         fs::rename(&path, &backup).unwrap();
         fs::create_dir(&path).unwrap();
-        let reply = control.handle(Request::Pause { active: false }).await;
+        let reply = control.handle(Request::Pause { active: false }, None).await;
         assert_eq!(reply["ok"], false);
         assert_eq!(reply["error"], "internal");
         assert!(live.is_paused());
@@ -1085,6 +1218,41 @@ mod pause_tests {
     }
 
     #[tokio::test]
+    async fn failed_pause_and_farm_writes_preserve_a_pending_download() {
+        let dir = data_dir("model-cancel-write-failure");
+        let live = Live::open(&dir).unwrap();
+        let contribution = Contribution::open(&dir, Preference {
+            modo: PreferenceMode::Usage, model: None, revision: 0,
+        }).unwrap();
+        let (_engine, engine_rx) = watch::channel(EngineState::Ready);
+        let store = crate::models::tests::fixture_store("model-cancel-write-failure");
+        let model = crate::models::find("qwen3.5-9b", None).unwrap();
+        fs::File::create(store.partial(model)).unwrap().set_len(model.bytes - 1).unwrap();
+        let control = Control::new(contribution.clone(), Arc::new(Telemetria::default()), live.clone(), engine_rx, ModelRef::default(), None)
+            .with_models(Some(store), None);
+        let (sent, ready) = tokio::sync::oneshot::channel();
+        let reply = control.handle(Request::Preference { mode: "use".into(), model: Some(model.id.clone()), quant: None }, Some(ready)).await;
+        assert_eq!(reply["state"], "downloading");
+        let download = live.changes.inventory();
+
+        fs::create_dir(dir.join("paused.json")).unwrap();
+        assert_eq!(control.handle(Request::Pause { active: true }, None).await["error"], "internal");
+        assert!(!live.is_paused());
+        assert_eq!(live.changes.inventory(), download);
+
+        fs::create_dir(dir.join("contributo.json.tmp")).unwrap();
+        let farm = Request::Preference { mode: "free".into(), model: None, quant: None };
+        assert_eq!(control.handle(farm, None).await["error"], "model_change_failed");
+        assert_eq!(contribution.preference().modo, PreferenceMode::Usage);
+        assert_eq!(live.changes.inventory(), download);
+
+        fs::remove_dir(dir.join("paused.json")).unwrap();
+        assert_eq!(control.handle(Request::Pause { active: true }, None).await["ok"], true);
+        assert!(live.changes.inventory().is_none());
+        let _ = sent.send(());
+    }
+
+    #[tokio::test]
     async fn cancelled_pause_keeps_worker_lock_until_publication() {
         use tokio::{sync::oneshot, time::timeout};
 
@@ -1092,7 +1260,7 @@ mod pause_tests {
         let live = Live::open(&dir).unwrap();
         let contribution = Contribution::open(&dir, Preference { modo: PreferenceMode::Free, model: None, revision: 0 }).unwrap();
         let (_engine, engine_rx) = watch::channel(EngineState::Ready);
-        let control = Control::new(contribution, Arc::new(Telemetria::default()), live.clone(), engine_rx, ModelRef::default(), None);
+        let control = Arc::new(Control::new(contribution, Arc::new(Telemetria::default()), live.clone(), engine_rx, ModelRef::default(), None));
         let (renamed, wait) = oneshot::channel();
         let (resume, gate) = std::sync::mpsc::channel();
         *live.after_rename.lock().unwrap() = Some(Box::new(move || {
@@ -1103,26 +1271,26 @@ mod pause_tests {
         let mut rx = live.pause_rx();
         let pause = tokio::spawn({
             let control = control.clone();
-            async move { control.handle(Request::Pause { active: true }).await }
+            async move { control.handle(Request::Pause { active: true }, None).await }
         });
         timeout(Duration::from_secs(2), wait).await.unwrap().unwrap();
-        let reply = timeout(Duration::from_secs(2), control.handle(Request::Pause { active: false })).await.unwrap();
+        let reply = timeout(Duration::from_secs(2), control.handle(Request::Pause { active: false }, None)).await.unwrap();
         assert_eq!(reply["error"], "busy");
         assert_eq!(fs::read_to_string(dir.join("paused.json")).unwrap(), "true\n");
-        let status = control.handle(Request::Status).await;
+        let status = control.handle(Request::Status, None).await;
         assert_eq!(status["status"]["paused"], false);
         assert!(!rx.has_changed().unwrap());
 
         pause.abort();
         assert!(pause.await.unwrap_err().is_cancelled());
-        let reply = timeout(Duration::from_secs(2), control.handle(Request::Pause { active: false })).await.unwrap();
+        let reply = timeout(Duration::from_secs(2), control.handle(Request::Pause { active: false }, None)).await.unwrap();
         assert_eq!(reply["error"], "busy");
         resume.send(()).unwrap();
         drop(timeout(Duration::from_secs(2), live.pause_lock.lock()).await.unwrap());
         assert!(rx.has_changed().unwrap());
         assert!(*rx.borrow_and_update());
-        assert_eq!(control.handle(Request::Status).await["status"]["paused"], true);
-        assert_eq!(control.handle(Request::Pause { active: false }).await["ok"], true);
+        assert_eq!(control.handle(Request::Status, None).await["status"]["paused"], true);
+        assert_eq!(control.handle(Request::Pause { active: false }, None).await["ok"], true);
         assert!(rx.has_changed().unwrap());
         assert!(!*rx.borrow());
         assert_eq!(fs::read_to_string(dir.join("paused.json")).unwrap(), "false\n");
@@ -1210,7 +1378,7 @@ mod pause_tests {
         let mut rx = live.pause_rx();
         for active in [true, false] {
             *live.after_rename.lock().unwrap() = Some(Box::new(|| anyhow::bail!("sync data-dir failed")));
-            let reply = control.handle(Request::Pause { active }).await;
+            let reply = control.handle(Request::Pause { active }, None).await;
             assert_eq!(reply["ok"], false);
             assert_eq!(reply["error"], "durability_uncertain");
             assert_eq!(reply["text"], "pause state applied but durability is uncertain");

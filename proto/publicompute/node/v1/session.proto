@@ -35,6 +35,8 @@ message NodeMessage {
     ContributionPreference contribution = 21;
     ModelDirectiveStatus model_directive_status = 22;
     Leaving leaving = 23;
+    PeerProbeReady peer_probe_ready = 24;
+    PeerProbeResult peer_probe_result = 25;
   }
 }
 
@@ -58,6 +60,7 @@ message CoordinatorMessage {
     ModelDirective model_directive = 24;
     ContributionSummary contribution_summary = 25;
     LeaveOk leave_ok = 26;
+    PeerProbe peer_probe = 27;
   }
 }
 
@@ -98,6 +101,8 @@ message Welcome {
   bytes capability_pub = 6;
   // If absent, the node withholds message bodies that require minor version 2.
   publicompute.common.v1.ProtocolVersion protocol_version = 7;
+  // Allows the agent to send the peer probe replies it advertised in Hello.
+  bool peer_probes = 8;
 }
 
 message Goodbye {
@@ -127,6 +132,7 @@ message Heartbeat {
   google.protobuf.Timestamp node_time = 1;
   Telemetry telemetry = 2;
   repeated LeaseProgress leases = 3;
+  NetworkInfo network = 4;
 }
 
 enum Availability {
@@ -200,6 +206,32 @@ message MeasurementPong {
   bytes nonce = 2;
 }
 
+// Prepare the receiver before sending the same nonce to the dialer.
+message PeerProbe {
+  string peer_id = 1;
+  bytes nonce = 2;
+  google.protobuf.Timestamp expires_at = 3;
+  bool receive = 4;
+}
+
+message PeerProbeReady {
+  bytes nonce = 1;
+}
+
+enum PeerProbePath {
+  PEER_PROBE_PATH_UNSPECIFIED = 0;
+  PEER_PROBE_PATH_DIRECT = 1;
+  PEER_PROBE_PATH_RELAY = 2;
+}
+
+message PeerProbeResult {
+  bytes nonce = 1;
+  // Unspecified also represents a failed or interrupted probe.
+  PeerProbePath path = 2;
+  uint32 median_micros = 3;
+  uint32 p95_micros = 4;
+}
+
 // The node initiates the connection to the measurement endpoint and presents
 // the token there. This lets an endpoint measure latency without dialing the node.
 message ProbeRequest {
@@ -245,6 +277,8 @@ enum AgentFeature {
   AGENT_FEATURE_ENGINE_SWITCH = 5;
   // The agent accepts StageAssign.
   AGENT_FEATURE_STAGES = 6;
+  AGENT_FEATURE_NETWORK_MEASUREMENT = 7;
+  AGENT_FEATURE_PEER_ECHO = 8;
 }
 
 enum ContributionMode {

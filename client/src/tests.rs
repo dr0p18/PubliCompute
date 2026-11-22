@@ -30,6 +30,25 @@ fn sample() -> Status {
     serde_json::from_value(sample_json()).unwrap()
 }
 
+#[test]
+fn tui_clears_the_switch_notice_only_after_the_requested_weights_are_loaded() {
+    let mut status = sample_json();
+    let mut pending = Some(("qwen3.6-35b-a3b".into(), "UD-Q4_K_XL".into()));
+    let mut notice = "switching to qwen3.6-35b-a3b".to_string();
+    crate::clear_finished_switch(&serde_json::from_value(status.clone()).unwrap(), &mut pending, &mut notice);
+    assert!(!notice.is_empty());
+
+    status["loaded_model"] = json!("qwen3.6-35b-a3b");
+    status["loaded_quant"] = json!("Q4_K_M");
+    crate::clear_finished_switch(&serde_json::from_value(status.clone()).unwrap(), &mut pending, &mut notice);
+    assert!(!notice.is_empty());
+
+    status["loaded_quant"] = json!("UD-Q4_K_XL");
+    crate::clear_finished_switch(&serde_json::from_value(status).unwrap(), &mut pending, &mut notice);
+    assert!(notice.is_empty());
+    assert!(pending.is_none());
+}
+
 fn with_reason(reason: &str, free_seat: bool) -> Status {
     let mut s = sample();
     let c = s.contribution.as_mut().unwrap();
@@ -93,6 +112,10 @@ fn render_fits_height_and_keeps_keys() {
     let lines = render::render(&sample(), 80, 6, 0, "", false);
     assert_eq!(lines.len(), 6);
     assert_eq!(lines.last().unwrap(), render::KEYS);
+    let notice = "downloading medium (20.8 GiB remaining), see publicompute status";
+    let lines = render::render(&sample(), 80, 6, 0, notice, false);
+    assert_eq!(lines.len(), 6);
+    assert!(lines.iter().any(|line| line.trim() == notice));
 }
 
 #[test]
@@ -452,11 +475,11 @@ fn command_pause_and_start() {
 #[test]
 fn command_pause_and_start_already_there() {
     let p = temp_socket("pause-again");
-    let rx = fake_agent_seq(&p, vec![status_with_pause(true)]);
+    let rx = fake_agent_seq(&p, vec![status_with_pause(true), json!({"ok": true})]);
     let out = command(&Socket::Explicit(p.clone()), &["pause".into()]).unwrap();
     assert!(out.starts_with("already paused") && out.contains("publicompute start"));
     assert_eq!(rx.recv().unwrap(), json!({"op": "status"}));
-    assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err());
+    assert_eq!(rx.recv().unwrap(), json!({"op": "pause", "active": true}));
 
     let p = temp_socket("start-again");
     fake_agent_seq(&p, vec![status_with_pause(false)]);
@@ -511,4 +534,72 @@ fn uninstall_without_agent_still_runs_script() {
     .unwrap();
     assert_eq!(fs::read_to_string(&marker).unwrap(), "done");
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn status_displays_network_and_checks_both_rates_and_age() {
+    let mut status = sample();
+    let original = status_line(&status).0;
+    assert_eq!(status_text(&status, 1_000_000), original);
+
+    let now = 1_000_000;
+    status.network = Some(Network {
+        download_bits_per_sec: 105_000_000,
+        upload_bits_per_sec: 100_000_000,
+        bandwidth_measured_at: Some(now - 8 * 86400),
+        coordinator_rtt_micros: Some(14_200),
+    });
+    let measured = status_text(&status, now);
+    assert!(measured.ends_with("network: 105.0/100.0 Mbit/s, 14.2 ms"));
+    let warning = "chains: below the network standard (100 Mbit/s up and down)";
+    assert!(status_text(&status, now + 1).ends_with(warning));
+
+    status.network.as_mut().unwrap().download_bits_per_sec = 99_999_999;
+    assert!(status_text(&status, now).ends_with(warning));
+    status.network.as_mut().unwrap().download_bits_per_sec = 100_000_000;
+    status.network.as_mut().unwrap().upload_bits_per_sec = 99_999_999;
+    assert!(status_text(&status, now).ends_with(warning));
+}
+
+#[test]
+fn use_prints_the_agent_message() {
+    for (state, text) in [
+        ("downloading", "downloading medium (20.8 GiB remaining), see publicompute status"),
+        ("switching", "switching to medium"),
+    ] {
+        let path = temp_socket(state);
+        fake_agent(&path, json!({"ok": true, "state": state, "text": text}));
+        assert_eq!(command(&Socket::Explicit(path), &["use".into(), "medium".into()]).unwrap(), text);
+    }
+}
+
+#[test]
+fn version_accepts_an_agent_version_without_other_status_fields() {
+    for alias in ["--version", "version"] {
+        let path = temp_socket(alias);
+        let received = fake_agent(&path, json!({"ok": true, "status": {"version": "0.8.1-beta"}}));
+        assert_eq!(command(&Socket::Explicit(path), &[alias.into()]).unwrap(),
+            concat!("publicompute ", env!("CARGO_PKG_VERSION"), "\npublicompute-agent 0.8.1-beta"));
+        assert_eq!(received.recv().unwrap(), json!({"op": "status"}));
+    }
+}
+
+#[test]
+fn version_succeeds_without_an_agent() {
+    let path = temp_socket("version-offline");
+    assert_eq!(command(&Socket::Explicit(path), &["--version".into()]).unwrap(),
+        concat!("publicompute ", env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn status_displays_model_progress_and_failure() {
+    let mut status = sample_json();
+    status["download"] = json!({"id":"medium", "state":"downloading", "bytes":1073741824_u64, "total_bytes":2147483648_u64});
+    let s: Status = serde_json::from_value(status.clone()).unwrap();
+    assert_eq!(s.download_line().as_deref(), Some("download: medium 1.0/2.0 GiB"));
+    assert!(render::render(&s, 80, 30, 0, "", false).iter().any(|line| line.contains("download: medium 1.0/2.0 GiB")));
+    status["download"]["state"] = json!("failed");
+    status["download"]["error"] = json!("SHA-256 mismatch");
+    let s: Status = serde_json::from_value(status).unwrap();
+    assert_eq!(s.download_line().as_deref(), Some("download: medium failed: SHA-256 mismatch"));
 }

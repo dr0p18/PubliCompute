@@ -29,8 +29,10 @@ fn decodes_go_golden_stream() {
     };
     assert_eq!(hello.seq, 1);
     let Some(node::node_message::Body::Hello(h)) = hello.body else { panic!("expected Hello") };
-    assert_eq!(h.agent_version, env!("CARGO_PKG_VERSION"));
+    // The fixture represents an older peer and stays fixed across releases.
+    assert_eq!(h.agent_version, "0.1.1");
     let hw = h.hardware.unwrap();
+    assert!(hw.network.is_none());
     assert_eq!(hw.gpus[0].vram_bytes, 24 << 30);
     assert_eq!(hw.gpus[0].vendor(), node::GpuVendor::Nvidia);
     assert_eq!(hw.policy.unwrap().electricity_price_per_kwh.unwrap().micros, 300_000);
@@ -162,5 +164,7 @@ fn hello_ignores_unknown_fields_and_defaults_missing_fields() {
     assert!(new.contribution.is_none());
     assert!(new.features.is_empty());
     // A missing version decodes as None.
-    assert!(node::Welcome::decode(&b""[..]).unwrap().protocol_version.is_none());
+    let welcome = node::Welcome::decode(&b""[..]).unwrap();
+    assert!(welcome.protocol_version.is_none());
+    assert!(!welcome.peer_probes);
 }

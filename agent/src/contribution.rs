@@ -97,8 +97,7 @@ impl Contribution {
         self.tx.borrow().clone()
     }
 
-    /// Only one GGUF is installed. Carry a saved USE preference over to it
-    /// when an upgrade changes the model or its quantization.
+    /// Carry a saved USE preference over to the weights this process serves.
     pub fn align_model(&self, selected: ModelSelection) -> Result<()> {
         let saved = self.preference();
         if saved.modo == PreferenceMode::Usage && saved.model.as_ref() != Some(&selected) {

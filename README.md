@@ -35,6 +35,8 @@ rough edges, and tell us about them in [GitHub issues](https://github.com/dr0p18
 
 - **NVIDIA GPUs with 8 GB or more**, Turing (RTX 20) and newer.
 - **Linux x86_64** today. Windows is currently a work in progress.
+- **NVIDIA driver 535 or newer** (570 or newer for RTX 50 cards) and a **CPU with AVX2**. The
+  installer checks both before downloading anything.
 - **A decent internet connection**: about 100 Mbit/s up and down, and under
   25 ms to the other nodes. Chains are generally built inside one region to
   keep latency down.
@@ -54,11 +56,14 @@ to another account.
 
 ```sh
 publicompute status            # what your card is doing, credits, Chain
-publicompute use <model>       # pick the model you want to use
+publicompute use <model>       # pick the model you want to use, downloads it if missing
 publicompute farm              # FARM mode: the scheduler decides
 publicompute pause             # leave the network
 publicompute start             # resume
 publicompute uninstall         # remove everything, keep or delete the models
+publicompute login             # sign in to chat from the terminal
+publicompute chat              # chat with your model, or: publicompute chat "question"
+publicompute --version         # client and agent versions
 ```
 
 ## So, what can I do with this?

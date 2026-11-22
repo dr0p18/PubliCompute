@@ -127,6 +127,7 @@ fi
 if [ "$keep" = 1 ] && [ -d "$state/models" ] && [ ! -L "$state/models" ]; then
     find "$state" -mindepth 1 -maxdepth 1 ! -name models -exec rm -rf -- {} +
     require_unmounted "$state"
+    find "$state/models" -mindepth 1 -maxdepth 1 \( -name '*.part' -o -name verified.json \) -exec rm -rf -- {} +
     chown -hR root:root "$state"
     chmod 0700 "$state"
     printf 'Models kept in %s/models.\n' "$state"

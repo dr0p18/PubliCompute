@@ -1,6 +1,7 @@
 //! An interactive terminal opens a live view when invoked without arguments.
-//! Commands and non-interactive invocations print one line and return a status code.
+//! Agent commands return a status line and chat streams the answer directly.
 
+mod chat;
 mod render;
 mod sock;
 mod status;
@@ -25,7 +26,7 @@ use sock::Socket;
 use status::Status;
 
 const CHAT_URL: &str = "https://publicompute.com/chat";
-const USAGE: &str = "usage: publicompute [--data-dir DIR | --socket FILE] [status [--json] | use <model> [--quant Q] | farm | pause | start | uninstall [--keep-models | --remove-models]]";
+const USAGE: &str = "usage: publicompute [--data-dir DIR | --socket FILE] [--version | version | status [--json] | use <model> [--quant Q] | farm | pause | start | uninstall [--keep-models | --remove-models] | login | logout | chat [--model ID] [--api URL] [\"question\"]]";
 const UNINSTALLER: &str = "/opt/publicompute-agent/uninstall.sh";
 
 fn main() {
@@ -49,13 +50,18 @@ fn run(args: Vec<String>) -> i32 {
             }
         };
     }
-    match command(&socket, &rest) {
-        Ok(out) => {
+    let result = match rest.first().map(String::as_str) {
+        Some("login") if rest.len() == 1 => chat::login(),
+        Some("logout") if rest.len() == 1 => chat::logout(),
+        Some("chat") => chat::run(&socket, &rest[1..]),
+        _ => command(&socket, &rest).map(|out| {
             if !out.is_empty() {
                 println!("{out}");
             }
-            0
-        }
+        }),
+    };
+    match result {
+        Ok(()) => 0,
         Err(e) => {
             eprintln!("error: {e}");
             1
@@ -70,6 +76,11 @@ fn parse_args(args: Vec<String>) -> Result<(Socket, Vec<String>), String> {
     let mut rest = Vec::new();
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
+        if a == "--" && rest.first().is_some_and(|command| command == "chat") {
+            rest.push(a);
+            rest.extend(it);
+            break;
+        }
         match a.as_str() {
             "--data-dir" => dir = Some(PathBuf::from(it.next().ok_or("--data-dir needs a value")?)),
             "--socket" => socket = Some(PathBuf::from(it.next().ok_or("--socket needs a value")?)),
@@ -93,7 +104,11 @@ fn command_with_uninstaller(
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
     match a.as_slice() {
         ["--help"] | ["-h"] => Ok(USAGE.into()),
-        [] | ["status"] => Ok(status::status_line(&sock::get_status(socket)?).0),
+        ["--version"] | ["version"] => Ok(version(socket)),
+        [] | ["status"] => {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            Ok(status::status_text(&sock::get_status(socket)?, now))
+        }
         ["status", "--json"] => {
             let v = sock::request(socket, &serde_json::json!({"op": "status"}))?;
             Ok(v["status"].to_string())
@@ -118,6 +133,9 @@ fn command_with_uninstaller(
 /// already in that state, instead of silently doing nothing.
 fn switch_pause(socket: &Socket, pause: bool) -> Result<String, String> {
     if sock::get_status(socket)?.paused == pause {
+        if pause {
+            sock::set_pause(socket, true)?;
+        }
         let notice = if pause {
             "already paused: run `publicompute start` to rejoin the network"
         } else {
@@ -153,9 +171,35 @@ fn run_uninstaller(command: &mut Command, args: &[String]) -> Result<(), String>
     Ok(())
 }
 
+fn version(socket: &Socket) -> String {
+    let mut text = concat!("publicompute ", env!("CARGO_PKG_VERSION")).to_string();
+    if let Ok(reply) = sock::request(socket, &serde_json::json!({"op": "status"})) {
+        if let Some(version) = reply["status"]["version"].as_str() {
+            text.push_str(&format!("\npublicompute-agent {version}"));
+        }
+    }
+    text
+}
+
 fn use_model(socket: &Socket, model: &str, quant: Option<&str>) -> Result<String, String> {
-    sock::set_preference(socket, Some(model), quant)?;
-    Ok(format!("using {model}"))
+    let reply = sock::set_preference(socket, Some(model), quant)?;
+    Ok(use_reply_text(&reply, model))
+}
+
+fn use_reply_text(reply: &serde_json::Value, model: &str) -> String {
+    // Older agents acknowledge successful preferences without a message.
+    reply["text"].as_str().map_or_else(|| format!("using {model}"), str::to_owned)
+}
+
+fn clear_finished_switch(status: &Status, pending: &mut Option<(String, String)>, notice: &mut String) {
+    if let Some((id, quant)) = pending {
+        if status.download.is_none() && status.loaded_model.as_ref() == Some(id)
+            && status.loaded_quant.as_ref().is_none_or(|loaded| loaded == quant)
+        {
+            *pending = None;
+            notice.clear();
+        }
+    }
 }
 
 enum Msg {
@@ -248,6 +292,7 @@ fn interactive(socket: &Socket) -> Result<(), String> {
     let mut status: Option<Status> = None;
     let mut down = String::new();
     let mut notice = String::new();
+    let mut pending_switch = None;
     let mut picking: Vec<sock::LocalModel> = Vec::new();
 
     loop {
@@ -260,7 +305,10 @@ fn interactive(socket: &Socket) -> Result<(), String> {
         }
 
         match rx.recv() {
-            Ok(Msg::Status(s)) => status = Some(s),
+            Ok(Msg::Status(s)) => {
+                clear_finished_switch(&s, &mut pending_switch, &mut notice);
+                status = Some(s);
+            }
             Ok(Msg::Down(why)) => {
                 status = None;
                 down = why;
@@ -276,7 +324,12 @@ fn interactive(socket: &Socket) -> Result<(), String> {
                             Some(d) => {
                                 let m = &picking[d as usize - 1];
                                 match sock::set_preference(socket, Some(&m.id), Some(&m.quant)) {
-                                    Ok(()) => format!("using {}", m.id),
+                                    Ok(reply) => {
+                                        if matches!(reply["state"].as_str(), Some("switching" | "downloading")) {
+                                            pending_switch = Some((m.id.clone(), m.quant.clone()));
+                                        }
+                                        use_reply_text(&reply, &m.id)
+                                    }
                                     Err(e) => e,
                                 }
                             }
@@ -288,6 +341,7 @@ fn interactive(socket: &Socket) -> Result<(), String> {
                     continue;
                 }
                 notice.clear();
+                pending_switch = None;
                 match k.code {
                     KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('u') | KeyCode::Char('U') if status.is_some() => match sock::get_models(socket) {
@@ -302,7 +356,7 @@ fn interactive(socket: &Socket) -> Result<(), String> {
                     },
                     KeyCode::Char('f') | KeyCode::Char('F') if status.is_some() => {
                         notice = match sock::set_preference(socket, None, None) {
-                            Ok(()) => "FARM mode: set".into(),
+                            Ok(_) => "FARM mode: set".into(),
                             Err(e) => e,
                         };
                     }

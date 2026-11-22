@@ -207,12 +207,12 @@ pub fn get_models(socket: &Socket) -> Result<Vec<LocalModel>, String> {
     serde_json::from_value(v["models"].clone()).map_err(|e| format!("unexpected model list: {e}"))
 }
 
-pub fn set_preference(socket: &Socket, model: Option<&str>, quant: Option<&str>) -> Result<(), String> {
+pub fn set_preference(socket: &Socket, model: Option<&str>, quant: Option<&str>) -> Result<Value, String> {
     let req = match model {
         Some(m) => json!({"op": "preference", "mode": "use", "model": m, "quant": quant}),
         None => json!({"op": "preference", "mode": "free"}),
     };
-    request(socket, &req).map(|_| ())
+    request(socket, &req)
 }
 
 pub fn set_pause(socket: &Socket, active: bool) -> Result<(), String> {

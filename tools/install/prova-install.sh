@@ -194,13 +194,15 @@ useradd --create-home fixture
 printf 'fixture ALL=(root) NOPASSWD: ALL\n' > /etc/sudoers.d/publicompute-fixture
 chmod 0440 /etc/sudoers.d/publicompute-fixture
 PUBLICOMPUTE_SKIP_GPU_CHECK=1
+PUBLICOMPUTE_TEST_CPUINFO=$work/cpuinfo
+printf 'processor\t: 0\nflags\t\t: ssse3 sse4_1 sse4_2 popcnt cx16 avx avx2 fma f16c bmi1 bmi2 abm movbe\n' > "$PUBLICOMPUTE_TEST_CPUINFO"
 PUBLICOMPUTE_TEST_MODEL_MANIFEST=$work/model.manifest
 PUBLICOMPUTE_CA_FILE=$work/ca.pem
 PUBLICOMPUTE_BASE_URL=$url
 PUBLICOMPUTE_VERSION=$version
 PUBLICOMPUTE_LINK_CODE=fixture-first-code
-export PUBLICOMPUTE_SKIP_GPU_CHECK PUBLICOMPUTE_TEST_MODEL_MANIFEST PUBLICOMPUTE_CA_FILE PUBLICOMPUTE_BASE_URL \
-    PUBLICOMPUTE_VERSION PUBLICOMPUTE_LINK_CODE
+export PUBLICOMPUTE_SKIP_GPU_CHECK PUBLICOMPUTE_TEST_CPUINFO PUBLICOMPUTE_TEST_MODEL_MANIFEST PUBLICOMPUTE_CA_FILE \
+    PUBLICOMPUTE_BASE_URL PUBLICOMPUTE_VERSION PUBLICOMPUTE_LINK_CODE
 expect_failure() {
     message=$1
     shift
@@ -225,6 +227,81 @@ lock=/run/publicompute-agent-lock/lock
 legacy_lock=/run/lock/publicompute-agent.lock
 chmod 1777 /run/lock
 runuser -u fixture -- touch "$legacy_lock"
+
+printf 'processor\t: 0\nflags\t\t: ssse3 sse4_1 sse4_2 popcnt cx16 avx fma f16c bmi1 bmi2 abm movbe\n' > "$work/cpuinfo-no-avx2"
+requests=$(wc -l < "$work/http.log")
+expect_failure 'This CPU lacks avx2. PubliCompute needs a CPU with AVX2' \
+    env PUBLICOMPUTE_TEST_CPUINFO="$work/cpuinfo-no-avx2" sh /src/install.sh
+if [ "$(wc -l < "$work/http.log")" -ne "$requests" ]; then
+    printf '%s\n' 'Unexpected HTTP request from a CPU without AVX2.' >&2
+    exit 1
+fi
+# A virtual CPU can mask a single feature of the baseline.
+printf 'processor\t: 0\nflags\t\t: ssse3 sse4_1 sse4_2 popcnt cx16 avx avx2 fma f16c bmi1 bmi2 abm\n' > "$work/cpuinfo-no-movbe"
+expect_failure 'This CPU lacks movbe.' env PUBLICOMPUTE_TEST_CPUINFO="$work/cpuinfo-no-movbe" sh /src/install.sh
+expect_failure 'PUBLICOMPUTE_PACKAGE requires PUBLICOMPUTE_PACKAGE_SHA256.' \
+    env PUBLICOMPUTE_PACKAGE="$work/http/$name.tar.zst" PUBLICOMPUTE_PACKAGE_SHA256= sh /src/install.sh
+
+mkdir "$work/bin"
+cat > "$work/bin/nvidia-smi" <<'SMI'
+#!/bin/sh
+[ "$LC_ALL" = C ] || exit 1
+printf '%s\n' "$1" >> "$FIXTURE_SMI_LOG"
+# Print only the requested columns, so a missing fallback query cannot pass.
+case "$1" in
+    --query-gpu=memory.total,uuid,driver_version,compute_cap)
+        [ "${FIXTURE_NVIDIA_OLD_CLI:-0}" = 0 ] || exit 1
+        printf '%s\n' "$FIXTURE_GPU_CSV" ;;
+    --query-gpu=memory.total,uuid,driver_version)
+        printf '%s\n' "$FIXTURE_GPU_CSV" | cut -d, -f1-3 ;;
+    *) exit 1 ;;
+esac
+SMI
+chmod 0755 "$work/bin/nvidia-smi"
+(
+    PATH=$work/bin:$PATH
+    PUBLICOMPUTE_SKIP_GPU_CHECK=0
+    FIXTURE_SMI_LOG=$work/nvidia-smi.log
+    export PATH PUBLICOMPUTE_SKIP_GPU_CHECK FIXTURE_SMI_LOG
+    unset PUBLICOMPUTE_TEST_MODEL_MANIFEST PUBLICOMPUTE_PACKAGE PUBLICOMPUTE_PACKAGE_SHA256
+    expect_gpu_install_failure() {
+        gpu_message=$1 gpu_csv=$2
+        shift 2
+        requests=$(wc -l < "$work/http.log")
+        expect_failure "$gpu_message" env FIXTURE_GPU_CSV="$gpu_csv" "$@" sh /src/install.sh
+        if [ "$(wc -l < "$work/http.log")" -ne "$requests" ]; then
+            printf 'Unexpected HTTP request with GPU data %s\n' "$gpu_csv" >&2
+            exit 1
+        fi
+    }
+    expect_gpu_install_failure 'NVIDIA driver 525.147.05 is too old for this GPU. PubliCompute needs 535 or newer.' \
+        '8192, GPU-aaaa, 580.12, 6.1
+16384, GPU-bbbb, 525.147.05, 8.9'
+    expect_gpu_install_failure 'NVIDIA driver 565.57.01 is too old for this GPU. PubliCompute needs 570 or newer.' \
+        '16384, GPU-aaaa, 565.57.01, 12.0'
+    grep -F 'sudo ubuntu-drivers install' "$work/failure.log"
+    grep -F 'update the Windows NVIDIA driver' "$work/failure.log"
+    expect_gpu_install_failure 'Unsupported NVIDIA GPU (compute capability 6.1).' '8192, GPU-aaaa, 580.12, 6.1'
+    expect_gpu_install_failure 'NVIDIA GPU data unavailable. Update the NVIDIA driver.' '8192, GPU-aaaa, 535.183.01, [N/A]'
+    : > "$FIXTURE_SMI_LOG"
+    expect_gpu_install_failure 'NVIDIA GPU data unavailable. Update the NVIDIA driver.' \
+        '8192, GPU-aaaa, 535.183.01, 8.9' FIXTURE_NVIDIA_OLD_CLI=1
+    printf '%s\n' --query-gpu=memory.total,uuid,driver_version,compute_cap \
+        --query-gpu=memory.total,uuid,driver_version | cmp -s - "$FIXTURE_SMI_LOG" || {
+        printf '%s\n' 'nvidia-smi fallback query missing or out of order' >&2
+        exit 1
+    }
+    expect_gpu_install_failure 'NVIDIA GPU data unavailable. Update the NVIDIA driver.' '[N/A], GPU-aaaa, 580.12, 8.9'
+
+    expect_gpu_install_failure 'PUBLICOMPUTE_PACKAGE requires PUBLICOMPUTE_PACKAGE_SHA256.' \
+        '8192, GPU-aaaa, 535.183.01, 7.5' PUBLICOMPUTE_PACKAGE="$work/http/$name.tar.zst"
+    grep -Fx 'Using NVIDIA GPU GPU-aaaa.' "$work/failure.log"
+    expect_gpu_install_failure 'PUBLICOMPUTE_PACKAGE requires PUBLICOMPUTE_PACKAGE_SHA256.' \
+        '16384, GPU-aaaa, 525.147.05, 8.9
+8192, GPU-bbbb, 570, 12.0' PUBLICOMPUTE_PACKAGE="$work/http/$name.tar.zst"
+    grep -Fx 'Using NVIDIA GPU GPU-bbbb.' "$work/failure.log"
+)
+
 expect_rejected_release() {
     expect_failure "$1" sh "$installer"
     if grep -F 'Coordinator fixture reachable' "$work/failure.log"; then
@@ -393,6 +470,11 @@ sed -i -e "s|^MODEL_PATH=.*|MODEL_PATH=$alternate|" -e 's/^MODEL_ID=.*/MODEL_ID=
     -e '/^PUBLICOMPUTE_REGION=/d' -e '/^PUBLICOMPUTE_RELAY=/d' \
     "$conf/agent.conf"
 printf 'qwen3.5-9b Q4_K_M 1099511627776000 %s %s/unavailable.gguf\n' "$model_sha" "$url" > "$work/unreachable.manifest"
+# An upgrade must leave the service's selection and transfer intact.
+printf '%s\n' '{"id":"fixture-other","quant":"Q8_0"}' > "$state/active-model.json"
+printf 'resumable service download\n' > "$alternate.agent.part"
+chown publicompute-agent:publicompute-agent "$state/active-model.json" "$alternate.agent.part"
+sha256sum "$state/active-model.json" "$alternate.agent.part" > "$work/model-state-before"
 for step in migration double-quoted single-quoted; do
     log=$work/model-$step.log
     expected_region=EU
@@ -438,7 +520,13 @@ grep -F 'Could not verify the configured model fixture-other Q8_0. Using the def
 grep -Fx "MODEL_PATH=$model" "$conf/agent.conf"
 grep -Fx "MODEL_SHA256=$model_sha" "$conf/agent.conf"
 
+sha256sum -c "$work/model-state-before"
+touch "$model.part" "$state/models/verified.json"
 runuser -u fixture -- publicompute uninstall --keep-models
+test ! -e "$state/active-model.json"
+test ! -e "$alternate.agent.part"
+test ! -e "$model.part"
+test ! -e "$state/models/verified.json"
 test -f "$model"
 test "$(stat -c %u "$model")" = 0
 test ! -e "$state/identity.bin"

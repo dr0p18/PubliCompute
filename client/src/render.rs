@@ -86,7 +86,7 @@ fn vram_bar(used: u64, total: u64, cells: usize) -> String {
 
 /// Build styled rows before fitting them to the viewport. The pending-change
 /// message compares the stored deadline with Unix seconds.
-pub fn rows(s: &Status, now: i64, notice: &str) -> Vec<Row> {
+fn rows(s: &Status, now: i64) -> Vec<Row> {
     use Style::*;
     let mut r = Vec::new();
     r.push(Row("PubliCompute".into(), Accent));
@@ -97,6 +97,12 @@ pub fn rows(s: &Status, now: i64, notice: &str) -> Vec<Row> {
         Tone::Warn => Warn,
     };
     r.push(Row(format!("  {line}"), style));
+    if let Some(detail) = s.download_line() {
+        r.push(Row(format!("  {detail}"), Plain));
+    }
+    if let Some(error) = &s.model_error {
+        r.push(Row(format!("  {error}"), Warn));
+    }
     if let Some(until) = s.contribution.as_ref().and_then(|c| c.stable_until).filter(|u| *u > now) {
         r.push(Row(format!("  change pending until {} UTC", hhmm_utc(until)), Dim));
     }
@@ -140,10 +146,6 @@ pub fn rows(s: &Status, now: i64, notice: &str) -> Vec<Row> {
     }
     r.push(Row(format!("  {NO_GUARANTEE}"), Dim));
     r.push(Row(String::new(), Plain));
-    if !notice.is_empty() {
-        r.push(Row(notice.to_string(), Accent));
-    }
-    r.push(Row(KEYS.into(), Dim));
     r
 }
 
@@ -164,18 +166,20 @@ fn wrap_message(message: &str, width: u16, style: Style) -> Vec<Row> {
     rows
 }
 
-/// Preserve the key legend on the last row when the body is too tall to fit.
+/// Keep command replies and the key legend visible when the status panel is tall.
 pub fn render(s: &Status, width: u16, height: u16, now: i64, notice: &str, color: bool) -> Vec<String> {
-    let mut rows = rows(s, now, notice);
+    let mut rows = rows(s, now);
     if s.gpu_lost {
         rows.splice(1..2, wrap_message(crate::status::GPU_LOST, width, Style::Warn));
     }
-    let h = height as usize;
-    if h > 0 && rows.len() > h {
-        let last = rows.pop().unwrap();
-        rows.truncate(h - 1);
-        rows.push(last);
+    let mut notices = if notice.is_empty() { Vec::new() } else { wrap_message(notice, width, Style::Accent) };
+    if height > 0 {
+        let available = usize::from(height - 1);
+        notices.truncate(available);
+        rows.truncate(available - notices.len());
     }
+    rows.extend(notices);
+    rows.push(Row(KEYS.into(), Style::Dim));
     finish(rows, width, color)
 }
 
