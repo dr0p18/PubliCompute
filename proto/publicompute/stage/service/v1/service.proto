@@ -50,6 +50,8 @@ message Request {
   // End at the first matching stop string and omit the match from the output.
   // Empty stop strings have no effect.
   repeated string stop = 8;
+  // Coordinator chat ID, used to correlate the head and agent logs.
+  string chat_id = 9;
 }
 
 message Cancel {
@@ -88,7 +90,7 @@ message Done {
   string reason = 2;
   Usage usage = 3;
   Timings timings = 4;
-  // Set for pre-admission rejection, such as an empty or oversized prompt.
+  // Code for pre-admission rejection, such as invalid_request or context_length_exceeded.
   string error = 5;
   // Final text buffered while checking stop strings or completing UTF-8 characters.
   // Any incomplete UTF-8 at the end is rendered with replacement characters.

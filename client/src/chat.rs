@@ -9,9 +9,9 @@ use std::{
     fs::File,
     io::{self, BufRead, IsTerminal, Write},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
@@ -32,7 +32,12 @@ use terminal::{AnswerOutput, Input, Interrupt};
 
 const DEFAULT_API: &str = "https://api.publicompute.com:8444";
 const MAX_MESSAGES: usize = 200;
-const MAX_REQUEST: usize = 256 * 1024;
+const MAX_REQUEST: usize = 1024 * 1024;
+// Starts before the POST. The coordinator gives quota 75s and seats 100s to
+// find a lease across all attempts, leaving at least 20s to deliver no_capacity.
+const CHAT_IDLE: Duration = Duration::from_secs(120);
+const FIRST_DELTA_TIMEOUT: &str = "chat timed out waiting for the first delta";
+const NEXT_DELTA_TIMEOUT: &str = "chat timed out waiting for the next delta";
 
 fn api(override_url: Option<&str>) -> Result<Endpoint, String> {
     if let Some(url) = override_url {
@@ -63,14 +68,22 @@ impl Resolver for DirectResolver {
 }
 
 fn http() -> Agent {
+    http_with_timeouts(Some(Duration::from_secs(30)), Some(Duration::from_secs(45)))
+}
+
+fn chat_http() -> Agent {
+    http_with_timeouts(None, None)
+}
+
+fn http_with_timeouts(response: Option<Duration>, read: Option<Duration>) -> Agent {
     let config = Config::builder()
         .proxy(None)
         .max_redirects(0)
         .http_status_as_error(false)
         .timeout_resolve(Some(Duration::from_secs(3)))
         .timeout_connect(Some(Duration::from_secs(5)))
-        .timeout_recv_response(Some(Duration::from_secs(30)))
-        .timeout_per_read(Some(Duration::from_secs(45)))
+        .timeout_recv_response(response)
+        .timeout_per_read(read)
         .timeout_per_write(Some(Duration::from_secs(15)))
         .build();
     Agent::with_parts(config, DefaultConnector::default(), DirectResolver)
@@ -135,10 +148,12 @@ pub fn logout() -> Result<(), String> {
 pub fn run(socket: &Socket, args: &[String]) -> Result<(), String> {
     let (mut model, mut url, mut question) = (None, None, None);
     let mut options = true;
+    let mut debug = env::var("PUBLICOMPUTE_DEBUG").as_deref() == Ok("1");
     let mut args = args.iter().map(String::as_str);
     while let Some(arg) = args.next() {
         match (options, arg) {
             (true, "--") => options = false,
+            (true, "-v") => debug = true,
             (true, "--model") => model = Some(args.next().filter(|s| !s.is_empty()).ok_or("--model needs an ID")?),
             (true, "--api") => url = Some(args.next().ok_or("--api needs a URL")?),
             (true, flag) if flag.starts_with("--") => return Err("unknown chat option".into()),
@@ -170,9 +185,9 @@ pub fn run(socket: &Socket, args: &[String]) -> Result<(), String> {
                 )
             })?,
     };
-    let chat = Chat { api, session, model };
+    let chat = Chat { api, session, model, debug };
     if let Some(question) = question {
-        chat.answer(&http(), &[Message::user(question.into())], None)?;
+        chat.answer(&chat_http(), &[Message::user(question.into())], None)?;
         return Ok(());
     }
     chat.conversation()
@@ -258,10 +273,73 @@ fn trim_history(model: &str, messages: &mut Vec<Message>) -> bool {
     skip != 0
 }
 
+// Only a content delta renews the deadline. Agent shutdown also interrupts a read
+// blocked on HTTP headers, a partial SSE event, or a stream of keepalives.
+fn with_chat_deadline<T>(
+    agent: &Agent,
+    limit: Duration,
+    cancel: &AtomicBool,
+    run: impl FnOnce(&mpsc::Sender<Instant>) -> Result<T, String>,
+) -> Result<T, String> {
+    let (delta, progress) = mpsc::channel();
+    let started = Instant::now();
+    thread::scope(|scope| {
+        let watchdog = scope.spawn(move || {
+            let mut deadline = started + limit;
+            let mut error = FIRST_DELTA_TIMEOUT;
+            loop {
+                match progress.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(at) if at < deadline => {
+                        error = NEXT_DELTA_TIMEOUT;
+                        deadline = at + limit;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+                    _ => {
+                        cancel.store(true, Ordering::Relaxed);
+                        agent.clone().shutdown();
+                        return Some(error);
+                    }
+                }
+            }
+        });
+        let result = run(&delta);
+        drop(delta);
+        match watchdog.join().expect("chat watchdog panicked") {
+            Some(error) => Err(error.into()),
+            None => result,
+        }
+    })
+}
+
+struct ChatTrace {
+    enabled: bool,
+    client_id: String,
+    server_id: Option<String>,
+    started: Instant,
+}
+
+impl ChatTrace {
+    fn new(enabled: bool) -> Self {
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let started = Instant::now();
+        let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let client_id = format!("{:x}-{:x}-{:x}", std::process::id(), time.as_nanos(), SEQUENCE.fetch_add(1, Ordering::Relaxed));
+        Self { enabled, client_id, server_id: None, started }
+    }
+
+    fn log(&self, event: &str, code: &str) {
+        if self.enabled {
+            eprintln!("chat event={event} client_request={} chat={} elapsed_ms={} code={code}",
+                self.client_id, self.server_id.as_deref().unwrap_or("-"), self.started.elapsed().as_millis());
+        }
+    }
+}
+
 struct Chat {
     api: Endpoint,
     session: Session,
     model: String,
+    debug: bool,
 }
 
 impl Chat {
@@ -269,6 +347,14 @@ impl Chat {
         match reply.status().as_u16() {
             401 => EXPIRED.into(),
             404 => format!("model_not_found: {}", model_help(agent, &self.api, &self.session)),
+            400 => {
+                let body: Value = reply.body_mut().read_json().unwrap_or_default();
+                match body["error"]["code"].as_str() {
+                    Some("context_length_exceeded") => "context_length_exceeded: the conversation is too long for this model".into(),
+                    Some("invalid_request") => "invalid_request: the chain could not prepare the conversation".into(),
+                    _ => "chat failed (HTTP 400)".into(),
+                }
+            }
             429 => "too_many_chats: wait for an active chat to finish and try again".into(),
             503 => {
                 let body: Value = reply.body_mut().read_json().unwrap_or_default();
@@ -290,21 +376,53 @@ impl Chat {
     ) -> Result<Option<String>, String> {
         let body = request_body(&self.model, messages);
         if body.len() > MAX_REQUEST {
-            return Err("the question exceeds the 256 KiB chat request limit".into());
+            return Err("the question exceeds the 1 MiB chat request limit".into());
         }
         self.session.check_expiry()?;
+        let mut trace = ChatTrace::new(self.debug);
+        trace.log("send", "-");
+        trace.log("wait", "-");
+        let local_cancel = AtomicBool::new(false);
+        let stop = cancel.unwrap_or(&local_cancel);
+        let result = with_chat_deadline(agent, CHAT_IDLE, stop, |progress| {
+            self.stream_answer(agent, &body, stop, cancel.is_some(), &mut trace, progress)
+        });
+        match result.as_ref().err().map(String::as_str) {
+            Some(FIRST_DELTA_TIMEOUT) => trace.log("timeout", "first_delta"),
+            Some(NEXT_DELTA_TIMEOUT) => trace.log("timeout", "next_delta"),
+            Some(_) => trace.log("end", "error"),
+            None => trace.log("end", "ok"),
+        }
+        result
+    }
+
+    fn stream_answer(
+        &self,
+        agent: &Agent,
+        body: &[u8],
+        cancel: &AtomicBool,
+        save_answer: bool,
+        trace: &mut ChatTrace,
+        progress: &mpsc::Sender<Instant>,
+    ) -> Result<Option<String>, String> {
         let reply = agent
             .post(self.api.url("/v1/chat/completions"))
             .header("Cookie", self.session.cookie())
             .header("Accept", "text/event-stream")
             .header("Content-Type", "application/json")
-            .send(body.as_slice())
+            .header("X-Client-Request-ID", &trace.client_id)
+            .send(body)
             .map_err(|_| "cannot reach the API for chat")?;
+        trace.server_id = reply.headers().get("X-Request-ID").and_then(|h| h.to_str().ok())
+            .filter(|id| id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+            .map(str::to_owned);
+        trace.log("first_byte", reply.status().as_str());
         if !reply.status().is_success() {
+            trace.log("http_error", reply.status().as_str());
             return Err(self.chat_error(agent, reply));
         }
         let mut stdout = AnswerOutput::open(cancel).map_err(|e| format!("cannot open chat output: {e}"))?;
-        let mut answer = cancel.is_some().then(String::new);
+        let mut answer = save_answer.then(String::new);
         let mut printed = false;
         let completion = stream::consume(reply.into_body().into_reader(), &self.model, &self.session, |text| {
             stdout.write(text)?;
@@ -317,6 +435,9 @@ impl Chat {
                 }
             }
             Ok(())
+        }, |event| match event {
+            stream::Progress::Delta(at) => { let _ = progress.send(at); }
+            stream::Progress::Error(code) => trace.log("sse_error", code),
         });
         let printed_to_terminal = printed && stdout.terminal;
         drop(stdout);
@@ -357,13 +478,14 @@ impl Chat {
             };
             let user = Message::user(question);
             if request_body(&self.model, std::slice::from_ref(&user)).len() > MAX_REQUEST {
-                eprintln!("! the question exceeds the 256 KiB chat request limit");
+                eprintln!("! the question exceeds the 1 MiB chat request limit");
                 continue;
             }
             let mut candidate = history.clone();
             candidate.push(user);
             let trimmed = trim_history(&self.model, &mut candidate);
             let notice = match self.interruptible_answer(&candidate, &interrupt) {
+                Some(Ok(Some(content))) if content.trim().is_empty() => continue,
                 Some(Ok(Some(content))) => {
                     candidate.push(Message {
                         role: "assistant",
@@ -379,7 +501,9 @@ impl Chat {
                     }
                     "chat history limit reached, the last turn was too large to keep".into()
                 }
-                Some(Err(error)) if error == EXPIRED => return Err(error),
+                Some(Err(error)) if matches!(error.as_str(),
+                    EXPIRED | FIRST_DELTA_TIMEOUT | NEXT_DELTA_TIMEOUT |
+                    stream::UNFINISHED_REASONING | stream::REASONING_TOKEN_LIMIT) => return Err(error),
                 Some(Err(error)) => format!("! {error}"),
                 Some(Ok(None)) => "chat history limit reached, the last turn was too large to keep".into(),
                 None => "answer stopped".into(),
@@ -393,7 +517,7 @@ impl Chat {
         history: &[Message],
         interrupt: &Interrupt,
     ) -> Option<Result<Option<String>, String>> {
-        let agent = http();
+        let agent = chat_http();
         let cancel = AtomicBool::new(false);
         thread::scope(|scope| {
             let worker = scope.spawn(|| self.answer(&agent, history, Some(&cancel)));
@@ -444,6 +568,52 @@ mod tests {
         Message {
             role: "assistant",
             content: content.into(),
+        }
+    }
+
+    #[test]
+    fn keepalives_do_not_extend_the_delta_deadline() {
+        use std::net::TcpListener;
+
+        for (first_delta, expected) in [(false, FIRST_DELTA_TIMEOUT), (true, NEXT_DELTA_TIMEOUT)] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let api = Endpoint::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+            let mut headers = ureq::http::HeaderMap::new();
+            headers.append("Set-Cookie", "pc_session=fixture_token; Max-Age=60".parse().unwrap());
+            let session = Session::from_headers(&headers, &api).unwrap();
+            let chat = Chat { api, session, model: "qwen3.6".into(), debug: false };
+            let server = thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut reader = std::io::BufReader::new(&mut socket);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                drop(reader);
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
+                if first_delta {
+                    socket.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"hidden\"}}]}\n\n").unwrap();
+                }
+                for _ in 0..100 {
+                    if socket.write_all(b": keepalive\n\nevent: publicompute.route\ndata: {}\n\n").is_err() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            });
+            let agent = chat_http();
+            let mut trace = ChatTrace::new(false);
+            let cancel = AtomicBool::new(false);
+            let result = with_chat_deadline(&agent, Duration::from_millis(250), &cancel, |progress| {
+                chat.stream_answer(&agent, b"", &cancel, false, &mut trace, progress)
+            });
+            assert_eq!(result.unwrap_err(), expected);
+            assert!(cancel.load(Ordering::Relaxed));
+            server.join().unwrap();
         }
     }
 

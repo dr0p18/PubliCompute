@@ -30,7 +30,7 @@ BINARY = Path(sys.argv.pop(1)).resolve() if len(sys.argv) > 1 and not sys.argv[1
 EMAIL = "cli@example.test"
 MODEL = "gemma-4-12b"
 QWEN = "qwen3.8-flash-next"
-MAX_REQUEST = 256 * 1024
+MAX_REQUEST = 1024 * 1024
 
 
 def read_until(fd, marker, timeout=6):
@@ -70,7 +70,7 @@ class ChatLoopback(unittest.TestCase):
     def setUp(self):
         self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.session = self.directory / "publicompute/session"
-        self.server = FAKE.crea_server(port=0, quota=0, saldo=2345, fast=True)
+        self.server = FAKE.crea_server(port=0, fast=True)
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
         threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
@@ -336,7 +336,7 @@ class ChatLoopback(unittest.TestCase):
             self.assertTrue(result.stdout)
             extra = self.command("chat", "--model", MODEL, input=question + b"a\n/exit\n")
             self.assertEqual(extra.stdout, b"")
-            self.assertIn(b"exceeds the 256 KiB chat request limit", extra.stderr)
+            self.assertIn(b"exceeds the 1 MiB chat request limit", extra.stderr)
         self.assertEqual(sizes, [MAX_REQUEST])
 
     def test_chat_uses_agent_serving_model_and_lists_fallback(self):

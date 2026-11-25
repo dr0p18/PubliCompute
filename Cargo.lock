@@ -2968,7 +2968,7 @@ dependencies = [
 
 [[package]]
 name = "publicompute"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "crossterm",
  "getrandom 0.4.3",
@@ -2984,7 +2984,7 @@ dependencies = [
 
 [[package]]
 name = "publicompute-agent"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3019,14 +3019,14 @@ dependencies = [
 
 [[package]]
 name = "publicompute-llama-sys"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bindgen",
 ]
 
 [[package]]
 name = "publicompute-proto"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bytes",
  "prost",
@@ -3037,7 +3037,7 @@ dependencies = [
 
 [[package]]
 name = "publicompute-stage"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bytes",
  "prost",

@@ -26,8 +26,15 @@ if [ "${1:-}" != "--inside" ]; then
     echo "Building $VERSION (log: $LOG)"
     "$ENGINE" build -t publicompute-build -f "$HERE/Containerfile" "$HERE" >> "$LOG" 2>&1 \
         || { tail -n 20 "$LOG"; exit 1; }
+    # Rootful Docker writes files as root, so the inner build hands them back to
+    # the caller. Rootless Podman maps container root to the caller already: a
+    # chown there would map the caller's UID to a subordinate one (100999).
+    OWNER=()
+    if [ "$ENGINE" = docker ] || [ "$(podman info --format '{{.Host.Security.Rootless}}')" != true ]; then
+        OWNER=(-e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)")
+    fi
     # Relabel the bind mount so SELinux permits access from the container.
-    "$ENGINE" run --rm -v "$REPO:/work:Z" -e VERSION="$VERSION" -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+    "$ENGINE" run --rm -v "$REPO:/work:Z" -e VERSION="$VERSION" "${OWNER[@]}" \
         publicompute-build bash /work/tools/pacchetto/build-linux.sh --inside >> "$LOG" 2>&1 \
         || { echo "Build failed. Last log lines:"; tail -n 25 "$LOG"; exit 1; }
     grep -A40 '^== Summary' "$LOG" || tail -n 10 "$LOG"

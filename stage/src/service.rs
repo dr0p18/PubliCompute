@@ -352,6 +352,28 @@ pub fn deepseek4_conversation<'a>(msgs: impl IntoIterator<Item = &'a pb::Message
 }
 
 const CONTEXT_ATTEMPTS: usize = 8;
+pub const LAST_MESSAGE_TOO_LONG: &str = "the last message alone exceeds the slot context";
+
+/// Keep enough room for a useful reply when history can be shortened.
+pub fn fit_chat_context<T>(
+    messages: &[pb::Message],
+    context: usize,
+    ceiling: u32,
+    mut prepare: impl FnMut(&[&pb::Message]) -> Result<(T, usize), String>,
+) -> Result<(T, usize), String> {
+    let preferred = ceiling.min(512) as usize;
+    let result = fit_context(messages, context.saturating_sub(preferred), &mut prepare);
+    if preferred > 1 && result.as_ref().err().is_some_and(|e| e == LAST_MESSAGE_TOO_LONG) {
+        return fit_context(messages, context.saturating_sub(1), prepare);
+    }
+    result
+}
+
+/// Return the available output budget. A full context has no room for a reply.
+pub fn output_budget(context: usize, prompt: usize, ceiling: u32) -> Option<u32> {
+    let budget = context.saturating_sub(prompt).min(ceiling as usize) as u32;
+    (budget > 0).then_some(budget)
+}
 
 /// Try a bounded search over whole turns and keep the prepared prompt that fit.
 pub fn fit_context<T>(
@@ -405,7 +427,7 @@ pub fn fit_context<T>(
             return Ok(best);
         }
         if size == 1 {
-            return Err("the last message alone exceeds the slot context".into());
+            return Err(LAST_MESSAGE_TOO_LONG.into());
         }
     }
     if last_index > 0 {
@@ -414,7 +436,7 @@ pub fn fit_context<T>(
             return Ok((prepared, last_index));
         }
     }
-    Err("the last message alone exceeds the slot context".into())
+    Err(LAST_MESSAGE_TOO_LONG.into())
 }
 
 #[cfg(test)]
@@ -510,6 +532,42 @@ mod test {
 
     fn prepare(messages: &[&pb::Message]) -> Result<(Vec<String>, usize), String> {
         Ok((messages.iter().map(|message| message.text.clone()).collect(), messages.iter().map(|message| message.text.len()).sum()))
+    }
+
+    #[test]
+    fn chat_output_uses_free_context_for_every_request_form() {
+        let messages = vec![pb::Message { role: "user".into(), text: "short".into() }];
+        for ceiling in [4096, 8192, 16384] {
+            let (prompt, dropped) = fit_chat_context(&messages, 8192, ceiling, |_| Ok((8, 8))).unwrap();
+            assert_eq!((prompt, dropped), (8, 0));
+            assert_eq!(output_budget(8192, prompt, ceiling), Some(ceiling.min(8184)));
+        }
+        assert_eq!(output_budget(8192, 8191, 16384), Some(1));
+        assert_eq!(output_budget(8192, 8192, 16384), None);
+    }
+
+    #[test]
+    fn chat_context_trims_history_then_accepts_a_one_token_reply() {
+        let messages = vec![
+            pb::Message { role: "user".into(), text: "old".into() },
+            pb::Message { role: "assistant".into(), text: "reply".into() },
+            pb::Message { role: "user".into(), text: "new".into() },
+        ];
+        let prepare = |history: &[&pb::Message]| {
+            let count = 8191 + 512 * (history.len() - 1);
+            Ok((count, count))
+        };
+        assert_eq!(fit_chat_context(&messages, 8192, 16384, prepare), Ok((8191, 2)));
+        assert_eq!(
+            fit_chat_context(&messages, 8192, 16384, |_| Ok((8192, 8192))).unwrap_err(),
+            LAST_MESSAGE_TOO_LONG
+        );
+        let mut attempts = 0;
+        assert!(fit_chat_context::<()>(&messages, 8192, 16384, |_| {
+            attempts += 1;
+            Err("tokenizer failed".into())
+        }).is_err());
+        assert_eq!(attempts, 1);
     }
 
     #[test]

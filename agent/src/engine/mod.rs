@@ -219,6 +219,7 @@ impl Engine {
     pub async fn chat_lease(
         &self,
         req: &InferenceRequest,
+        chat_id: &str,
         top_k: u32,
         progress: &progress::Progress,
         deltas: Option<stages::DeltaSender>,
@@ -227,7 +228,7 @@ impl Engine {
         match self {
             Engine::Mock(e) => e.chat_lease(req, top_k, progress, deltas, cancel).await,
             Engine::Llama(e) => e.chat_lease(req, top_k, progress, deltas, cancel).await,
-            Engine::Stages(e) => e.chat_lease(req, progress, deltas, cancel).await,
+            Engine::Stages(e) => e.chat_lease(req, chat_id, progress, deltas, cancel).await,
         }
     }
 

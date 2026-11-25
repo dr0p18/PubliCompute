@@ -122,23 +122,24 @@ impl StadiEngine {
 
     /// Run a chat using the shared engine progress counter.
     pub async fn chat(&self, req: &InferenceRequest, deltas: Option<DeltaSender>, cancel: Option<oneshot::Receiver<()>>) -> Result<Generation> {
-        self.chat_lease(req, &self.progress, deltas, cancel).await
+        self.chat_lease(req, "", &self.progress, deltas, cancel).await
     }
 
     /// Give this chat its own progress counter and optionally stream text as it
     /// arrives. Also update shared progress for supervision. Cancellation or
     /// loss of its sender sends a cancel message to the head and ends the lease.
-    pub async fn chat_lease(&self, req: &InferenceRequest, progress: &Progress, deltas: Option<DeltaSender>, mut cancel: Option<oneshot::Receiver<()>>) -> Result<Generation> {
+    pub async fn chat_lease(&self, req: &InferenceRequest, chat_id: &str, progress: &Progress, deltas: Option<DeltaSender>, mut cancel: Option<oneshot::Receiver<()>>) -> Result<Generation> {
         let Some(link) = self.stages.head() else {
             return Err(request_error(RequestFailureCode::EngineError, "no chain head is ready on this node"));
         };
         let Some(messages) = messaggi_testa(req) else {
-            return Err(request_error(RequestFailureCode::EngineError, "request has no user messages"));
+            return Err(request_error(RequestFailureCode::InvalidRequest, "request has no user messages"));
         };
         let text = messages.iter().rev().find(|m| m.role == "user").map(|m| m.text.clone()).unwrap_or_default();
         let _attiva = Attiva::new(self);
         let s = req.sampling.clone().unwrap_or_default();
         let id = link.nuovo_id();
+        tracing::info!(chat = chat_id, request = %req.request_id, head_request = id, "sending request to head");
         let t0 = Instant::now();
         self.su_entrambi(progress, |p| p.set_phase(Phase::Prefill));
         self.su_entrambi(progress, Progress::tick);
@@ -152,6 +153,7 @@ impl StadiEngine {
                 sampling: Some(campionamento_testa(&s)),
                 stop: s.stop.clone(),
                 class: pb::Class::Interactive as i32,
+                chat_id: chat_id.to_owned(),
             })
             .await
             .map_err(|e| fault(FaultCause::Connection, format!("request to the head: {e:#}")))?;
@@ -227,15 +229,18 @@ impl StadiEngine {
                 return Err(OutputStalled.into());
             }
             "error" => {
-                // The head includes this phrase in both context overflow messages.
-                let code = if done.error.contains("the slot context") { RequestFailureCode::ContextTooLong } else { RequestFailureCode::EngineError };
-                return Err(request_error(code, format!("head rejected the request: {}", done.error)));
+                let code = match done.error.as_str() {
+                    "context_length_exceeded" => RequestFailureCode::ContextTooLong,
+                    "invalid_request" => RequestFailureCode::InvalidRequest,
+                    _ => RequestFailureCode::EngineError,
+                };
+                return Err(request_error(code, "head rejected the request"));
             }
             "failed" => return Err(request_error(RequestFailureCode::EngineError, "conversation failed in the chain")),
             "eog" | "stop" => FinishReason::Stop,
             "max_token" => FinishReason::Length,
             "cancelled" => FinishReason::Cancelled,
-            reason => return Err(request_error(RequestFailureCode::EngineError, format!("unknown head finish reason {reason:?}"))),
+            _ => return Err(request_error(RequestFailureCode::EngineError, "unknown head finish reason")),
         };
         text.push_str(&done.remaining_text);
         if let Some(d) = &deltas {

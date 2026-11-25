@@ -1,6 +1,6 @@
 [package]
 name = "publicompute-proto"
-version = "0.1.4"
+version = "0.1.5"
 description = "Protocol messages and framing for the coordinator, relay, and nodes"
 edition.workspace = true
 license.workspace = true

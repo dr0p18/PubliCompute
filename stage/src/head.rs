@@ -265,6 +265,7 @@ struct Conv {
     /// Service mode: agent request ID (0 for test conversations), its token limit, requested
     /// cancellation (close after the next recorded token), and UTF-8 buffering for output text.
     ext_id: u64,
+    chat_id: String,
     max_tokens: Option<u32>,
     utf8: Utf8Fragments,
     /// Sampling cutoffs are set by the service request.
@@ -1160,6 +1161,10 @@ impl Head<'_> {
         cv.token.push(r.token);
         cv.logprob.push(r.logprob);
         cv.tempi_ms.push(t_ms);
+        if cv.ext_id != 0 && cv.token.len() == 1 {
+            let ttft_ms = (t_ms - cv.t_arrivo_ms.unwrap_or(t_ms)).max(0.0);
+            eprintln!("[head] first token chat={} head_request={} ttft_ms={ttft_ms:.1}", cv.chat_id, cv.ext_id);
+        }
         // The proposal is valid at this transcript length and expires when it advances.
         cv.bz.mtp = if self.o.draft_source == DraftSource::Mtp && !r.draft.is_empty() { Some((cv.token.len(), r.draft.clone())) } else { None };
         self.registrati += 1;
@@ -1923,57 +1928,59 @@ impl Head<'_> {
         }
     }
 
-    fn reject_request(&self, id: u64, error: String) {
-        eprintln!("[head] request {id} rejected: {error}");
+    fn reject_request(&self, request: &pbs::Request, code: &str, prompt_tokens: Option<usize>) {
+        eprintln!("[head] chat chat={} head_request={} outcome=rejected code={code} prompt_tokens={prompt_tokens:?} ctx_per_slot={} max_tokens={} reserved_output=0",
+            request.chat_id, request.id, self.o.ctx_per_slot, request.max_tokens);
         if let Some(s) = &self.serv {
-            s.manda(pbs::FromHead { body: Some(pbs::from_head::Body::Done(pbs::Done { id, reason: "error".into(), error, ..Default::default() })) });
+            s.manda(pbs::FromHead { body: Some(pbs::from_head::Body::Done(pbs::Done {
+                id: request.id, reason: "error".into(), error: code.into(), ..Default::default()
+            })) });
         }
     }
 
     /// A `Request` queues a conversation for admission at threshold 0 (arrival next round).
     fn service_add(&mut self, r: pbs::Request) {
         if r.id == 0 || self.serv_vive.iter().any(|&c| self.convs[c].ext_id == r.id) {
-            return self.reject_request(r.id, "request ID is zero or already in use".into());
+            return self.reject_request(&r, "invalid_request", None);
         }
-        let max_tokens = if r.max_tokens == 0 { self.o.max_tokens } else { r.max_tokens };
-        let tok = if !r.prompt_token.is_empty() {
-            r.prompt_token.clone()
+        let ceiling = if r.max_tokens == 0 { self.o.max_tokens } else { r.max_tokens };
+        let context = self.o.ctx_per_slot as usize;
+        let (tokens, dropped) = if !r.prompt_token.is_empty() {
+            (r.prompt_token.clone(), 0)
         } else if !r.messages.is_empty() {
-            // Trim history to the context left after reserving output tokens.
-            // Preserve the system message when possible, and keep the newest message.
             if r.messages.iter().all(|m| m.text.trim().is_empty()) {
-                return self.reject_request(r.id, "missing request prompt".into());
+                return self.reject_request(&r, "invalid_request", None);
             }
-            let limite = (self.o.ctx_per_slot as usize).saturating_sub(max_tokens as usize);
-            let m = &self.m;
-            let adattata = crate::service::fit_context(&r.messages, limite, |messages| {
-                let (tokens, _, _) = m.prepara_conversazione(messages)?;
-                let count = tokens.len();
-                Ok((tokens, count))
+            let mut count = None;
+            let result = crate::service::fit_chat_context(&r.messages, context, ceiling, |messages| {
+                let (tokens, _, _) = self.m.prepara_conversazione(messages)?;
+                let len = tokens.len();
+                count = Some(len);
+                Ok((tokens, len))
             });
-            match adattata {
-                Ok((tokens, tolti)) => {
-                    if tolti > 0 {
-                        eprintln!("[head] request {} exceeded the context; dropped {tolti} oldest messages", r.id);
-                    }
-                    tokens
+            match result {
+                Ok(fitted) => fitted,
+                Err(e) if e == crate::service::LAST_MESSAGE_TOO_LONG => {
+                    return self.reject_request(&r, "context_length_exceeded", count);
                 }
-                Err(e) => return self.reject_request(r.id, format!("{e}: prompt exceeds the slot context ({})", self.o.ctx_per_slot)),
+                Err(_) => return self.reject_request(&r, "invalid_request", count),
             }
         } else if r.text.trim().is_empty() {
-            return self.reject_request(r.id, "missing request prompt".into());
+            return self.reject_request(&r, "invalid_request", None);
         } else {
             match self.m.prepara_prompt(&r.text) {
-                Ok((t, _, _)) => t,
-                Err(e) => return self.reject_request(r.id, format!("cannot prepare prompt: {e}")),
+                Ok((tokens, _, _)) => (tokens, 0),
+                Err(_) => return self.reject_request(&r, "invalid_request", None),
             }
         };
-        if tok.is_empty() {
-            return self.reject_request(r.id, "prompt has no tokens".into());
+        if tokens.is_empty() {
+            return self.reject_request(&r, "invalid_request", Some(0));
         }
-        if tok.len() + max_tokens as usize > self.o.ctx_per_slot as usize {
-            return self.reject_request(r.id, format!("{} prompt tokens + {max_tokens} output tokens exceed the slot context ({})", tok.len(), self.o.ctx_per_slot));
-        }
+        let Some(max_tokens) = crate::service::output_budget(context, tokens.len(), ceiling) else {
+            return self.reject_request(&r, "context_length_exceeded", Some(tokens.len()));
+        };
+        eprintln!("[head] chat chat={} head_request={} outcome=admitted prompt_tokens={} ctx_per_slot={context} max_tokens={ceiling} reserved_output={max_tokens} dropped_messages={dropped}",
+            r.chat_id, r.id, tokens.len());
         let camp = r.sampling.unwrap_or_default();
         let conv_id = self.prossimo_conv;
         self.prossimo_conv += 1;
@@ -1987,11 +1994,11 @@ impl Head<'_> {
             conv_id,
             gruppo: 0,
             slot: 0,
-            c: Conversation::new(conv_id, tok.len() as u32, self.cfg(), adesso).0,
+            c: Conversation::new(conv_id, tokens.len() as u32, self.cfg(), adesso).0,
             da_aprire: None,
             da_inviare: Vec::new(),
             passo_primo: 0,
-            prompt: tok,
+            prompt: tokens,
             inviati: 0,
             token: Vec::new(),
             logprob: Vec::new(),
@@ -2008,6 +2015,7 @@ impl Head<'_> {
             class,
             sospensioni: 0,
             ext_id: r.id,
+            chat_id: r.chat_id,
             max_tokens: Some(max_tokens),
             utf8: Utf8Fragments::default(),
             tagli: Tagli { top_p: camp.top_p, top_k: camp.top_k },
@@ -2084,6 +2092,8 @@ impl Head<'_> {
             },
             prompt_token: cv.prompt.clone(),
         };
+        eprintln!("[head] chat finished chat={} head_request={} prompt_tokens={} completion_tokens={} total_ms={:.1} reason={}",
+            cv.chat_id, cv.ext_id, cv.prompt.len(), cv.token.len(), (now - arrivo).max(0.0), done.reason);
         cv.clear_weights();
         if let Some(s) = &self.serv {
             s.manda(pbs::FromHead { body: Some(pbs::from_head::Body::Done(done)) });
@@ -2330,6 +2340,7 @@ pub fn run(mut engine: Engine, mut options: HeadOptions, network: Option<&HeadLi
             class: classi[i],
             sospensioni: 0,
             ext_id: 0,
+            chat_id: String::new(),
             max_tokens: None,
             utf8: Utf8Fragments::default(),
             tagli,
@@ -2610,6 +2621,7 @@ mod test {
             class: Class::Interactive,
             sospensioni: 0,
             ext_id: 0,
+            chat_id: String::new(),
             max_tokens: None,
             utf8: Utf8Fragments::default(),
             tagli: Tagli::default(),
