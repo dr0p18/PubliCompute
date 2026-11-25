@@ -38,6 +38,8 @@ message StageAssign {
 message StageRelease {
   string chain_id = 1;
   uint64 assign_epoch = 2;
+  // Why the chain is released, in English, for the node's own log and status. Includes the recomposition of the
+  // same model ("a better chain of the same model is being formed"). Never requires an answer.
   string reason = 3;
 }
 

@@ -5,7 +5,7 @@ use std::{
 
 use serde_json::Value;
 
-use super::{session::Session, terminal::escape_controls};
+use super::session::Session;
 
 const MAX_EVENT: usize = 1024 * 1024;
 
@@ -142,16 +142,15 @@ pub(super) fn consume(
         }
         let parsed = serde_json::from_str::<Value>(&data);
         if event == "error" || parsed.as_ref().is_ok_and(|v| !v["error"].is_null()) {
-            let message = parsed
-                .as_ref()
-                .ok()
-                .and_then(|v| v["error"]["message"].as_str().or(v["message"].as_str()));
-            break Err(match message {
-                Some(message) => format!(
-                    "chat stream error: {}",
-                    escape_controls(&session.redact(message), false)
-                ),
-                None => "chat stream error".into(),
+            // The coordinator writes its messages in Italian for the web chat:
+            // the terminal shows its own English text for each error type.
+            let kind = parsed.as_ref().ok().and_then(|v| v["error"]["type"].as_str());
+            break Err(match kind {
+                Some("no_capacity") => "chat stream error: no free seat on this model, try again in a moment".into(),
+                Some("timeout") => "chat stream error: the answer took longer than the time limit".into(),
+                Some("context_length_exceeded") => "chat stream error: the conversation is too long for this model".into(),
+                Some("slow_client") => "chat stream error: the connection was too slow, the answer stopped".into(),
+                _ => "chat stream error: the answer was not completed".into(),
             });
         }
         let Ok(chunk) = parsed else {
@@ -303,13 +302,13 @@ mod tests {
     #[test]
     fn reports_named_and_unnamed_stream_errors_after_partial_output() {
         for event in ["", "event: error\n"] {
-            let input = format!("{TEXT}{event}data: {{\"error\":{{\"message\":\"failure fixture_token\"}}}}\n\n{DONE}");
+            let input = format!("{TEXT}{event}data: {{\"error\":{{\"message\":\"rete piena fixture_token\",\"type\":\"no_capacity\"}}}}\n\n{DONE}");
             let mut answer = String::new();
             let result = consume(input.as_bytes(), "gemma", &session(), |text| {
                 answer.push_str(text);
                 Ok(())
             });
-            assert!(matches!(result, Err(message) if message == "chat stream error: failure [redacted]"));
+            assert!(matches!(result, Err(message) if message == "chat stream error: no free seat on this model, try again in a moment"));
             assert_eq!(answer, "caffè");
         }
     }

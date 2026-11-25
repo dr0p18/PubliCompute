@@ -29,6 +29,9 @@ pub struct Contribution {
     pub free_seat: bool,
     #[serde(default)]
     pub reason: String,
+    /// Coordinator explanation, already in English; absent from older agents.
+    #[serde(default)]
+    pub detail: String,
     /// Earliest time a preference change can take effect, in Unix seconds.
     pub stable_until: Option<i64>,
 }
@@ -36,9 +39,7 @@ pub struct Contribution {
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 pub struct Summary {
     pub days: u32,
-    pub free_value_mc: i64,
     pub free_chats: u32,
-    pub earned_mc: i64,
     pub service_seconds: u64,
     pub work_seconds: u64,
 }
@@ -70,6 +71,11 @@ pub struct Status {
     pub engine: String,
     pub loaded_model: Option<String>,
     pub loaded_quant: Option<String>,
+    // Verified local weights; in chain mode loaded_model waits for a stage.
+    #[serde(default)]
+    pub weights_model: Option<String>,
+    #[serde(default)]
+    pub weights_quant: Option<String>,
     pub download: Option<Download>,
     pub model_error: Option<String>,
     #[serde(default)]
@@ -88,7 +94,7 @@ impl Status {
         let d = self.download.as_ref()?;
         let gib = |bytes| bytes as f64 / (1u64 << 30) as f64;
         Some(match d.state.as_str() {
-            "failed" => format!("download: {} failed: {}", d.id, d.error.as_deref().unwrap_or("unknown error")),
+            "failed" => format!("! download: {} failed: {}", d.id, d.error.as_deref().unwrap_or("unknown error")),
             "switching" => format!("switching to {} after current work finishes", d.id),
             _ => {
                 let verification = if d.state == "verifying" { " (verifying)" } else { "" };
@@ -112,13 +118,14 @@ const HOT_CELSIUS: u32 = 85;
 pub const GPU_LOST: &str = "GPU not available: check the driver, then sudo systemctl restart publicompute-agent";
 
 pub fn status_text(status: &Status, now: u64) -> String {
-    let mut text = status_line(status).0;
+    let (line, tone) = status_line(status);
+    let mut text = if tone == Tone::Warn { format!("! {line}") } else { line };
     if let Some(detail) = status.download_line() {
         text.push('\n');
         text.push_str(&detail);
     }
     if let Some(error) = &status.model_error {
-        text.push_str(&format!("\n{error}"));
+        text.push_str(&format!("\n! {error}"));
     }
     let Some(network) = &status.network else { return text };
     let rate = |bits: u64| {
@@ -161,12 +168,15 @@ pub fn status_line(s: &Status) -> (String, Tone) {
         return ("Engine stopped: the agent needs a restart".into(), Warn);
     }
     if s.paused {
-        return ("Paused — resume with [P]".into(), Warn);
+        return ("Paused — resume with [P]".into(), Plain);
     }
     if s.engine == "recovering" {
         return ("Recovering the engine".into(), Warn);
     }
     let Some(c) = &s.contribution else {
+        if s.preference.mode == "free" {
+            return ("Free card — waiting for work".into(), Plain);
+        }
         return (format!("Serving {loaded}"), Plain);
     };
     let serving = c.serving.clone().unwrap_or_else(|| loaded.clone());
@@ -183,17 +193,39 @@ pub fn status_line(s: &Status) -> (String, Tone) {
     }
     match reason {
         "WARMING_UP" => (format!("Starting {serving} — free seat shortly"), Plain),
-        "MODE_FREE" if s.preference.mode == "free" => (format!("FARM mode — serving {serving}"), Good),
-        "MODE_FREE" => (format!("FARM mode (automatic) — back to use at the next chat on {chosen}"), Plain),
-        "NOT_PLACED" => (
-            format!("Serving {serving}. {chosen} is paid in credits: the card was not placed in one of its chains"),
-            Plain,
-        ),
+        "MODE_FREE" if s.preference.mode == "free" => match c.serving.as_deref() {
+            Some(model) => (format!("Free card — serving {model}"), Good),
+            None => ("Free card — waiting for work".into(), Plain),
+        },
+        "MODE_FREE" => (format!("Free card (automatic) — back to use at the next chat on {chosen}"), Plain),
+        "NOT_PLACED" => (format!("Serving {serving}. The card was not placed in a chain of {chosen}"), Plain),
         "UNVERIFIED" => ("Serving, checks in progress — free seat after the first checks".into(), Plain),
         "BELOW_QUALITY" => (format!("Serving below the speed threshold — no free seat on {chosen}"), Warn),
         "NO_ACCOUNT" => ("Card without a linked user — link your user on the site".into(), Warn),
         "MODEL_MISSING" => (format!("{chosen} is not installed on this PC"), Warn),
         "SUSPENDED" => ("Free seat suspended for 24 h after abrupt exits".into(), Warn),
-        _ => (format!("Serving {serving}"), Plain),
+        // The coordinator explains these with live numbers, so its text wins over ours.
+        "WAITING_PEERS" => (detail_or(&c.detail, format!("Waiting for other cards to form a chain of {chosen}")), Plain),
+        "CHAIN_FULL" => (detail_or(&c.detail, format!("The chains of {chosen} are full — waiting for a seat")), Plain),
+        "NETWORK_BELOW_STANDARD" => (
+            detail_or(&c.detail, "Network below the chain standard (100 Mbit/s each way, 25 ms)".into()),
+            Warn,
+        ),
+        "VRAM_TOO_SMALL" => (detail_or(&c.detail, format!("This card cannot hold a stage of {chosen}")), Warn),
+        "NAT_BLOCKED" => (
+            detail_or(&c.detail, "The router blocks incoming connections — the card cannot join a chain".into()),
+            Warn,
+        ),
+        // A reason newer than this client: the detail is the only explanation we have.
+        _ => (detail_or(&c.detail, format!("Serving {serving}")), Plain),
+    }
+}
+
+/// The coordinator's detail with the first letter capitalized, or the fallback when it is empty.
+fn detail_or(detail: &str, fallback: String) -> String {
+    let mut chars = detail.trim().chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => fallback,
     }
 }

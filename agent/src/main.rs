@@ -31,6 +31,7 @@ use std::{io::Read, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use contribution::{Contribution, ModelSelection, Preference, PreferenceMode};
 use publicompute_proto::common::{EngineKind, ModelRef, Money};
 use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
@@ -191,11 +192,11 @@ struct Args {
 
     /// Initial contribution mode. Usage reserves the card for the selected weights.
     /// Free mode lets the scheduler use it where needed. A stored preference takes priority.
-    #[arg(long = "mode", default_value = "usage")]
-    modo: String,
+    #[arg(long = "mode")]
+    mode: Option<String>,
     /// USE selection as an ID with optional quantization. Defaults to the installed weights.
     #[arg(long = "selected-model")]
-    modello_scelto: Option<String>,
+    selected_model: Option<String>,
 
     /// Region advertised in the handshake. An empty value leaves it unset.
     /// An administrative assignment takes precedence over this hint.
@@ -252,6 +253,13 @@ enum Command {
     NatCheck,
     /// Verify the coordinator's QUIC endpoint without enrolling.
     CoordinatorCheck,
+    /// Save the installer's choice while the service is stopped.
+    #[command(hide = true)]
+    InstallPreference { choice: String },
+    /// Copy service-owned preference state to the installer's snapshot.
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    BackupPreference { name: String },
     /// Replace the installed package directory in one filesystem operation.
     #[cfg(target_os = "linux")]
     #[command(hide = true)]
@@ -303,6 +311,9 @@ fn run_command(args: Args) -> Result<i32> {
                 println!("Coordinator reachable over QUIC");
                 Ok(0)
             }
+            Some(Command::InstallPreference { choice }) => install_preference(&args.data_dir, choice).map(|()| 0),
+            #[cfg(target_os = "linux")]
+            Some(Command::BackupPreference { name }) => backup_preference(&args.data_dir, name),
             #[cfg(target_os = "linux")]
             Some(Command::SwapInstall { staging, installed }) => swap_install(staging, installed).map(|()| 0),
             None => {
@@ -314,6 +325,58 @@ fn run_command(args: Args) -> Result<i32> {
     runtime.shutdown_timeout(Duration::from_secs(1));
     drop(data_dir_lock);
     result
+}
+
+fn install_preference(data_dir: &std::path::Path, choice: &str) -> Result<()> {
+    let id = match choice {
+        "free" => None,
+        "medio" => Some("qwen3.6-35b-a3b"),
+        "deepseek" => Some("deepseek-v4-flash"),
+        _ => bail!("expected medio, deepseek or free"),
+    };
+    // Use the same lock as the service so a running agent cannot overwrite the choice.
+    let _lock = control::Live::open(data_dir)?;
+    let mut model = None;
+    if let Some(id) = id {
+        let entry = models::find(id, None).context("installer model is absent from the manifest")?;
+        let store = models::Store::new(data_dir);
+        store.prepare()?;
+        println!("{id} needs {:.1} GiB of disk space for its weights.", models::gib(entry.bytes));
+        let space = store.download_size(entry).and_then(|missing| match missing {
+            Some(bytes) => store.space(bytes),
+            None => Ok(()),
+        });
+        match space {
+            Ok(()) => model = Some(ModelSelection { id: entry.id.clone(), quant: entry.quant.clone() }),
+            Err(err) => eprintln!("Cannot prepare {id}: {err:#}. Keeping the card free. Use publicompute use when ready."),
+        }
+    }
+    let contribution = Contribution::open(data_dir, Preference { modo: PreferenceMode::Free, model: None, revision: 0 })?;
+    let mode = if model.is_some() { PreferenceMode::Usage } else { PreferenceMode::Free };
+    contribution.imposta(mode, model)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn backup_preference(data_dir: &std::path::Path, name: &str) -> Result<i32> {
+    use std::{io::{self, Write}, os::unix::fs::MetadataExt};
+
+    const MAX_BYTES: u64 = 16 << 10;
+    anyhow::ensure!(matches!(name, "contributo.json" | "active-model.json"), "unexpected preference file {name}");
+    let file = match models::open_file(&data_dir.join(name), false) {
+        Ok(file) => file,
+        Err(err) if err.downcast_ref::<io::Error>().is_some_and(|e| e.kind() == io::ErrorKind::NotFound) => return Ok(3),
+        Err(err) => return Err(err),
+    };
+    let meta = file.metadata()?;
+    anyhow::ensure!(meta.nlink() == 1 && meta.uid() == rustix::process::geteuid().as_raw(), "unexpected owner or link count for {name}");
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(!bytes.is_empty() && bytes.len() as u64 <= MAX_BYTES, "invalid size for {name}");
+    let mut output = io::stdout().lock();
+    output.write_all(&bytes)?;
+    output.flush()?;
+    Ok(0)
 }
 
 #[cfg(target_os = "linux")]
@@ -379,21 +442,33 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
         None
     };
     let configured = model_metadata(&args);
-    let modo = contribution::PreferenceMode::parse(&args.modo)?;
+    let initial = configured.as_ref().cloned().unwrap_or_default();
+    let from_store = configured.as_ref().is_ok_and(|m| m.model_id.is_empty());
+    let mode = match args.mode.as_deref() {
+        Some(mode) => PreferenceMode::parse(mode)?,
+        None if from_store && args.selected_model.is_none() => PreferenceMode::Free,
+        None => PreferenceMode::Usage,
+    };
     let selected = |model: &ModelRef, override_model: Option<&str>| match override_model {
         Some(m) => match m.split_once(':') {
-            Some((id, quant)) => contribution::ModelSelection { id: id.into(), quant: quant.into() },
-            None => contribution::ModelSelection { id: m.into(), quant: model.quantization.clone() },
+            Some((id, quant)) => ModelSelection { id: id.into(), quant: quant.into() },
+            None if model.model_id.is_empty() => ModelSelection {
+                id: m.into(),
+                quant: models::find(m, None).map_or_else(|| model.quantization.clone(), |entry| entry.quant.clone()),
+            },
+            None => ModelSelection { id: m.into(), quant: model.quantization.clone() },
         },
-        None => contribution::ModelSelection { id: model.model_id.clone(), quant: model.quantization.clone() },
+        None => ModelSelection { id: model.model_id.clone(), quant: model.quantization.clone() },
     };
-    let initial = configured.as_ref().cloned().unwrap_or_default();
-    let contribution = contribution::Contribution::open(&args.data_dir, contribution::Preference {
-        modo,
-        model: (modo == contribution::PreferenceMode::Usage).then(|| selected(&initial, args.modello_scelto.as_deref())),
+    let contribution = Contribution::open(&args.data_dir, Preference {
+        modo: mode,
+        model: (mode == PreferenceMode::Usage && (!from_store || args.selected_model.is_some()))
+            .then(|| selected(&initial, args.selected_model.as_deref())),
         revision: 0,
     })?;
+    let startup_preference = contribution.preference();
     let telemetria_gpu = Arc::new(gpu::Telemetria::default());
+    let stage_only = matches!(args.engine, EngineArg::Stages);
     let (engine_state, engine_rx) = tokio::sync::watch::channel(engine::supervisor::EngineState::Starting);
     let control = control::Control::new(
         contribution.clone(),
@@ -402,7 +477,7 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
         engine_rx,
         initial,
         args.model_path.clone(),
-    ).with_models(store.clone(), model_error.clone());
+    ).stage_only(stage_only).with_models(store.clone(), model_error.clone());
     control.verifying_weights(store.is_some() || args.model_path.is_some());
     listener.serve(control.clone())?;
 
@@ -415,9 +490,10 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
 
     let configured_path = args.model_path.clone();
     let restore = store.is_some();
+    let requested = from_store.then(|| startup_preference.clone());
     let verify = async {
         tokio::select! {
-            verified = tokio::task::spawn_blocking(move || verify_startup_weights(&weights, restore, configured, configured_path)) => {
+            verified = tokio::task::spawn_blocking(move || verify_startup_weights(&weights, restore, configured, configured_path, requested.as_ref())) => {
                 verified?.map(Some)
             }
             _ = uscita_rx.wait_for(|stop| *stop) => Ok(None),
@@ -436,15 +512,26 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
     }
     {
         let _commands = live.changes.commands.lock().await;
-        let modello_scelto = selected(&model, args.modello_scelto.as_deref().filter(|_| restored.is_none()));
-        if let Some(active) = restored {
-            let pref = contribution.preference();
-            if pref.modo == contribution::PreferenceMode::Free && active.use_revision == Some(pref.revision) {
-                contribution.imposta(contribution::PreferenceMode::Usage, Some(modello_scelto.clone()))?;
+        let preference = contribution.preference();
+        if preference.revision == startup_preference.revision {
+            if model.model_id.is_empty() && preference.modo == PreferenceMode::Usage {
+                let requested = preference.model.as_ref().and_then(|m| models::find(&m.id, Some(&m.quant)));
+                if requested.is_none() {
+                    // A preference from an older release may name weights we no longer serve.
+                    contribution.imposta(PreferenceMode::Free, None)?;
+                }
+            } else if !model.model_id.is_empty() {
+                let picked = selected(&model, args.selected_model.as_deref().filter(|_| restored.is_none()));
+                // A finished download adds the verified fingerprint sent with this preference.
+                if restored.is_some_and(|active| active.use_revision == Some(preference.revision)) {
+                    contribution.imposta(PreferenceMode::Usage, Some(picked))?;
+                } else {
+                    contribution.align_model(picked)?;
+                }
             }
         }
-        contribution.align_model(modello_scelto)?;
         control.model_verified(model.clone(), args.model_path.clone(), model_error, needs_repair);
+        control.resume_saved_model();
     }
     if needs_repair {
         // Keep the socket available for a repair or another model choice.
@@ -472,14 +559,14 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
         Some(value) if value.parse::<u32>().is_ok() => gpu::resolve_index(value).await,
         _ => None,
     };
-    let track_gpu = managed_gpu && (selector.is_none() || gpu_uuid.is_some());
+    let track_gpu = (managed_gpu && selector.is_none()) || ((managed_gpu || stage_only) && gpu_uuid.is_some());
     let unresolved_index = gpu_index.is_some() && gpu_uuid.is_none();
     if managed_gpu && !track_gpu {
         warn!("cannot resolve a single NVIDIA GPU UUID; GPU loss monitoring is disabled");
     }
     let first = gpu::read(gpu_uuid.as_deref()).await;
     let detected = first.as_deref().unwrap_or_default().to_vec();
-    gpu::avvia_campionatore(telemetria_gpu.clone(), first, track_gpu, gpu_uuid).await;
+    gpu::avvia_campionatore(telemetria_gpu.clone(), first, track_gpu, gpu_uuid.clone()).await;
     if track_gpu && identity::load(&args.data_dir)?.is_none() {
         // Initial enrollment requires an inventory. An enrolled node can reconnect while paused.
         let mut device = telemetria_gpu.device_rx();
@@ -544,11 +631,12 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
     };
     let progress = Arc::new(engine::progress::Progress::default());
     let stats = Arc::new(engine::stats::Stats::new(Some(&args.data_dir)));
-    let stage_only = matches!(args.engine, EngineArg::Stages);
+    let has_model = !model.model_id.is_empty();
     if stage_only && matches!(args.llama_mode, LlamaMode::Managed) {
         bail!("--llama-mode managed requires a llama engine");
     }
     let stages = match args.stage_bin.as_ref() {
+        Some(_) if (stage_only || managed_gpu) && !has_model => None,
         Some(bin) if stage_only || managed_gpu => {
             Some(stages::Stages::new(stages::StagesConfig {
                 stage_bin: bin.clone(),
@@ -558,7 +646,7 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
                 threads: args.stage_threads,
                 ngl: args.stage_ngl,
                 extra_args: args.stage_args.clone(),
-                env: vec![],
+                env: gpu_uuid.map(|uuid| ("CUDA_VISIBLE_DEVICES".into(), uuid)).into_iter().collect(),
                 load_timeout: secs(args.stage_load_timeout_secs),
                 stop_grace: secs(args.stop_grace_secs),
                 kill_wait: secs(args.kill_wait_secs),
@@ -571,6 +659,9 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
         None if stage_only => bail!("--engine stages requires --stage-bin"),
         None => None,
     };
+    if let Some(stages) = &stages {
+        control.attach_stages(stages.clone());
+    }
     let stage_engine = stages.as_ref().map(|s| Arc::new(engine::Engine::Stages(engine::stages::StadiEngine {
         stages: s.clone(),
         attive: Default::default(),
@@ -579,23 +670,22 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
         progress: if stage_only { progress.clone() } else { Default::default() },
     })));
     let engine = match args.engine {
-        EngineArg::Mock => Arc::new(engine::Engine::Mock(engine::mock::MockEngine {
+        EngineArg::Mock | EngineArg::Stages => stage_engine.clone().unwrap_or_else(|| Arc::new(engine::Engine::Mock(engine::mock::MockEngine {
             per_token_delay: Duration::from_millis(args.mock_delay_ms),
             cheat: args.mock_cheat,
             hang: std::sync::atomic::AtomicU32::new(args.mock_hang),
             limits: limits.clone(),
             progress: progress.clone(),
-        })),
+        }))),
         EngineArg::Llama => Arc::new(engine::Engine::Llama(engine::llama::LlamaEngine::new(
             args.llama_url.clone(),
             limits.clone(),
             progress.clone(),
             args.llama_stream,
         )?)),
-        EngineArg::Stages => stage_engine.as_ref().expect("stage config is required").clone(),
     };
     let managed = match (args.engine, args.llama_mode) {
-        (EngineArg::Llama, LlamaMode::Managed) => Some(engine::managed::ManagedCfg {
+        (EngineArg::Llama, LlamaMode::Managed) if has_model => Some(engine::managed::ManagedCfg {
             bin: args.llama_bin.clone().context("--llama-mode managed requires --llama-bin")?,
             model_path: args.model_path.clone().context("--llama-mode managed requires --model-path")?,
             port: engine::managed::port_from_url(&args.llama_url)?,
@@ -608,6 +698,9 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
         (EngineArg::Mock, LlamaMode::Managed) => bail!("--llama-mode managed requires --engine llama"),
         _ => None,
     };
+    if !has_model {
+        engine_state.send_replace(engine::supervisor::EngineState::Parked);
+    }
     let sup = engine::supervisor::Supervisor::with_state(
         engine.clone(),
         engine::supervisor::SupervisorCfg {
@@ -631,6 +724,9 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
     // Check the engine before connecting so the first advertised state reflects its readiness.
     // Recovery continues in the background if the initial probe does not pass.
     let start_engine = async {
+        if !has_model {
+            return Ok(());
+        }
         tokio::select! {
             result = sup.start() => result,
             _ = uscita_rx.wait_for(|stop| *stop) => Ok(()),
@@ -653,7 +749,7 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
     } else {
         Default::default()
     };
-    let build = if track_gpu && sup.state() != engine::supervisor::EngineState::Ready {
+    let build = if !has_model || (track_gpu && sup.state() != engine::supervisor::EngineState::Ready) {
         None
     } else {
         engine.build_info().await
@@ -680,7 +776,7 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
             s.set_bridge(p.clone());
             Some(p)
         }
-        (Some(_), None) => {
+        (Some(_), None) if args.stage_bin.is_none() => {
             // Shared configuration may set a relay even on nodes that never start a stage.
             warn!("--relay requires --stage-bin; ignoring it");
             None
@@ -808,10 +904,13 @@ async fn connect(
         if *stop_rx.borrow() || *cfg.output.borrow() {
             return Ok(None);
         }
-        if cfg.gpu_profile_missing() && cfg.sup.state() == engine::supervisor::EngineState::Ready {
+        if cfg.gpu_profile_missing() && !cfg.gpu.unavailable()
+            && (cfg.model.model_id.is_empty() || cfg.sup.state() == engine::supervisor::EngineState::Ready)
+        {
             let cards = cfg.gpu.letture();
             if let Some(card) = cards.first() {
-                hardware::set_detected_gpu(&mut cfg.hardware, card, engine.build_info().await);
+                let build = if cfg.model.model_id.is_empty() { None } else { engine.build_info().await };
+                hardware::set_detected_gpu(&mut cfg.hardware, card, build);
             }
         }
         let id = match identity::load(&args.data_dir)? {
@@ -819,8 +918,11 @@ async fn connect(
             None => {
                 if cfg.gpu_profile_missing() {
                     let mut state = cfg.sup.subscribe();
+                    let mut device = cfg.gpu.device_rx();
+                    let has_model = !cfg.model.model_id.is_empty();
                     tokio::select! {
-                        ready = state.wait_for(|state| *state == engine::supervisor::EngineState::Ready) => { ready?; }
+                        ready = state.wait_for(|state| *state == engine::supervisor::EngineState::Ready), if has_model => { ready?; }
+                        ready = device.wait_for(|state| matches!(state.device, gpu::Device::Ready(_))), if !has_model => { ready?; }
                         _ = leaving.wait_for(|stop| *stop) => return Ok(None),
                     }
                     continue;
@@ -929,10 +1031,14 @@ fn verify_startup_weights(
     restore: bool,
     configured: Result<ModelRef>,
     path: Option<PathBuf>,
+    preference: Option<&Preference>,
 ) -> Result<StartupWeights> {
     let mut error = None;
     if restore {
-        match store.active() {
+        match store.active(|active| preference.is_none_or(|pref| {
+            pref.modo == PreferenceMode::Free || active.use_revision == Some(pref.revision)
+                || pref.model.as_ref().is_none_or(|m| m.id == active.id && m.quant == active.quant)
+        })) {
             Ok(Some((model, active))) => return Ok(StartupWeights {
                 model: model.reference(), path: Some(store.path(model)), restored: Some(active), error: None, needs_repair: false,
             }),
@@ -976,7 +1082,8 @@ fn model_metadata(args: &Args) -> Result<ModelRef> {
             }
             (args.model_id.clone().context("--weights-sha256 requires --model-id")?, hash)
         }
-        (None, None) => bail!("indicare --model-path oppure --model-id e --weights-sha256"),
+        (None, None) if args.model_id.is_none() => return Ok(ModelRef::default()),
+        (None, None) => bail!("--model-id requires --model-path or --weights-sha256"),
     };
     Ok(ModelRef { model_id: id, quantization: args.quantization.clone(), weights_sha256: hash })
 }
@@ -1036,6 +1143,47 @@ fn base64_decode(s: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use tokio::sync::{mpsc, watch};
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_choice_takes_priority_over_a_previous_switch() {
+        let dir = stages::tests::tempdir("install-preference");
+        let store = models::Store::new(&dir);
+        store.prepare().unwrap();
+        let medium = models::find("qwen3.6-35b-a3b", None).unwrap();
+        let deepseek = models::find("deepseek-v4-flash", None).unwrap();
+        for model in [medium, deepseek] {
+            models::tests::cached_weights(&store, model);
+        }
+        let args = |choice| Args::try_parse_from([
+            "publicompute-agent", "--data-dir", dir.to_str().unwrap(), "install-preference", choice,
+        ]).unwrap();
+        let initial = Preference { modo: PreferenceMode::Free, model: None, revision: 0 };
+        assert_eq!(run_command(args("medio")).unwrap(), 0);
+        let preference = Contribution::open(&dir, initial.clone()).unwrap().preference();
+        assert_eq!(preference.modo, PreferenceMode::Usage);
+        assert_eq!(preference.model.as_ref().unwrap().id, medium.id);
+
+        // A completed use request survives a restart under the same preference.
+        store.save_active(deepseek, Some(preference.revision)).unwrap();
+        let configured = || model_metadata(&Args::try_parse_from(["publicompute-agent"]).unwrap());
+        let weights = verify_startup_weights(&store, true, configured(), None, Some(&preference)).unwrap();
+        assert_eq!(weights.model.model_id, deepseek.id);
+        assert_eq!(weights.path, Some(store.path(deepseek)));
+
+        assert_eq!(run_command(args("medio")).unwrap(), 0);
+        let preference = Contribution::open(&dir, initial.clone()).unwrap().preference();
+        let weights = verify_startup_weights(&store, true, configured(), None, Some(&preference)).unwrap();
+        assert!(weights.model.model_id.is_empty());
+        assert!(weights.path.is_none());
+
+        assert_eq!(run_command(args("free")).unwrap(), 0);
+        let preference = Contribution::open(&dir, initial).unwrap().preference();
+        assert_eq!(preference.modo, PreferenceMode::Free);
+        assert!(preference.model.is_none());
+        assert!(store.installed(deepseek).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn owner_token_file_wins() {

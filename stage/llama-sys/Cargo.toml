@@ -1,6 +1,6 @@
 [package]
 name = "publicompute-llama-sys"
-version = "0.1.2"
+version = "0.1.4"
 description = "Bindings for the dynamically linked llama.cpp engine"
 edition.workspace = true
 license.workspace = true

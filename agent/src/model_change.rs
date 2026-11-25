@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     io::SeekFrom,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -18,12 +19,22 @@ use tokio::{
 };
 
 use crate::{
-    contribution::{Contribution, PreferenceMode},
+    contribution::Contribution,
     control::Live,
     models::{self, Model, Store},
 };
 
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(600);
+const RETRY_SECONDS: [u64; 4] = [10, 30, 60, 300];
+
+#[derive(Debug)]
+struct RetryDownload;
+
+impl fmt::Display for RetryDownload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("transient download error")
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Phase {
@@ -265,8 +276,7 @@ impl Changes {
     }
 
     pub async fn commit(&self, change: Change, store: Arc<Store>, contribution: &Contribution) -> bool {
-        let pref = contribution.preference();
-        let revision = (pref.modo == PreferenceMode::Free).then_some(pref.revision);
+        let revision = Some(contribution.preference().revision);
         let result = tokio::task::spawn_blocking(move || store.save_active(change.model, revision))
             .await
             .unwrap_or_else(|err| Err(err.into()));
@@ -300,17 +310,40 @@ async fn prepare(
     store: Arc<Store>,
     ticket: u64,
     model: &'static Model,
-    client: impl FnOnce() -> Result<reqwest::Client>,
+    client: impl Fn() -> Result<reqwest::Client>,
 ) {
     // Wait for the previous worker to close its file before inspecting the partial again.
     let _worker = store.worker.lock().await;
-    if !live.changes.current(ticket) {
-        return;
-    }
-    let result = fetch_weights(&live, &store, ticket, model, client).await;
+    let mut state = live.changes.subscribe();
+    let mut retry = 0;
+    let result = loop {
+        if !live.changes.current(ticket) {
+            return;
+        }
+        let result = fetch_weights(&live, &store, ticket, model, &client).await;
+        let Err(err) = &result else { break result };
+        if !err.is::<RetryDownload>() {
+            break result;
+        }
+        let delay = RETRY_SECONDS[retry];
+        retry = (retry + 1).min(RETRY_SECONDS.len() - 1);
+        if !live.changes.update(ticket, |c| {
+            c.error = Some(format!("retrying in {delay} s: {err:#}"));
+            true
+        }) {
+            return;
+        }
+        tracing::warn!(model = %model.id, error = %format_args!("{err:#}"), retry_in_seconds = delay, "will retry model download");
+        live.notify();
+        tokio::select! {
+            _ = state.wait_for(|s| s.as_ref().is_none_or(|c| c.ticket != ticket)) => return,
+            _ = tokio::time::sleep(Duration::from_secs(delay)) => {}
+        }
+    };
     let changed = match result {
         Ok(()) => live.changes.update(ticket, |c| {
             c.bytes = model.bytes;
+            c.error = None;
             c.phase = Phase::Switching(Instant::now() + DRAIN_TIMEOUT);
             true
         }),
@@ -326,7 +359,7 @@ async fn fetch_weights(
     store: &Arc<Store>,
     ticket: u64,
     model: &'static Model,
-    client: impl FnOnce() -> Result<reqwest::Client>,
+    client: &impl Fn() -> Result<reqwest::Client>,
 ) -> Result<()> {
     if store.download_candidate(model)? {
         let (live, store) = (live.clone(), store.clone());
@@ -358,7 +391,7 @@ async fn fetch_weights(
         let mut response = tokio::select! {
             biased;
             _ = &mut replaced => bail!("model request replaced"),
-            response = request.send() => response.map_err(reqwest::Error::without_url).context("request model weights")?,
+            response = request.send() => response.map_err(|err| request_error(err, "request model weights"))?,
         };
         let start = response_start(response.status(), response.headers(), offset, model.bytes)?;
         if start == 0 && offset > 0 {
@@ -373,7 +406,7 @@ async fn fetch_weights(
             let chunk = tokio::select! {
                 biased;
                 _ = &mut replaced => bail!("model request replaced"),
-                chunk = response.chunk() => chunk.map_err(reqwest::Error::without_url).context("read model weights")?,
+                chunk = response.chunk() => chunk.map_err(|err| request_error(err, "read model weights"))?,
             };
             let Some(chunk) = chunk else { break };
             let next = offset.saturating_add(chunk.len() as u64);
@@ -385,11 +418,9 @@ async fn fetch_weights(
             report(live, ticket, Phase::Downloading, offset);
         }
     }
-    ensure!(
-        offset == model.bytes,
-        "incomplete model download ({offset}/{} bytes)",
-        model.bytes
-    );
+    if offset != model.bytes {
+        return Err(anyhow::anyhow!("incomplete model download ({offset}/{} bytes)", model.bytes).context(RetryDownload));
+    }
     part.sync_all().await?;
     drop(part);
     report(live, ticket, Phase::Verifying, offset);
@@ -397,10 +428,24 @@ async fn fetch_weights(
     tokio::task::spawn_blocking(move || store.promote(model, || live.changes.current(ticket))).await?
 }
 
+fn request_error(err: reqwest::Error, action: &'static str) -> anyhow::Error {
+    let transport = err.is_timeout() || err.is_request() || err.is_body() || err.is_decode() || err.is_connect();
+    let err = anyhow::Error::new(err.without_url()).context(action);
+    let tls = err.chain().any(|cause| {
+        cause.is::<rustls::Error>() || cause.downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref).is_some_and(|err| err.is::<rustls::Error>())
+    });
+    if transport && !tls {
+        err.context(RetryDownload)
+    } else {
+        err
+    }
+}
+
 fn report(live: &Live, ticket: u64, phase: Phase, bytes: u64) {
     // Wake the network and status followers at coarse intervals during a fast transfer.
     let changed = live.changes.update(ticket, |c| {
-        let changed = c.phase != phase || c.bytes >> 24 != bytes >> 24 || bytes == c.model.bytes;
+        let changed = c.error.take().is_some() || c.phase != phase || c.bytes >> 24 != bytes >> 24 || bytes == c.model.bytes;
         c.bytes = bytes;
         c.phase = phase;
         changed
@@ -422,7 +467,14 @@ fn response_start(status: StatusCode, headers: &header::HeaderMap, offset: u64, 
             offset
         }
         StatusCode::RANGE_NOT_SATISFIABLE if offset == total => return Ok(total),
-        _ => bail!("unexpected model download HTTP status {status}"),
+        _ => {
+            let err = anyhow::anyhow!("unexpected model download HTTP status {status}");
+            return Err(if status.is_server_error() || matches!(status, StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS) {
+                err.context(RetryDownload)
+            } else {
+                err
+            });
+        }
     };
     if let Some(encoding) = headers.get(header::CONTENT_ENCODING) {
         ensure!(encoding == "identity", "unexpected content encoding for model weights");
@@ -449,7 +501,7 @@ mod tests {
     const WEIGHTS: &[u8] = b"abcdefgh";
 
     async fn https_fixture(
-        reply: &'static str,
+        replies: &[&'static str],
         stall: bool,
     ) -> (reqwest::Client, String, watch::Receiver<String>, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -471,27 +523,25 @@ mod tests {
             .build()
             .unwrap();
         let (headers, received) = watch::channel(String::new());
+        let replies = replies.to_vec();
         let task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut stream = BufReader::new(
-                tokio_rustls::TlsAcceptor::from(Arc::new(tls))
-                    .accept(stream)
-                    .await
-                    .unwrap(),
-            );
-            let mut request = String::new();
-            loop {
-                let end = request.len();
-                if stream.read_line(&mut request).await.unwrap() == 0 || &request[end..] == "\r\n" {
-                    break;
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+            for reply in replies {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(acceptor.accept(stream).await.unwrap());
+                let mut request = String::new();
+                loop {
+                    let end = request.len();
+                    if stream.read_line(&mut request).await.unwrap() == 0 || &request[end..] == "\r\n" {
+                        break;
+                    }
                 }
-            }
-            headers.send_replace(request);
-            stream.get_mut().write_all(reply.as_bytes()).await.unwrap();
-            stream.get_mut().flush().await.unwrap();
-            if stall {
-                std::future::pending::<()>().await;
-            } else {
+                headers.send_replace(request);
+                stream.get_mut().write_all(reply.as_bytes()).await.unwrap();
+                stream.get_mut().flush().await.unwrap();
+                if stall {
+                    std::future::pending::<()>().await;
+                }
                 stream.get_mut().shutdown().await.unwrap();
             }
         });
@@ -508,7 +558,7 @@ mod tests {
         prefix: &[u8],
         response: &'static str,
     ) -> (Arc<Live>, Arc<Store>, &'static Model, String) {
-        let (client, url, received, server) = https_fixture(response, false).await;
+        let (client, url, received, server) = https_fixture(&[response], false).await;
         let mut model = fixture_model(name, WEIGHTS);
         model.url = url;
         let model = Box::leak(Box::new(model));
@@ -518,7 +568,7 @@ mod tests {
         let (ticket, _, _) = live.changes.begin(&live, &store, model).unwrap();
         timeout(
             Duration::from_secs(5),
-            prepare(live.clone(), store.clone(), ticket, model, || Ok(client)),
+            prepare(live.clone(), store.clone(), ticket, model, || Ok(client.clone())),
         )
         .await
         .unwrap();
@@ -533,6 +583,37 @@ mod tests {
             "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-7/8\r\nContent-Length: 5\r\nConnection: close\r\n\r\ndefgh").await;
         assert!(request.contains("range: bytes=3-\r\n"));
         assert!(live.changes.switching().is_some());
+        assert_eq!(fs::read(store.path(model)).unwrap(), WEIGHTS);
+        assert!(!store.partial(model).exists());
+    }
+
+    #[tokio::test]
+    async fn interrupted_download_retries_from_the_saved_offset() {
+        let (client, url, received, server) = https_fixture(&[
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nabc",
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-7/8\r\nContent-Length: 5\r\nConnection: close\r\n\r\ndefgh",
+        ], false).await;
+        let mut model = fixture_model("retry", WEIGHTS);
+        model.url = url;
+        let model = Box::leak(Box::new(model));
+        let store = fixture_store("https-retry");
+        let live = Live::new();
+        let mut state = live.changes.subscribe();
+        let (ticket, _, _) = live.changes.begin(&live, &store, model).unwrap();
+        let worker = tokio::spawn(prepare(live.clone(), store.clone(), ticket, model, move || Ok(client.clone())));
+        timeout(Duration::from_secs(5), state.wait_for(|state| {
+            state.as_ref().is_some_and(|change| change.error.is_some())
+        })).await.unwrap().unwrap();
+        let status = live.changes.view().unwrap();
+        assert_eq!(status.state, "downloading");
+        assert!(status.error.unwrap().contains("retrying in 10 s"));
+        assert_eq!(fs::read(store.partial(model)).unwrap(), b"abc");
+
+        timeout(Duration::from_secs(15), worker).await.unwrap().unwrap();
+        server.await.unwrap();
+        assert!(received.borrow().to_ascii_lowercase().contains("range: bytes=3-\r\n"));
+        assert!(live.changes.switching().is_some());
+        assert!(live.changes.view().unwrap().error.is_none());
         assert_eq!(fs::read(store.path(model)).unwrap(), WEIGHTS);
         assert!(!store.partial(model).exists());
     }
@@ -643,7 +724,7 @@ mod tests {
             let name = if is_link { "replace-symlink" } else { "replace-bad-weights" };
             let store = fixture_store(name);
             let (client, url, _, server) = https_fixture(
-                "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nabcdefgh",
+                &["HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nabcdefgh"],
                 false,
             ).await;
             let mut model = fixture_model(name, WEIGHTS);
@@ -661,7 +742,7 @@ mod tests {
             let live = Live::new();
             let (ticket, installed, missing) = live.changes.begin(&live, &store, model).unwrap();
             assert_eq!((installed, missing), (false, model.bytes));
-            timeout(Duration::from_secs(5), prepare(live.clone(), store.clone(), ticket, model, || Ok(client))).await.unwrap();
+            timeout(Duration::from_secs(5), prepare(live.clone(), store.clone(), ticket, model, || Ok(client.clone()))).await.unwrap();
             assert!(live.changes.switching().is_some());
             assert!(fs::symlink_metadata(&path).unwrap().is_file());
             assert_eq!(fs::read(path).unwrap(), WEIGHTS);
@@ -675,7 +756,7 @@ mod tests {
     #[tokio::test]
     async fn a_new_use_stops_an_active_transfer_and_keeps_its_partial() {
         let (client, url, _, server) = https_fixture(
-            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nabc",
+            &["HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nabc"],
             true,
         )
         .await;
@@ -686,7 +767,7 @@ mod tests {
         let store = fixture_store("replace-transfer");
         let live = Live::new();
         let (ticket, _, _) = live.changes.begin(&live, &store, first).unwrap();
-        let old_worker = tokio::spawn(prepare(live.clone(), store.clone(), ticket, first, || Ok(client)));
+        let old_worker = tokio::spawn(prepare(live.clone(), store.clone(), ticket, first, move || Ok(client.clone())));
         timeout(Duration::from_secs(5), async {
             while fs::metadata(store.partial(first)).map_or(0, |m| m.len()) < 3 {
                 tokio::time::sleep(Duration::from_millis(10)).await;

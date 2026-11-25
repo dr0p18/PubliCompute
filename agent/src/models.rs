@@ -49,7 +49,7 @@ impl Model {
 pub struct ActiveModel {
     pub id: String,
     pub quant: String,
-    // Apply the selection to FARM mode on startup only if no later preference replaced it.
+    // Apply a completed switch only if no later preference replaced it.
     #[serde(default)]
     pub use_revision: Option<u64>,
 }
@@ -195,11 +195,17 @@ impl Store {
         }
     }
 
-    pub fn active(&self) -> Result<Option<(&'static Model, ActiveModel)>> {
+    pub fn active(&self, accept: impl FnOnce(&ActiveModel) -> bool) -> Result<Option<(&'static Model, ActiveModel)>> {
         let Some(active): Option<ActiveModel> = read_json(&self.data_dir.join("active-model.json"), false)? else {
             return Ok(None);
         };
-        let model = find(&active.id, Some(&active.quant)).context("model is absent from the manifest")?;
+        let Some(model) = find(&active.id, Some(&active.quant)) else {
+            // Older releases can leave a selection for weights we no longer serve.
+            return Ok(None);
+        };
+        if !accept(&active) {
+            return Ok(None);
+        }
         self.verify(model, || true)?;
         Ok(Some((model, active)))
     }
@@ -483,37 +489,28 @@ pub mod tests {
     }
 
     #[test]
-    fn manifest_matches_catalog_and_installer() {
+    fn manifest_matches_catalog_and_downloads() {
         let catalog: Value = serde_json::from_str(include_str!("../../infra/hetzner/models.json")).unwrap();
         let catalog = catalog["models"].as_array().unwrap();
-        assert_eq!(MANIFEST.len(), 3);
-        assert_eq!(MANIFEST.len(), catalog.len());
-        for model in MANIFEST.iter() {
-            let row = catalog.iter().find(|row| row["id"] == model.id).unwrap();
+        assert_eq!(MANIFEST.len(), 2);
+        assert_eq!(catalog.len(), MANIFEST.len());
+        for row in catalog {
+            let model = find(row["id"].as_str().unwrap(), None).unwrap();
             assert_eq!(row["quantization"], model.quant);
             assert_eq!(row["weights_sha256"], model.sha256);
+        }
+        for model in MANIFEST.iter() {
             assert_eq!(model.reference().weights_sha256.len(), 32);
             assert_eq!(model.file, format!("{}-{}.gguf", model.id, model.quant));
             let url = reqwest::Url::parse(&model.url).unwrap();
             assert!(allowed_url(&url));
             let (_, path) = url.path().split_once("/resolve/").unwrap();
-            let (commit, _) = path.split_once('/').unwrap();
+            let (commit, file) = path.split_once('/').unwrap();
             assert_eq!(hex::decode(commit).unwrap().len(), 20);
+            assert!(file.to_ascii_lowercase().starts_with(&format!("{}-", model.id)));
+            assert!(file.ends_with(".gguf"));
         }
-        let inst = include_str!("../../site/install.sh");
-        assert_eq!(inst, include_str!("../../install.sh"));
-        let row = inst
-            .lines()
-            .find_map(|line| line.strip_prefix("model_manifest='"))
-            .unwrap();
-        let small = find("qwen3.5-9b", None).unwrap();
-        assert_eq!(
-            row.trim_end_matches('\''),
-            format!(
-                "{} {} {} {} {}",
-                small.id, small.quant, small.bytes, small.sha256, small.url
-            )
-        );
+        assert_eq!(include_str!("../../site/install.sh"), include_str!("../../install.sh"));
         assert_eq!(find("qwen3.6-35b-a3b", None).unwrap().bytes, 22_360_456_160);
         assert_eq!(find("deepseek-v4-flash", None).unwrap().bytes, 86_720_111_488);
     }
@@ -560,16 +557,16 @@ pub mod tests {
         let store = fixture_store("active-model");
         let model = find("qwen3.6-35b-a3b", None).unwrap();
         let active = store.data_dir.join("active-model.json");
-        assert!(store.active().unwrap().is_none());
+        assert!(store.active(|_| true).unwrap().is_none());
 
         fs::write(&active, b"{ broken").unwrap();
-        assert!(store.active().is_err());
+        assert!(store.active(|_| true).is_err());
         fs::write(&active, br#"{"id":"unknown","quant":"q"}"#).unwrap();
-        assert!(store.active().is_err());
+        assert!(store.active(|_| true).unwrap().is_none());
 
         cached_weights(&store, model);
         store.save_active(model, Some(42)).unwrap();
-        let (restored, selection) = store.active().unwrap().unwrap();
+        let (restored, selection) = store.active(|_| true).unwrap().unwrap();
         assert_eq!(restored.id, model.id);
         assert_eq!(selection.use_revision, Some(42));
         File::options()
@@ -578,7 +575,8 @@ pub mod tests {
             .unwrap()
             .set_len(40)
             .unwrap();
-        assert!(store.active().unwrap_err().to_string().contains("incorrect model size"));
+        assert!(store.active(|_| false).unwrap().is_none());
+        assert!(store.active(|_| true).unwrap_err().to_string().contains("incorrect model size"));
         fs::remove_dir_all(&store.data_dir).unwrap();
     }
 

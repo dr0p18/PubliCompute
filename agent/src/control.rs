@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -138,7 +138,7 @@ impl Live {
     }
 
     #[cfg(unix)]
-    async fn save_pause(self: &Arc<Self>, v: bool) -> Value {
+    async fn save_pause(self: &Arc<Self>, v: bool, resume: impl FnOnce() + Send + 'static) -> Value {
         let Ok(lock) = self.pause_lock.clone().try_lock_owned() else {
             return json!({"ok": false, "error": "busy", "text": "a pause state change is in progress"});
         };
@@ -170,6 +170,8 @@ impl Live {
             if v {
                 live.changes.cancel();
                 live.notify();
+            } else {
+                resume();
             }
             drop(commands);
             drop(lock);
@@ -316,6 +318,8 @@ struct ContributionView {
     in_chain: bool,
     free_seat: bool,
     reason: String,
+    /// Short English explanation from the coordinator; empty from older coordinators.
+    detail: String,
     /// Earliest time for a preference change, in Unix seconds.
     stable_until: Option<i64>,
     revision: u64,
@@ -339,6 +343,8 @@ struct Status {
     paused: bool,
     preference: PreferenceView,
     engine: &'static str,
+    weights_model: Option<String>,
+    weights_quant: Option<String>,
     loaded_model: Option<String>,
     loaded_quant: Option<String>,
     download: Option<crate::model_change::DownloadView>,
@@ -373,6 +379,8 @@ pub struct Control {
     model: Mutex<ModelState>,
     last_change: Mutex<Option<Instant>>,
     store: Option<Arc<crate::models::Store>>,
+    stage_only: bool,
+    stages: OnceLock<Arc<crate::stages::Stages>>,
 }
 
 struct ModelState {
@@ -402,10 +410,6 @@ fn engine_name(s: EngineState) -> &'static str {
     }
 }
 
-fn model_loaded(engine: EngineState, gpu_available: bool) -> bool {
-    gpu_available && matches!(engine, EngineState::Ready | EngineState::Busy | EngineState::Settling)
-}
-
 fn contribution_view(s: &ContributionStatus) -> ContributionView {
     ContributionView {
         effective_mode: match s.effective_mode() {
@@ -416,6 +420,7 @@ fn contribution_view(s: &ContributionStatus) -> ContributionView {
         in_chain: s.in_chain,
         free_seat: s.free_seat,
         reason: s.reason().as_str_name().to_string(),
+        detail: s.detail.clone(),
         stable_until: s.stable_until.as_ref().map(|t| t.seconds),
         revision: s.revision,
     }
@@ -444,10 +449,20 @@ impl Control {
     ) -> Self {
         Self {
             contribution, gpu, live, engine, last_change: Mutex::new(None), store: None,
+            stage_only: false, stages: OnceLock::new(),
             model: Mutex::new(ModelState {
                 reference: model, path: model_path, error: None, verifying: false, needs_repair: false,
             }),
         }
+    }
+
+    pub fn stage_only(mut self, stage_only: bool) -> Self {
+        self.stage_only = stage_only;
+        self
+    }
+
+    pub fn attach_stages(&self, stages: Arc<crate::stages::Stages>) {
+        let _ = self.stages.set(stages);
     }
 
     pub fn with_models(mut self, store: Option<Arc<crate::models::Store>>, error: Option<String>) -> Arc<Self> {
@@ -466,16 +481,44 @@ impl Control {
         self.live.notify();
     }
 
+    // The caller holds the command lock so a pause or a new choice cannot race this request.
+    pub fn resume_saved_model(&self) {
+        if self.live.is_paused() || self.live.changes.view().is_some() {
+            return;
+        }
+        {
+            let active = self.model.lock().unwrap();
+            if active.verifying || !active.reference.model_id.is_empty() {
+                return;
+            }
+        }
+        let preference = self.contribution.preference();
+        let Some(model) = preference.model.as_ref()
+            .filter(|_| preference.modo == PreferenceMode::Usage)
+            .and_then(|m| crate::models::find(&m.id, Some(&m.quant))) else { return };
+        let download = self.store.as_ref().context("the model store is unavailable")
+            .and_then(|store| self.live.changes.request(&self.live, store, model, None));
+        if let Err(err) = download {
+            tracing::warn!(model = %model.id, "cannot prepare selected weights: {err:#}");
+        }
+    }
+
     fn models(&self) -> Vec<LocalModel> {
         let engine = *self.engine.borrow();
         let active = self.model.lock().unwrap();
         let model = &active.reference;
-        let loaded = !active.needs_repair && model_loaded(engine, self.gpu.loss().is_none());
+        let loaded = self.model_loaded(&active, engine, !self.gpu.unavailable());
         let mut models = Vec::new();
         if !model.model_id.is_empty() {
             let bytes = active.path.as_ref().and_then(|p| std::fs::symlink_metadata(p).ok()).filter(|m| m.is_file()).map(|m| m.len()).unwrap_or(0);
-            models.push(LocalModel { id: model.model_id.clone(), quant: model.quantization.clone(),
-                state: if loaded { "ready" } else { active.engine_name(engine) }, loaded, bytes });
+            let state = if loaded {
+                "ready"
+            } else if self.stage_only && active.weights_ready() {
+                "weights ready"
+            } else {
+                active.engine_name(engine)
+            };
+            models.push(LocalModel { id: model.model_id.clone(), quant: model.quantization.clone(), state, loaded, bytes });
         }
         if self.store.is_some() {
             models.extend(crate::models::MANIFEST.iter()
@@ -483,6 +526,14 @@ impl Control {
                 .map(|m| LocalModel { id: m.id.clone(), quant: m.quant.clone(), state: "available", loaded: false, bytes: m.bytes }));
         }
         models
+    }
+
+    fn model_loaded(&self, model: &ModelState, engine: EngineState, gpu_available: bool) -> bool {
+        if !model.verified() || !gpu_available {
+            return false;
+        }
+        (!self.stage_only && matches!(engine, EngineState::Ready | EngineState::Busy | EngineState::Settling))
+            || self.stages.get().is_some_and(|stages| stages.model_loaded())
     }
 
     fn status(&self) -> Status {
@@ -496,7 +547,8 @@ impl Control {
             temperature_celsius: l.temperature,
         });
         let gpu_loss = self.gpu.loss();
-        let loaded = !model.needs_repair && !model.reference.model_id.is_empty() && model_loaded(engine, gpu_loss.is_none());
+        let loaded = self.model_loaded(&model, engine, !self.gpu.unavailable());
+        let weights_ready = model.weights_ready();
         Status {
             version: env!("CARGO_PKG_VERSION"),
             connected: self.live.connected.load(Ordering::Relaxed),
@@ -508,6 +560,8 @@ impl Control {
                 revision: p.revision,
             },
             engine: model.engine_name(engine),
+            weights_model: weights_ready.then(|| model.reference.model_id.clone()),
+            weights_quant: weights_ready.then(|| model.reference.quantization.clone()),
             loaded_model: loaded.then(|| model.reference.model_id.clone()),
             loaded_quant: loaded.then(|| model.reference.quantization.clone()),
             download: self.live.changes.view(),
@@ -540,6 +594,9 @@ impl Control {
                     let Some((store, model)) = self.store.as_ref().zip(crate::models::find(&id, quant.as_deref())) else {
                         return Err(Refusal("not_installed", format!("model {id} is not installed on this machine")));
                     };
+                    if self.live.is_paused() {
+                        return Err(Refusal("paused", "resume the agent before changing models".into()));
+                    }
                     let (installed, missing) = self.live.changes.request(&self.live, store, model, reply).map_err(internal)?;
                     return Ok(if installed {
                         json!({"ok": true, "state": "switching", "text": format!("switching to {id}")})
@@ -568,12 +625,15 @@ impl Control {
 
     /// Handle requests that complete with a single reply.
     #[cfg(unix)]
-    async fn handle(&self, req: Request, reply: Option<tokio::sync::oneshot::Receiver<()>>) -> Value {
+    async fn handle(self: &Arc<Self>, req: Request, reply: Option<tokio::sync::oneshot::Receiver<()>>) -> Value {
         let refused = |r: Refusal| json!({"ok": false, "error": r.0, "text": r.1});
         match req {
             Request::Status => json!({"ok": true, "status": self.status()}),
             Request::Models => json!({"ok": true, "models": self.models()}),
-            Request::Pause { active } => self.live.save_pause(active).await,
+            Request::Pause { active } => {
+                let control = self.clone();
+                self.live.save_pause(active, move || control.resume_saved_model()).await
+            }
             Request::Preference { mode, model, quant } => self.set_preference(&mode, model, quant, reply).await.unwrap_or_else(refused),
             Request::Follow => unreachable!("follow is served by `follow`"),
         }
@@ -581,6 +641,14 @@ impl Control {
 }
 
 impl ModelState {
+    fn verified(&self) -> bool {
+        !self.reference.model_id.is_empty() && !self.verifying && !self.needs_repair
+    }
+
+    fn weights_ready(&self) -> bool {
+        self.path.is_some() && self.verified()
+    }
+
     fn engine_name(&self, engine: EngineState) -> &'static str {
         if self.verifying {
             "verifying weights"
@@ -1090,19 +1158,19 @@ mod tests {
     #[tokio::test]
     async fn pause_and_farm_cancel_a_pending_download() {
         let store = crate::models::tests::fixture_store("control-model-cancel");
-        let model = crate::models::find("qwen3.5-9b", None).unwrap();
+        let model = crate::models::find("qwen3.6-35b-a3b", None).unwrap();
         fs::File::create(store.partial(model)).unwrap().set_len(model.bytes - 1).unwrap();
         let dir = super::pause_tests::data_dir("control-model-cancel");
         let (test, _) = test_control(&dir);
         let control = Control::new(test.contribution.clone(), test.gpu.clone(), test.live.clone(),
             test.engine.clone(), test.model.lock().unwrap().reference.clone(), None).with_models(Some(store), None);
         for command in [
-            Request::Pause { active: true },
             Request::Preference { mode: "free".into(), model: None, quant: None },
+            Request::Pause { active: true },
         ] {
             let (sent, ready) = tokio::sync::oneshot::channel();
             let response = control.handle(Request::Preference {
-                mode: "use".into(), model: Some("qwen3.5-9b".into()), quant: None,
+                mode: "use".into(), model: Some("qwen3.6-35b-a3b".into()), quant: None,
             }, Some(ready)).await;
             assert_eq!(response["state"], "downloading");
             assert_eq!(control.live.changes.inventory().unwrap().status(), publicompute_proto::node::ModelStatus::Downloading);
@@ -1173,16 +1241,55 @@ mod pause_tests {
         let dir = data_dir("reopen");
         let live = Live::open(&dir).unwrap();
         assert!(!live.is_paused());
-        assert_eq!(live.save_pause(true).await["ok"], true);
+        assert_eq!(live.save_pause(true, || {}).await["ok"], true);
         drop(live);
 
         let live = Live::open(&dir).unwrap();
         assert!(live.is_paused());
         assert!(*live.pause_rx().borrow());
-        assert_eq!(live.save_pause(false).await["ok"], true);
+        assert_eq!(live.save_pause(false, || {}).await["ok"], true);
         drop(live);
 
         assert!(!Live::open(&dir).unwrap().is_paused());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn persisted_pause_defers_the_saved_download_until_resume() {
+        let dir = data_dir("paused-download");
+        let store = Arc::new(crate::models::Store::new(&dir));
+        store.prepare().unwrap();
+        let model = crate::models::find("qwen3.6-35b-a3b", None).unwrap();
+        let preference = Preference {
+            modo: PreferenceMode::Usage,
+            model: Some(ModelSelection { id: model.id.clone(), quant: model.quant.clone() }),
+            revision: 0,
+        };
+        let saved = Contribution::open(&dir, preference).unwrap().preference();
+        fs::File::create(store.partial(model)).unwrap().set_len(model.bytes - 1).unwrap();
+        let live = Live::open(&dir).unwrap();
+        assert_eq!(live.save_pause(true, || {}).await["ok"], true);
+        drop(live);
+
+        let live = Live::open(&dir).unwrap();
+        let contribution = Contribution::open(&dir, Preference { modo: PreferenceMode::Free, model: None, revision: 0 }).unwrap();
+        let (_engine, engine_rx) = watch::channel(EngineState::Parked);
+        let control = Control::new(contribution.clone(), Arc::new(Telemetria::default()), live.clone(), engine_rx, ModelRef::default(), None)
+            .with_models(Some(store.clone()), None);
+        let _worker = store.worker.lock().await;
+        {
+            let _commands = live.changes.commands.lock().await;
+            control.model_verified(ModelRef::default(), None, None, false);
+            control.resume_saved_model();
+        }
+        assert!(control.status().paused);
+        assert!(control.status().download.is_none());
+        assert_eq!(control.handle(Request::Pause { active: false }, None).await["ok"], true);
+        let download = live.changes.inventory().unwrap();
+        assert_eq!(download.status(), publicompute_proto::node::ModelStatus::Downloading);
+        assert_eq!(download.downloaded_bytes, model.bytes - 1);
+        assert_eq!(contribution.preference(), saved);
+        assert_eq!(control.handle(Request::Pause { active: true }, None).await["ok"], true);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1193,7 +1300,7 @@ mod pause_tests {
         assert!(!live.is_paused());
         let contribution = Contribution::open(&dir, Preference { modo: PreferenceMode::Free, model: None, revision: 0 }).unwrap();
         let (_engine, engine_rx) = watch::channel(EngineState::Ready);
-        let control = Control::new(contribution, Arc::new(Telemetria::default()), live.clone(), engine_rx, ModelRef::default(), None);
+        let control = Arc::new(Control::new(contribution, Arc::new(Telemetria::default()), live.clone(), engine_rx, ModelRef::default(), None));
         assert_eq!(control.handle(Request::Pause { active: true }, None).await["ok"], true);
 
         let rx = live.pause_rx();
@@ -1226,7 +1333,7 @@ mod pause_tests {
         }).unwrap();
         let (_engine, engine_rx) = watch::channel(EngineState::Ready);
         let store = crate::models::tests::fixture_store("model-cancel-write-failure");
-        let model = crate::models::find("qwen3.5-9b", None).unwrap();
+        let model = crate::models::find("qwen3.6-35b-a3b", None).unwrap();
         fs::File::create(store.partial(model)).unwrap().set_len(model.bytes - 1).unwrap();
         let control = Control::new(contribution.clone(), Arc::new(Telemetria::default()), live.clone(), engine_rx, ModelRef::default(), None)
             .with_models(Some(store), None);
@@ -1313,7 +1420,7 @@ mod pause_tests {
         fs::set_permissions(dir.join("paused.json"), fs::Permissions::from_mode(0o666)).unwrap();
         fs::rename(&dir, &moved).unwrap();
         fs::create_dir(&dir).unwrap();
-        assert_eq!(live.save_pause(true).await["ok"], true);
+        assert_eq!(live.save_pause(true, || {}).await["ok"], true);
         let path = moved.join("paused.json");
         assert_eq!(fs::read_to_string(&path).unwrap(), "true\n");
         assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
@@ -1374,7 +1481,7 @@ mod pause_tests {
         let live = Live::open(&dir).unwrap();
         let contribution = Contribution::open(&dir, Preference { modo: PreferenceMode::Free, model: None, revision: 0 }).unwrap();
         let (_engine, engine_rx) = watch::channel(EngineState::Ready);
-        let control = Control::new(contribution, Arc::new(Telemetria::default()), live.clone(), engine_rx, ModelRef::default(), None);
+        let control = Arc::new(Control::new(contribution, Arc::new(Telemetria::default()), live.clone(), engine_rx, ModelRef::default(), None));
         let mut rx = live.pause_rx();
         for active in [true, false] {
             *live.after_rename.lock().unwrap() = Some(Box::new(|| anyhow::bail!("sync data-dir failed")));

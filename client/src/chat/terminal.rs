@@ -6,8 +6,10 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::Instant,
 };
 
+use crossterm::{execute, terminal::{self, EnterAlternateScreen, LeaveAlternateScreen}};
 use rustix::{
     event::{poll, PollFd, PollFlags, Timespec},
     fs::{fcntl_getfl, fcntl_setfl, open, Mode, OFlags},
@@ -18,6 +20,8 @@ use signal_hook::{
     consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM},
     flag, low_level, SigId,
 };
+
+use crate::render;
 
 const POLL_TIMEOUT: Timespec = Timespec {
     tv_sec: 0,
@@ -67,7 +71,7 @@ pub(super) enum Input {
     Interrupted,
 }
 
-pub(super) fn read_tty(tty: &mut File, interrupt: &Interrupt) -> io::Result<Input> {
+pub(super) fn read_tty(tty: &mut File, interrupt: &Interrupt, mut idle: impl FnMut() -> io::Result<()>) -> io::Result<Input> {
     let mut bytes = [0; 8192];
     loop {
         if interrupt.take() {
@@ -75,7 +79,11 @@ pub(super) fn read_tty(tty: &mut File, interrupt: &Interrupt) -> io::Result<Inpu
         }
         let mut fds = [PollFd::new(&*tty, PollFlags::IN)];
         match poll(&mut fds, Some(&POLL_TIMEOUT)) {
-            Ok(0) | Err(Errno::INTR) => continue,
+            Ok(0) => {
+                idle()?;
+                continue;
+            }
+            Err(Errno::INTR) => continue,
             Err(e) => return Err(e.into()),
             Ok(_) => {}
         }
@@ -91,6 +99,89 @@ pub(super) fn read_tty(tty: &mut File, interrupt: &Interrupt) -> io::Result<Inpu
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+pub(super) fn empty_prompt(
+    tty: &mut File,
+    out: &mut io::StderrLock<'_>,
+    interrupt: &Interrupt,
+    model: &str,
+    color: bool,
+) -> io::Result<Input> {
+    let (width, height) = terminal::size().unwrap_or((80, 24));
+    let start = Instant::now();
+    let mut eyes = render::chat_eyes(width, color, Some(start.elapsed()));
+    let mut rows = render::render_empty_chat(model, width, color, Some(start.elapsed()));
+    if !render::motion_enabled(io::stdout().is_terminal()) || eyes.is_empty()
+        || usize::from(height) <= rows.len()
+    {
+        write!(out, "{}", render::render_empty_chat(model, width, color, None).join("\n"))?;
+        out.flush()?;
+        return read_tty(tty, interrupt, || Ok(()));
+    }
+
+    let prompt_row = rows.len();
+    let prompt = rows.pop().unwrap();
+    let eye_row = rows.len() - eyes.len();
+    let input = {
+        let screen = ChatScreen(out);
+        execute!(screen.0, EnterAlternateScreen)?;
+        // Keep the kernel's line editing. Only the prompt may scroll if a question wraps.
+        let frame = rows.join("\x1b[E");
+        write!(
+            screen.0,
+            "\x1b[2J\x1b[H{frame}\x1b[{prompt_row};{height}r\x1b[{prompt_row};1H{prompt}"
+        )?;
+        screen.0.flush()?;
+        let mut animate = true;
+        let mut redraw = |out: &mut io::StderrLock<'_>| -> io::Result<()> {
+            // A resize can move the prompt. Leave its cursor alone until submission.
+            if !animate || !terminal::size().is_ok_and(|size| size == (width, height)) {
+                animate = false;
+                return Ok(());
+            }
+            let next = render::chat_eyes(width, color, Some(start.elapsed()));
+            if eyes != next {
+                // Save the cursor where canonical input last echoed it.
+                let frame = next.join("\x1b[E\x1b[2K");
+                let update = format!("\x1b7\x1b[{eye_row};1H\x1b[2K{frame}\x1b8");
+                out.write_all(update.as_bytes())?;
+                out.flush()?;
+                eyes = next;
+            }
+            Ok(())
+        };
+        loop {
+            let input = read_tty(tty, interrupt, || redraw(screen.0))?;
+            match input {
+                Input::Interrupted => {}
+                Input::Line(ref line) if line.trim().is_empty() => {}
+                _ => break input,
+            }
+            write!(screen.0, "\r\x1b[2K{prompt}")?;
+            screen.0.flush()?;
+        }
+    };
+    match &input {
+        Input::Line(line) if line.trim() != "/exit" => {
+            // The alternate screen is temporary. Keep the question with its answer in scrollback.
+            let (width, _) = terminal::size().unwrap_or((width, height));
+            let header = render::chat_header(model, width, color).join("\n");
+            let question = escape_controls(line.trim_end_matches(['\n', '\r']), false);
+            writeln!(out, "{header}\n{prompt}{question}")?;
+        }
+        _ => {}
+    }
+    Ok(input)
+}
+
+struct ChatScreen<'a, 'b>(&'a mut io::StderrLock<'b>);
+
+impl Drop for ChatScreen<'_, '_> {
+    fn drop(&mut self) {
+        let _ = write!(self.0, "\x1b[r");
+        let _ = execute!(self.0, LeaveAlternateScreen);
     }
 }
 
@@ -110,7 +201,7 @@ pub(super) fn credentials() -> Result<(String, String), String> {
             .map_err(|e| format!("cannot handle login signals: {e}"))?;
     }
     let interrupt = Interrupt::for_signals(&LOGIN_SIGNALS).map_err(|e| format!("cannot handle login signals: {e}"))?;
-    let read = |tty: &mut File| match read_tty(tty, &interrupt) {
+    let read = |tty: &mut File| match read_tty(tty, &interrupt, || Ok(())) {
         Ok(Input::Line(line)) if !line.trim().is_empty() => Ok(line.trim().to_owned()),
         Ok(Input::Interrupted) => Err("login cancelled"),
         Ok(_) => Err("email and access key are required"),
