@@ -101,9 +101,29 @@ pub struct Shared {
 }
 
 /// Grace period requested from the coordinator and limit on waiting for departure.
-pub const GRAZIA_USCITA_S: u32 = 60;
-pub const ATTESA_USCITA: Duration = Duration::from_secs(65);
+pub const GRAZIA_USCITA_S: u32 = 300;
+pub const ATTESA_USCITA: Duration = Duration::from_secs(GRAZIA_USCITA_S as u64 + 5);
 const CLOSE_IO_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Format the user-facing shutdown message. Non-head stages do not track active
+/// answers directly, so they show a generic chain drain message instead of a count.
+fn departure_notice(role: Option<crate::stages::Role>, has_chain: bool, active_answers: usize) -> String {
+    match role {
+        Some(crate::stages::Role::Middle | crate::stages::Role::Tail) => {
+            "waiting for the chain to finish its answers, Ctrl+C again to quit now".into()
+        }
+        None if has_chain && active_answers == 0 => {
+            "waiting for the chain to finish its answers, Ctrl+C again to quit now".into()
+        }
+        _ if active_answers == 1 => {
+            "waiting for 1 answer to finish, Ctrl+C again to quit now".into()
+        }
+        _ if active_answers > 1 => {
+            format!("waiting for {active_answers} answers to finish, Ctrl+C again to quit now")
+        }
+        _ => "shutting down, Ctrl+C again to quit now".into(),
+    }
+}
 
 /// Return the file size in bytes, or zero when it cannot be measured.
 fn dimensione_modello(path: &Option<std::path::PathBuf>) -> u64 {
@@ -112,14 +132,17 @@ fn dimensione_modello(path: &Option<std::path::PathBuf>) -> u64 {
 
 /// Build the weights inventory with the measured file size and slot count.
 fn inventory(cfg: &NodeConfig, engine: &Engine) -> ModelInventory {
-    let mut models = vec![InstalledModel {
-        model: Some(cfg.model.clone()),
-        status: ModelStatus::Ready as i32,
-        loaded: !matches!(engine, Engine::Stages(_)) && single_loaded(cfg),
-        size_bytes: dimensione_modello(&cfg.model_path),
-        slots: capacita(cfg, engine) as u32,
-        downloaded_bytes: 0,
-    }];
+    let mut models = Vec::new();
+    if !cfg.model.model_id.is_empty() {
+        models.push(InstalledModel {
+            model: Some(cfg.model.clone()),
+            status: ModelStatus::Ready as i32,
+            loaded: !matches!(engine, Engine::Stages(_)) && single_loaded(cfg),
+            size_bytes: dimensione_modello(&cfg.model_path),
+            slots: capacita(cfg, engine) as u32,
+            downloaded_bytes: 0,
+        });
+    }
     if let Some(transfer) = cfg.live.changes.inventory() {
         models.push(transfer);
     }
@@ -454,7 +477,7 @@ async fn run_inner(
                 ultimo_inventario = inv;
             }
             if cfg.gpu_profile_missing() {
-                if cfg.sup.state() == EngineState::Ready {
+                if !cfg.gpu.unavailable() && (cfg.model.model_id.is_empty() || cfg.sup.state() == EngineState::Ready) {
                     // Reconnect to refresh the coordinator inventory because the hardware profile is sent in Hello.
                     break Ok(SessionEnd::Reconnect);
                 }
@@ -524,12 +547,12 @@ async fn run_inner(
                                     Err(status) => out.send(node_message::Body::StageStatus(status)).await?,
                                 }
                             }
-                            Some(_) if cfg.live.is_paused() => {
+                            Some(_) if cfg.live.is_paused() || cfg.gpu.unavailable() || cfg.gpu_profile_missing() => {
                                 out.send(node_message::Body::StageStatus(StageStatus {
                                     chain_id: a.chain_id,
                                     assign_epoch: a.assign_epoch,
                                     state: StageState::Failed as i32,
-                                    error: "agent paused by host".into(),
+                                    error: if cfg.live.is_paused() { "agent paused by host" } else { "selected GPU unavailable" }.into(),
                                     ..Default::default()
                                 })).await?;
                             }
@@ -544,12 +567,17 @@ async fn run_inner(
                             }
                             Some(s) => s.queue_assignment(a),
                             None => {
-                                warn!(chain = %a.chain_id, "StageAssign requires --stage-bin");
+                                let error = if cfg.model.model_id.is_empty() {
+                                    "no verified model weights"
+                                } else {
+                                    "start the agent with --stage-bin to run stages"
+                                };
+                                warn!(chain = %a.chain_id, "{error}");
                                 out.send(node_message::Body::StageStatus(StageStatus {
                                     chain_id: a.chain_id,
                                     assign_epoch: a.assign_epoch,
                                     state: StageState::Failed as i32,
-                                    error: "start the agent with --stage-bin to run stages".into(),
+                                    error: error.into(),
                                     ..Default::default()
                                 }))
                                 .await?;
@@ -676,7 +704,10 @@ async fn run_inner(
                         Err(_) => uscita_chiusa = true,
                         Ok(()) if !*uscita_rx.borrow() => {}
                         Ok(()) if minor2 => {
-                            warn!("shutting down within {GRAZIA_USCITA_S} s; press Ctrl-C again to exit now");
+                            let role = cfg.stages.as_ref().and_then(|s| s.active_role());
+                            let has_chain = cfg.stages.as_ref().is_some_and(|s| s.has_chain());
+                            let notice = departure_notice(role, has_chain, lease.attive());
+                            warn!(max_seconds = GRAZIA_USCITA_S, "{notice}");
                             output = Some(Instant::now());
                             conto.reset();
                             if leave_ok {
@@ -695,7 +726,10 @@ async fn run_inner(
                 _ = conto.tick(), if output.is_some() => {
                     let trascorsi = output.map(|t| t.elapsed()).unwrap_or_default();
                     let rimasti = ATTESA_USCITA.saturating_sub(trascorsi).as_secs().min(u64::from(GRAZIA_USCITA_S));
-                    info!(seconds = rimasti, lease = lease.map.len(), "shutting down in {rimasti} s");
+                    let role = cfg.stages.as_ref().and_then(|s| s.active_role());
+                    let has_chain = cfg.stages.as_ref().is_some_and(|s| s.has_chain());
+                    let notice = departure_notice(role, has_chain, lease.attive());
+                    info!(seconds = rimasti, "{notice} ({rimasti} s left)");
                 }
                 _ = tokio::time::sleep_until(scadenza_uscita), if output.is_some() => {
                     warn!("departure acknowledgment timed out; exiting");
@@ -718,6 +752,7 @@ async fn run_inner(
                         || cfg.stages.as_ref().is_some_and(|s| s.stage_status_current(&st));
                     if current {
                         cfg.live.set_chain((!terminal).then(|| st.chain_id.clone()));
+                        cfg.live.notify();
                     }
                     pending_stage_status = Some(st.clone());
                     out.send(node_message::Body::StageStatus(st)).await?;
@@ -2901,11 +2936,47 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn hello_has_no_ready_weights_during_the_first_download() {
+        use crate::contribution::PreferenceMode;
+        use crate::models::{find, tests::fixture_store};
+        let (_f, mut cfg) = nodo_con_modello("hello-without-weights").await;
+        cfg.model = ModelRef::default();
+        cfg.model_path = None;
+        cfg.contribution.imposta(PreferenceMode::Free, None).unwrap();
+        let (peer, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        assert!(peer.hello.models.as_ref().unwrap().models.is_empty());
+        assert_eq!(peer.hello.contribution.as_ref().unwrap().mode(), ContributionMode::Free);
+        peer.stop_tx.send(true).unwrap();
+        assert!(matches!(peer.done().await, SessionEnd::Shutdown));
+
+        let (_f, mut cfg) = nodo_con_modello("hello-first-download").await;
+        cfg.model = ModelRef::default();
+        cfg.model_path = None;
+        let store = fixture_store("hello-first-download");
+        let download = find("qwen3.6-35b-a3b", None).unwrap();
+        std::fs::File::create(store.partial(download)).unwrap().set_len(download.bytes - 1).unwrap();
+        let (sent, ready) = oneshot::channel();
+        cfg.live.changes.request(&cfg.live, &store, download, Some(ready)).unwrap();
+        let live = cfg.live.clone();
+        let (peer, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        let models = &peer.hello.models.as_ref().unwrap().models;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model.as_ref(), Some(&download.reference()));
+        assert_eq!(models[0].status(), ModelStatus::Downloading);
+        assert!(!models[0].loaded);
+        live.changes.cancel();
+        let _ = sent.send(());
+        peer.stop_tx.send(true).unwrap();
+        assert!(matches!(peer.done().await, SessionEnd::Shutdown));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn hello_only_advertises_the_active_model_as_ready() {
         use crate::models::{find, tests::fixture_store};
         let (_f, cfg) = nodo_con_modello("hello-download").await;
         let store = fixture_store("hello-download");
-        let download = find("qwen3.5-9b", None).unwrap();
+        let download = find("qwen3.6-35b-a3b", None).unwrap();
         std::fs::File::create(store.partial(download)).unwrap().set_len(download.bytes - 1).unwrap();
         let (sent, ready) = oneshot::channel();
         cfg.live.changes.request(&cfg.live, &store, download, Some(ready)).unwrap();
@@ -2950,7 +3021,7 @@ mod tests {
             _ => None,
         }).await.unwrap();
         assert_eq!(rejected.detail, "agent is changing models");
-        assert!(store.active().unwrap().is_none());
+        assert!(store.active(|_| true).unwrap().is_none());
         assert!(!peer.task.is_finished());
         if force {
             live.changes.expire_switch();
@@ -2964,7 +3035,7 @@ mod tests {
         }
         let SessionEnd::SwitchModel(change) = peer.done().await else { panic!("expected to leave for the model switch") };
         assert!(live.changes.commit(change, store.clone(), &pref).await);
-        assert_eq!(store.active().unwrap().unwrap().0.id, model.id);
+        assert_eq!(store.active(|_| true).unwrap().unwrap().0.id, model.id);
     }
 
     #[cfg(unix)]
@@ -3123,7 +3194,8 @@ mod tests {
             })
             .await
             .expect("expected Leaving after the first signal");
-        assert_eq!(l.grazia_s, 60);
+        // A graceful exit leaves 300 s for the answers in flight to finish.
+        assert_eq!(l.grazia_s, GRAZIA_USCITA_S);
         // Wait for acknowledgment before sending the final goodbye.
         let saluto = fin.attendi(400, |b| matches!(b, node_message::Body::Goodbye(_)).then_some(())).await;
         assert!(saluto.is_none(), "Goodbye arrived before LeaveOk");
@@ -3181,6 +3253,28 @@ mod tests {
         assert!(versione_sufficiente("0.2.0", "0.1.9"));
         assert!(!versione_sufficiente("0.1.0", "0.1.1"));
         assert!(!versione_sufficiente("0.9.9", "1.0.0"));
+    }
+
+    #[test]
+    fn departure_notice_uses_generic_text_for_non_head_stages() {
+        assert_eq!(GRAZIA_USCITA_S, 300);
+        assert_eq!(ATTESA_USCITA, Duration::from_secs(305));
+        assert_eq!(
+            departure_notice(Some(crate::stages::Role::Head), true, 3),
+            "waiting for 3 answers to finish, Ctrl+C again to quit now"
+        );
+        assert_eq!(
+            departure_notice(Some(crate::stages::Role::Head), true, 1),
+            "waiting for 1 answer to finish, Ctrl+C again to quit now"
+        );
+        assert_eq!(
+            departure_notice(Some(crate::stages::Role::Middle), true, 0),
+            "waiting for the chain to finish its answers, Ctrl+C again to quit now"
+        );
+        assert_eq!(
+            departure_notice(Some(crate::stages::Role::Tail), true, 0),
+            "waiting for the chain to finish its answers, Ctrl+C again to quit now"
+        );
     }
 
     #[tokio::test]

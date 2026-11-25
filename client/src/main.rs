@@ -12,7 +12,7 @@ use std::{
     process::Command,
     sync::mpsc,
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossterm::{
@@ -26,7 +26,7 @@ use sock::Socket;
 use status::Status;
 
 const CHAT_URL: &str = "https://publicompute.com/chat";
-const USAGE: &str = "usage: publicompute [--data-dir DIR | --socket FILE] [--version | version | status [--json] | use <model> [--quant Q] | farm | pause | start | uninstall [--keep-models | --remove-models] | login | logout | chat [--model ID] [--api URL] [\"question\"]]";
+const USAGE: &str = "usage: publicompute [--data-dir DIR | --socket FILE] [--version | version | status [--json] | use <model> [--quant Q] | free | pause | start | uninstall [--keep-models | --remove-models] | login | logout | chat [--model ID] [--api URL] [\"question\"]]";
 const UNINSTALLER: &str = "/opt/publicompute-agent/uninstall.sh";
 
 fn main() {
@@ -37,15 +37,17 @@ fn run(args: Vec<String>) -> i32 {
     let (socket, rest) = match parse_args(args) {
         Ok(x) => x,
         Err(e) => {
-            eprintln!("{e}\n{USAGE}");
+            eprintln!("! {e}\n{USAGE}");
             return 1;
         }
     };
-    if rest.is_empty() && std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+    if rest.is_empty() && std::io::stdout().is_terminal() && std::io::stdin().is_terminal()
+        && std::env::var("TERM").as_deref() != Ok("dumb")
+    {
         return match interactive(&socket) {
             Ok(()) => 0,
             Err(e) => {
-                eprintln!("error: {e}");
+                eprintln!("! {e}");
                 1
             }
         };
@@ -63,7 +65,7 @@ fn run(args: Vec<String>) -> i32 {
     match result {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("! {e}");
             1
         }
     }
@@ -113,10 +115,7 @@ fn command_with_uninstaller(
             let v = sock::request(socket, &serde_json::json!({"op": "status"}))?;
             Ok(v["status"].to_string())
         }
-        ["farm"] => {
-            sock::set_preference(socket, None, None)?;
-            Ok("FARM mode: set".into())
-        }
+        ["free"] => free_card(socket),
         ["use", model] => use_model(socket, model, None),
         ["use", model, "--quant", q] => use_model(socket, model, Some(q)),
         ["pause"] => switch_pause(socket, true),
@@ -186,6 +185,11 @@ fn use_model(socket: &Socket, model: &str, quant: Option<&str>) -> Result<String
     Ok(use_reply_text(&reply, model))
 }
 
+fn free_card(socket: &Socket) -> Result<String, String> {
+    sock::set_preference(socket, None, None)?;
+    Ok("Free card: set".into())
+}
+
 fn use_reply_text(reply: &serde_json::Value, model: &str) -> String {
     // Older agents acknowledge successful preferences without a message.
     reply["text"].as_str().map_or_else(|| format!("using {model}"), str::to_owned)
@@ -193,8 +197,13 @@ fn use_reply_text(reply: &serde_json::Value, model: &str) -> String {
 
 fn clear_finished_switch(status: &Status, pending: &mut Option<(String, String)>, notice: &mut String) {
     if let Some((id, quant)) = pending {
-        if status.download.is_none() && status.loaded_model.as_ref() == Some(id)
-            && status.loaded_quant.as_ref().is_none_or(|loaded| loaded == quant)
+        // The switch is done once the weights are verified: in a chain the
+        // stage loads only when the scheduler assigns one.
+        let ready = |model: &Option<String>, q: &Option<String>| {
+            model.as_ref() == Some(id) && q.as_ref().is_none_or(|got| got == quant)
+        };
+        if status.download.is_none()
+            && (ready(&status.loaded_model, &status.loaded_quant) || ready(&status.weights_model, &status.weights_quant))
         {
             *pending = None;
             notice.clear();
@@ -233,15 +242,48 @@ fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-fn draw(lines: &[String]) {
+fn draw(lines: &[String], height: u16) -> std::io::Result<()> {
     let mut out = std::io::stdout().lock();
-    // Clear one row at a time to avoid flicker, then erase any rows left below the new frame.
-    let _ = write!(out, "\x1b[H");
-    for l in lines {
-        let _ = write!(out, "{l}\x1b[K\r\n");
+    // Clear before writing so a row that fills the screen keeps its last cell.
+    write!(out, "\x1b[H")?;
+    for (i, line) in lines.iter().take(height.into()).enumerate() {
+        if i > 0 {
+            write!(out, "\r\n")?;
+        }
+        write!(out, "\x1b[2K{line}")?;
     }
-    let _ = write!(out, "\x1b[J");
-    let _ = out.flush();
+    if lines.len() < usize::from(height) {
+        write!(out, "\r\n\x1b[J")?;
+    }
+    out.flush()
+}
+
+fn quit_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('q' | 'Q') | KeyCode::Esc)
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn intro(color: bool) -> std::io::Result<bool> {
+    let start = Instant::now();
+    let mut size = (0, 0);
+    while let Some(left) = render::INTRO.checked_sub(start.elapsed()) {
+        let (width, height) = terminal::size().unwrap_or((80, 24));
+        if (width, height) != size {
+            // After a resize the terminal reflows the old frame: start from a blank screen.
+            write!(std::io::stdout(), "\x1b[2J")?;
+            size = (width, height);
+        }
+        let logo_width = if height < 6 { width.min(39) } else { width };
+        draw(&render::render_intro(logo_width, height, color, start.elapsed()), height)?;
+        if event::poll(left.min(Duration::from_millis(45)))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    return Ok(quit_key(key));
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn follow_updates(socket: &Socket, silence: Duration, mut emit: impl FnMut(Msg) -> bool) -> bool {
@@ -255,9 +297,9 @@ fn follow_updates(socket: &Socket, silence: Duration, mut emit: impl FnMut(Msg) 
     }
 }
 
-fn interactive(socket: &Socket) -> Result<(), String> {
-    let color = std::env::var_os("NO_COLOR").is_none();
-    let _guard = TermGuard::enter().map_err(|e| e.to_string())?;
+fn interactive(socket: &Socket) -> std::io::Result<()> {
+    let color = render::supports_color(true);
+    let _guard = TermGuard::enter()?;
 
     let (tx, rx) = mpsc::channel::<Msg>();
 
@@ -270,6 +312,9 @@ fn interactive(socket: &Socket) -> Result<(), String> {
         }
         thread::sleep(Duration::from_secs(2));
     });
+    if render::motion_enabled(true) && intro(color)? {
+        return Ok(());
+    }
     // The key reader can remain blocked until process exit. It needs no join on shutdown.
     let t = tx;
     thread::spawn(move || loop {
@@ -284,11 +329,6 @@ fn interactive(socket: &Socket) -> Result<(), String> {
         }
     });
 
-    // Key events queue while the startup logo is displayed.
-    let (w, _) = terminal::size().unwrap_or((80, 24));
-    draw(&render::render_logo(w, color));
-    thread::sleep(Duration::from_millis(700));
-
     let mut status: Option<Status> = None;
     let mut down = String::new();
     let mut notice = String::new();
@@ -297,12 +337,12 @@ fn interactive(socket: &Socket) -> Result<(), String> {
 
     loop {
         let (w, h) = terminal::size().unwrap_or((80, 24));
-        match &status {
-            Some(s) => draw(&render::render(s, w, h, now_unix(), &notice, color)),
-            // Wait for an initial status or connection failure before replacing the startup view.
-            None if down.is_empty() => {}
-            None => draw(&render::render_down(w, &down, color)),
-        }
+        let frame = match &status {
+            Some(s) => render::render(s, w, h, now_unix(), &notice, color),
+            None if down.is_empty() => render::render_logo(if h < 6 { w.min(39) } else { w }, color),
+            None => render::render_down(w, &down, color),
+        };
+        draw(&frame, h)?;
 
         match rx.recv() {
             Ok(Msg::Status(s)) => {
@@ -313,9 +353,9 @@ fn interactive(socket: &Socket) -> Result<(), String> {
                 status = None;
                 down = why;
             }
-            Ok(Msg::Resize) => {}
+            Ok(Msg::Resize) => write!(std::io::stdout(), "\x1b[2J")?,
             Ok(Msg::Key(k)) => {
-                if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
+                if k.modifiers.contains(KeyModifiers::CONTROL) && quit_key(k) {
                     return Ok(());
                 }
                 if !picking.is_empty() {
@@ -330,7 +370,7 @@ fn interactive(socket: &Socket) -> Result<(), String> {
                                         }
                                         use_reply_text(&reply, &m.id)
                                     }
-                                    Err(e) => e,
+                                    Err(e) => format!("! {e}"),
                                 }
                             }
                             None => String::new(),
@@ -343,7 +383,7 @@ fn interactive(socket: &Socket) -> Result<(), String> {
                 notice.clear();
                 pending_switch = None;
                 match k.code {
-                    KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => return Ok(()),
+                    _ if quit_key(k) => return Ok(()),
                     KeyCode::Char('u') | KeyCode::Char('U') if status.is_some() => match sock::get_models(socket) {
                         Ok(m) if m.is_empty() => notice = "no models installed".into(),
                         Ok(m) => {
@@ -352,18 +392,15 @@ fn interactive(socket: &Socket) -> Result<(), String> {
                             notice = format!("Use which model?  {}  (any other key cancels)", list.join("  "));
                             picking = m;
                         }
-                        Err(e) => notice = e,
+                        Err(e) => notice = format!("! {e}"),
                     },
                     KeyCode::Char('f') | KeyCode::Char('F') if status.is_some() => {
-                        notice = match sock::set_preference(socket, None, None) {
-                            Ok(_) => "FARM mode: set".into(),
-                            Err(e) => e,
-                        };
+                        notice = free_card(socket).unwrap_or_else(|e| format!("! {e}"));
                     }
                     KeyCode::Char('p') | KeyCode::Char('P') => {
                         if let Some(s) = &status {
                             if let Err(e) = sock::set_pause(socket, !s.paused) {
-                                notice = e;
+                                notice = format!("! {e}");
                             }
                         }
                     }

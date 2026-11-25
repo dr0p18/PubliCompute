@@ -16,8 +16,8 @@ Builds `publicompute-linux-x86_64-<version>.tar.zst` and `SHA256SUMS`. Remote in
 
 On a Linux machine with podman or docker (a GPU is not needed to build):
 
-    tools/pacchetto/build-linux.sh 0.1.1
-    tools/pacchetto/prova-pacchetto.sh tools/pacchetto/out/publicompute-linux-x86_64-0.1.1.tar.zst
+    tools/pacchetto/build-linux.sh 0.1.4
+    tools/pacchetto/prova-pacchetto.sh tools/pacchetto/out/publicompute-linux-x86_64-0.1.4.tar.zst
 
 The package check uses a clean Ubuntu 22.04 container.
 
@@ -44,9 +44,9 @@ The installer compares numbered releases (major.minor.patch) with the active pac
 verification still applies. When the active package has a recorded digest, a remote archive with the same version
 and a different digest also requires explicit approval via this flag.
 
-To keep an alternate model on upgrade, set `MODEL_PATH`, `MODEL_ID`, `QUANTIZATION`, `MODEL_SIZE` (bytes), and
-`MODEL_SHA256` together in the root-owned `/etc/publicompute-agent/agent.conf`. Get the expected size and digest from
-trusted model metadata. If the configured weights cannot be verified, the installer prepares the default model.
+The installer asks which model the agent should use. Set `PUBLICOMPUTE_MODEL=medio|deepseek|free` to select one
+non-interactively. Without a terminal or an explicit choice, the installer keeps the GPU free. The agent downloads
+the selected weights in the background and retains existing weights on disk during upgrades.
 
 The installer and uninstaller share a lock under `/run/publicompute-agent-lock`. During migration they also honor a
 valid root-owned lock under `/run/lock` when the directory protects that entry from replacement by other users.

@@ -2,6 +2,9 @@
 Description=PubliCompute agent
 After=network-online.target
 Wants=network-online.target
+# At most 10 starts in 10 minutes: model switches are rare, a crash loop stops.
+StartLimitIntervalSec=10min
+StartLimitBurst=10
 
 [Service]
 User=publicompute-agent
@@ -13,15 +16,16 @@ Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/u
 EnvironmentFile=/etc/publicompute-agent/agent.conf
 LoadCredential=owner-token:/etc/publicompute-agent/owner-token
 ExecStart=/opt/publicompute-agent/bin/publicompute-agent \
-    --engine llama --llama-mode managed \
-    --llama-bin /opt/publicompute-agent/bin/llama-server \
+    --engine stages \
     --stage-bin /opt/publicompute-agent/bin/publicompute-stage \
-    --model-path ${MODEL_PATH} --model-id ${MODEL_ID} --quantization ${QUANTIZATION} \
     --coordinator ${COORDINATOR} --server-name ${SERVER_NAME} --ca /etc/publicompute-agent/ca.pem \
     --data-dir /var/lib/publicompute-agent --control-socket /run/publicompute-agent/agent.sock \
     --owner-token-file ${CREDENTIALS_DIRECTORY}/owner-token
+# Exit 75 applies a verified model switch; any other failure is retried too,
+# because nobody watches the card while it serves the network.
 Restart=on-failure
-RestartSec=5
+RestartForceExitStatus=75
+RestartSec=10s
 KillMode=mixed
 TimeoutStopSec=110s
 UMask=0077

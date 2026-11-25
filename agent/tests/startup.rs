@@ -335,10 +335,27 @@ async fn pause_survives_service_restart_and_is_advertised_before_work() {
     }
 }
 
+fn cache_sparse_weights(models: &std::path::Path, chosen: &serde_json::Value) -> fs::File {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let weights = fs::File::create(models.join(chosen["file"].as_str().unwrap())).unwrap();
+    // A sparse file with a matching cache exercises the selection without reading real weights.
+    weights.set_len(chosen["bytes"].as_u64().unwrap()).unwrap();
+    let meta = weights.metadata().unwrap();
+    let cache = fs::OpenOptions::new().create_new(true).write(true).mode(0o600)
+        .open(models.join("verified.json")).unwrap();
+    serde_json::to_writer(cache, &serde_json::json!([{
+        "id": chosen["id"], "quant": chosen["quant"], "sha256": chosen["sha256"],
+        "stamp": {
+            "bytes": meta.len(), "inode": meta.ino(), "device": meta.dev(),
+            "mtime_ns": meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+            "ctime_ns": meta.ctime() * 1_000_000_000 + meta.ctime_nsec()
+        }
+    }])).unwrap();
+    weights
+}
+
 #[tokio::test]
 async fn a_model_switch_exits_75_and_startup_restores_or_falls_back() {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
     use serde_json::{json, Value};
     use tokio::{process::Command, time::timeout};
 
@@ -353,21 +370,7 @@ async fn a_model_switch_exits_75_and_startup_restores_or_falls_back() {
     let manifest: Vec<Value> = serde_json::from_str(include_str!("../models.json")).unwrap();
     let chosen = &manifest[1];
     let id = chosen["id"].as_str().unwrap();
-    let path = models.join(chosen["file"].as_str().unwrap());
-    let weights = fs::File::create(&path).unwrap();
-    // A sparse file with a matching cache exercises the selection without reading real weights.
-    weights.set_len(chosen["bytes"].as_u64().unwrap()).unwrap();
-    let meta = weights.metadata().unwrap();
-    let cache = fs::OpenOptions::new().create_new(true).write(true).mode(0o600)
-        .open(models.join("verified.json")).unwrap();
-    serde_json::to_writer(cache, &json!([{
-        "id": chosen["id"], "quant": chosen["quant"], "sha256": chosen["sha256"],
-        "stamp": {
-            "bytes": meta.len(), "inode": meta.ino(), "device": meta.dev(),
-            "mtime_ns": meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
-            "ctime_ns": meta.ctime() * 1_000_000_000 + meta.ctime_nsec()
-        }
-    }])).unwrap();
+    let weights = cache_sparse_weights(&models, chosen);
 
     let offline = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let spawn = || Command::new(env!("CARGO_BIN_EXE_publicompute-agent"))
@@ -500,7 +503,7 @@ async fn socket_serves_status_while_active_model_is_hashed_without_cache() {
     let models = dir.join("models");
     fs::create_dir_all(&models).unwrap();
     let manifest: Vec<Value> = serde_json::from_str(include_str!("../models.json")).unwrap();
-    let chosen = &manifest[2];
+    let chosen = manifest.iter().find(|model| model["id"] == "deepseek-v4-flash").unwrap();
     fs::File::create(models.join(chosen["file"].as_str().unwrap())).unwrap()
         .set_len(chosen["bytes"].as_u64().unwrap()).unwrap();
     fs::write(dir.join("active-model.json"), json!({"id":chosen["id"], "quant":chosen["quant"]}).to_string()).unwrap();
@@ -521,6 +524,66 @@ async fn socket_serves_status_while_active_model_is_hashed_without_cache() {
     tokio::time::timeout(Duration::from_secs(3), check).await.unwrap();
     assert!(!models.join("verified.json").exists());
 
+    agent.kill().await.unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn stage_service_starts_free_then_prepares_the_installer_choice() {
+    let dir = std::env::temp_dir().join(format!("publicompute-stage-startup-{}", std::process::id()));
+    let models = dir.join("models");
+    fs::create_dir_all(&models).unwrap();
+    let ca = dir.join("ca.pem");
+    fs::write(&ca, rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap().cert.pem()).unwrap();
+    let offline = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bin = env!("CARGO_BIN_EXE_publicompute-agent");
+    let spawn = || tokio::process::Command::new(bin)
+        .arg("--data-dir").arg(&dir)
+        .arg("--ca").arg(&ca)
+        .args(["--coordinator", &offline.local_addr().unwrap().to_string(), "--skip-nat-probe"])
+        .args(["--engine", "stages", "--stage-bin", "/unused-stage"])
+        .stdout(Stdio::null()).kill_on_drop(true).spawn().unwrap();
+    let socket = dir.join("agent.sock");
+    let mut agent = spawn();
+    let status = startup_status(&socket, |s| s["engine"] == "parked").await;
+    assert_eq!(status["preference"]["mode"], "free");
+    assert!(status["loaded_model"].is_null());
+    assert!(status["download"].is_null());
+    agent.kill().await.unwrap();
+
+    let manifest: Vec<serde_json::Value> = serde_json::from_str(include_str!("../models.json")).unwrap();
+    let medium = manifest.iter().find(|model| model["id"] == "qwen3.6-35b-a3b").unwrap();
+    let file = medium["file"].as_str().unwrap();
+    // A complete sparse partial exercises the background verifier without a network fetch.
+    fs::File::create(models.join(format!("{file}.agent.part"))).unwrap()
+        .set_len(medium["bytes"].as_u64().unwrap()).unwrap();
+    assert!(Command::new(bin).arg("--data-dir").arg(&dir)
+        .args(["install-preference", "medio"]).status().unwrap().success());
+    let mut agent = spawn();
+    let status = startup_status(&socket, |s| s["engine"] == "parked" && !s["download"].is_null()).await;
+    assert_eq!(status["preference"]["model"], medium["id"]);
+    assert_eq!(status["download"]["state"], "verifying");
+    assert_eq!(status["download"]["id"], medium["id"]);
+    assert!(status["loaded_model"].is_null());
+    let revision = status["preference"]["revision"].as_u64().unwrap();
+    agent.kill().await.unwrap();
+
+    cache_sparse_weights(&models, medium);
+    let mut agent = spawn();
+    let exit = tokio::time::timeout(Duration::from_secs(5), agent.wait()).await.unwrap().unwrap();
+    assert_eq!(exit.code(), Some(75));
+    let mut agent = spawn();
+    let status = startup_status(&socket, |s| s["engine"] == "ready").await;
+    assert_eq!(status["preference"]["model"], medium["id"]);
+    assert!(status["preference"]["revision"].as_u64().unwrap() > revision);
+    assert!(status["download"].is_null());
+    assert_eq!(status["weights_model"], medium["id"]);
+    assert_eq!(status["weights_quant"], medium["quant"]);
+    assert!(status["loaded_model"].is_null());
+    assert!(status["loaded_quant"].is_null());
+    let catalog = startup_request(&socket, serde_json::json!({"op":"models"})).await;
+    assert_eq!(catalog["models"][0]["state"], "weights ready");
+    assert_eq!(catalog["models"][0]["loaded"], false);
     agent.kill().await.unwrap();
     fs::remove_dir_all(dir).unwrap();
 }

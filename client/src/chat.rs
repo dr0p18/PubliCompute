@@ -26,7 +26,7 @@ use ureq::{
     Agent, Body,
 };
 
-use crate::sock::{self, Socket};
+use crate::{render, sock::{self, Socket}};
 use session::{directory, Endpoint, Session, SessionDir, EXPIRED};
 use terminal::{AnswerOutput, Input, Interrupt};
 
@@ -268,14 +268,13 @@ impl Chat {
     fn chat_error(&self, agent: &Agent, mut reply: Response<Body>) -> String {
         match reply.status().as_u16() {
             401 => EXPIRED.into(),
-            402 => "insufficient_credits: free quota and credits used up. The free quota comes back tomorrow, or you can add credits.".into(),
             404 => format!("model_not_found: {}", model_help(agent, &self.api, &self.session)),
             429 => "too_many_chats: wait for an active chat to finish and try again".into(),
             503 => {
                 let body: Value = reply.body_mut().read_json().unwrap_or_default();
                 match body["error"]["code"].as_str().or(body["error"]["type"].as_str()) {
-                    Some("network_full") => "network_full: the free chat queue is full, try again later".into(),
-                    Some("network_busy") => "network_busy: the paid chat queue is full, try again later".into(),
+                    Some("no_chain_ready") => "no_chain_ready: no chain is ready for this model yet, try again in a few minutes".into(),
+                    Some("network_full") | Some("no_capacity") => "network_full: no free seat on this model, try again later".into(),
                     _ => "the network is unavailable (HTTP 503), try again later".into(),
                 }
             }
@@ -326,35 +325,12 @@ impl Chat {
         }
         let completion = completion?;
         if completion.free_seat == Some(false) {
-            self.report_cost(agent);
+            eprintln!("contribution seat not used");
         }
         if let Some(rate) = completion.tokens_per_second {
             eprintln!("{rate:.1} tok/s");
         }
         Ok(answer)
-    }
-
-    fn report_cost(&self, agent: &Agent) {
-        let balance = (|| {
-            self.session.check_expiry().ok()?;
-            let mut reply = agent
-                .get(self.api.url("/v1/me"))
-                .header("Cookie", self.session.cookie())
-                .call()
-                .ok()?;
-            if !reply.status().is_success() {
-                return None;
-            }
-            let me: Value = reply.body_mut().read_json().ok()?;
-            me["credits"]["balance"].as_i64()
-        })();
-        match balance {
-            Some(balance) => eprintln!(
-                "contribution seat not used, balance {:.3} credits",
-                balance as f64 / 1000.0
-            ),
-            None => eprintln!("contribution seat not used, balance unavailable"),
-        }
     }
 
     fn conversation(&self) -> Result<(), String> {
@@ -367,18 +343,21 @@ impl Chat {
         };
         let mut stdin = stdin.lock();
         let mut history = Vec::new();
+        let mut first_prompt = true;
         loop {
-            let question =
-                match prompt(&mut tty, &mut stdin, &interrupt).map_err(|e| format!("cannot read question: {e}"))? {
-                    Input::Line(line) if line.trim() == "/exit" => return Ok(()),
-                    Input::Line(line) if line.trim().is_empty() => continue,
-                    Input::Line(line) => line.trim_end_matches(['\n', '\r']).to_owned(),
-                    Input::Eof => return Ok(()),
-                    Input::Interrupted => continue,
-                };
+            let model = first_prompt.then_some(self.model.as_str());
+            let input = prompt(&mut tty, &mut stdin, &interrupt, model).map_err(|e| format!("cannot read question: {e}"))?;
+            first_prompt = false;
+            let question = match input {
+                Input::Line(line) if line.trim() == "/exit" => return Ok(()),
+                Input::Line(line) if line.trim().is_empty() => continue,
+                Input::Line(line) => line.trim_end_matches(['\n', '\r']).to_owned(),
+                Input::Eof => return Ok(()),
+                Input::Interrupted => continue,
+            };
             let user = Message::user(question);
             if request_body(&self.model, std::slice::from_ref(&user)).len() > MAX_REQUEST {
-                eprintln!("error: the question exceeds the 256 KiB chat request limit");
+                eprintln!("! the question exceeds the 256 KiB chat request limit");
                 continue;
             }
             let mut candidate = history.clone();
@@ -401,7 +380,7 @@ impl Chat {
                     "chat history limit reached, the last turn was too large to keep".into()
                 }
                 Some(Err(error)) if error == EXPIRED => return Err(error),
-                Some(Err(error)) => format!("error: {error}"),
+                Some(Err(error)) => format!("! {error}"),
                 Some(Ok(None)) => "chat history limit reached, the last turn was too large to keep".into(),
                 None => "answer stopped".into(),
             };
@@ -433,11 +412,16 @@ impl Chat {
     }
 }
 
-fn prompt(tty: &mut Option<File>, stdin: &mut impl BufRead, interrupt: &Interrupt) -> io::Result<Input> {
+fn prompt(tty: &mut Option<File>, stdin: &mut impl BufRead, interrupt: &Interrupt, model: Option<&str>) -> io::Result<Input> {
     if let Some(tty) = tty {
-        eprint!("> ");
-        io::stderr().flush()?;
-        return terminal::read_tty(tty, interrupt);
+        let mut out = io::stderr().lock();
+        let color = render::supports_color(out.is_terminal());
+        if let Some(model) = model.filter(|_| out.is_terminal()) {
+            return terminal::empty_prompt(tty, &mut out, interrupt, model, color);
+        }
+        write!(out, "{}", render::chat_prompt(color))?;
+        out.flush()?;
+        return terminal::read_tty(tty, interrupt, || Ok(()));
     }
     let mut line = String::new();
     let size = stdin.read_line(&mut line)?;

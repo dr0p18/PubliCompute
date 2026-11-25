@@ -55,8 +55,8 @@ Environment=CREDENTIALS_DIRECTORY=/run/publicompute-agent/credential
 ExecStartPre=+/bin/sh -c 'install -d -m 0700 -o publicompute-agent -g publicompute-agent /run/publicompute-agent/credential && install -m 0400 -o publicompute-agent -g publicompute-agent /etc/publicompute-agent/owner-token /run/publicompute-agent/credential/owner-token'
 UNIT
 fi
-version=0.10.0
-older_version=0.9.0
+version=0.1.4
+older_version=0.1.3
 name=publicompute-linux-x86_64-$version
 older_name=publicompute-linux-x86_64-$older_version
 package=$work/$name
@@ -100,17 +100,39 @@ if sys.argv[1] == "swap-install":
         staging.rename(installed)
     sys.exit(0)
 
+if sys.argv[1] == "--data-dir":
+    _, _, data_dir, command, choice = sys.argv
+    if command == "backup-preference":
+        assert choice in ("contributo.json", "active-model.json")
+        try:
+            fd = os.open(Path(data_dir, choice), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            sys.exit(3)
+        with os.fdopen(fd, "rb") as source:
+            sys.stdout.buffer.write(source.read())
+        sys.exit(0)
+    assert command == "install-preference"
+    path = Path(data_dir, "contributo.json")
+    revision = json.loads(path.read_text())["revisione"] + 1 if path.exists() else 1
+    id_quant = {
+        "medio": ("qwen3.6-35b-a3b", "UD-Q4_K_XL"),
+        "deepseek": ("deepseek-v4-flash", "IQ2XXS-w2Q2K-0731"),
+        "free": None,
+    }[choice]
+    model = dict(zip(("id", "quant"), id_quant)) if id_quant else None
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"modo": "uso" if model else "libera", "modello": model, "revisione": revision}))
+    tmp.replace(path)
+    sys.exit(0)
+
 parser = argparse.ArgumentParser()
-for arg in ("engine", "llama-mode", "llama-bin", "stage-bin", "model-path", "model-id", "quantization",
-            "coordinator", "server-name", "ca", "data-dir", "control-socket", "owner-token-file"):
+for arg in ("engine", "stage-bin", "coordinator", "server-name", "ca", "data-dir", "control-socket", "owner-token-file"):
     parser.add_argument("--" + arg, required=True)
 args = parser.parse_args()
-assert (args.engine, args.llama_mode) == ("llama", "managed")
+assert args.engine == "stages"
 assert args.stage_bin == "/opt/publicompute-agent/bin/publicompute-stage"
 assert os.environ["PUBLICOMPUTE_RELAY"] == "https://relay.publicompute.com:8443"
-assert (args.model_id, args.quantization) in (("qwen3.5-9b", "Q4_K_M"), ("fixture-other", "Q8_0"))
-model = Path(args.model_path)
-assert model.name == f"{args.model_id}-{args.quantization}.gguf" and model.is_file()
+
 token = Path(args.owner_token_file).read_text().strip()
 assert token and token not in sys.argv and token not in os.environ.values()
 identity = Path(args.data_dir, "identity.bin")
@@ -134,7 +156,7 @@ with socket.socket(socket.AF_UNIX) as listener:
         stream, _ = listener.accept()
         with stream, stream.makefile("rwb") as io:
             assert json.loads(io.readline()) == {"op": "status"}
-            state = {"engine": "ready", "connected": token != "fixture-wait-code", "gpu_lost": False}
+            state = {"engine": "parked", "connected": token != "fixture-wait-code", "gpu_lost": False}
             io.write(json.dumps({"ok": True, "status": state}, separators=(",", ":")).encode() + b"\n")
 PY
 cat > "$package/bin/publicompute" <<'PY'
@@ -181,10 +203,7 @@ mkdir "$work/http/replacement"
 cp "$work/rejected.tar.zst" "$work/http/replacement/$name.tar.zst"
 (cd "$work/http/replacement" && sha256sum "$name.tar.zst" > SHA256SUMS)
 HOME=$work/signer /src/tools/pacchetto/firma.sh "$work/http/replacement/SHA256SUMS"
-dd if=/dev/zero of="$work/http/model.gguf" bs=1024 count=4 status=none
-model_sha=$(sha256sum "$work/http/model.gguf" | cut -d ' ' -f 1)
 url=http://127.0.0.1:18773
-printf 'qwen3.5-9b Q4_K_M 4096 %s %s/model.gguf\n' "$model_sha" "$url" > "$work/model.manifest"
 printf 'fixture CA\n' > "$work/ca.pem"
 python3 -m http.server 18773 --bind 127.0.0.1 --directory "$work/http" > "$work/http.log" 2>&1 &
 http_pid=$!
@@ -196,12 +215,12 @@ chmod 0440 /etc/sudoers.d/publicompute-fixture
 PUBLICOMPUTE_SKIP_GPU_CHECK=1
 PUBLICOMPUTE_TEST_CPUINFO=$work/cpuinfo
 printf 'processor\t: 0\nflags\t\t: ssse3 sse4_1 sse4_2 popcnt cx16 avx avx2 fma f16c bmi1 bmi2 abm movbe\n' > "$PUBLICOMPUTE_TEST_CPUINFO"
-PUBLICOMPUTE_TEST_MODEL_MANIFEST=$work/model.manifest
 PUBLICOMPUTE_CA_FILE=$work/ca.pem
 PUBLICOMPUTE_BASE_URL=$url
 PUBLICOMPUTE_VERSION=$version
 PUBLICOMPUTE_LINK_CODE=fixture-first-code
-export PUBLICOMPUTE_SKIP_GPU_CHECK PUBLICOMPUTE_TEST_CPUINFO PUBLICOMPUTE_TEST_MODEL_MANIFEST PUBLICOMPUTE_CA_FILE \
+unset PUBLICOMPUTE_MODEL
+export PUBLICOMPUTE_SKIP_GPU_CHECK PUBLICOMPUTE_TEST_CPUINFO PUBLICOMPUTE_CA_FILE \
     PUBLICOMPUTE_BASE_URL PUBLICOMPUTE_VERSION PUBLICOMPUTE_LINK_CODE
 expect_failure() {
     message=$1
@@ -263,7 +282,7 @@ chmod 0755 "$work/bin/nvidia-smi"
     PUBLICOMPUTE_SKIP_GPU_CHECK=0
     FIXTURE_SMI_LOG=$work/nvidia-smi.log
     export PATH PUBLICOMPUTE_SKIP_GPU_CHECK FIXTURE_SMI_LOG
-    unset PUBLICOMPUTE_TEST_MODEL_MANIFEST PUBLICOMPUTE_PACKAGE PUBLICOMPUTE_PACKAGE_SHA256
+    unset PUBLICOMPUTE_PACKAGE PUBLICOMPUTE_PACKAGE_SHA256
     expect_gpu_install_failure() {
         gpu_message=$1 gpu_csv=$2
         shift 2
@@ -332,12 +351,31 @@ cp "$work/rejected.tar.zst" "$work/http/$name.tar.zst"
 expect_rejected_release 'Package SHA-256 mismatch.'
 mv "$work/original.tar.zst" "$work/http/$name.tar.zst"
 expect_failure 'Invalid region.' sh "$installer" --region 'EU/IT'
+expect_failure 'PUBLICOMPUTE_MODEL must be medio, deepseek or free.' env PUBLICOMPUTE_MODEL=invalid sh "$installer"
 runuser -u fixture -- sh -c 'curl -fsSL "$PUBLICOMPUTE_BASE_URL/install.sh" | PUBLICOMPUTE_REGION=EU-DE sh -s -- --region EU-IT'
 grep -Fx 'PUBLICOMPUTE_REGION=EU-IT' "$conf/agent.conf"
 grep -Fx 'PUBLICOMPUTE_RELAY=https://relay.publicompute.com:8443' "$conf/agent.conf"
 test "$(stat -c %u "$legacy_lock")" = "$(id -u fixture)"
 runuser -u fixture -- rm -- "$legacy_lock"
 model=$state/models/qwen3.5-9b-Q4_K_M.gguf
+preference=$state/contributo.json
+expect_preference() {
+    python3 - "$preference" "$@" <<'PYFIX'
+import json
+from pathlib import Path
+import sys
+
+pref = json.loads(Path(sys.argv[1]).read_text())
+assert pref["modo"] == sys.argv[2], pref
+assert pref["modello"] == ({"id": sys.argv[3], "quant": sys.argv[4]} if len(sys.argv) == 5 else None), pref
+assert pref["revisione"] > 0
+PYFIX
+}
+test -z "$(ls -A "$state/models")"
+expect_preference libera
+# Retained weights must survive subsequent updates and uninstall --keep-models.
+printf 'legacy weights\n' > "$model"
+chown publicompute-agent:publicompute-agent "$model"
 socket=/run/publicompute-agent/agent.sock
 test "$(stat -c %a "$socket")" = 660
 test "$(stat -c %a "$(dirname "$socket")")" = 750
@@ -393,12 +431,12 @@ sed -i 's|/bin/publicompute-agent |/bin/previous-agent |' "$unit_file"
 systemctl daemon-reload
 systemctl start publicompute-agent.service
 timeout 10 sh -c 'until publicompute status >/dev/null 2>&1; do sleep 1; done'
-sha256sum "$conf/agent.conf" "$conf/ca.pem" "$unit_file" > "$work/before-upgrade"
+sha256sum "$conf/agent.conf" "$conf/ca.pem" "$unit_file" "$preference" > "$work/before-upgrade"
 printf 'candidate CA\n' > "$work/candidate-ca.pem"
 expect_failure 'Restoring the previous PubliCompute installation.' env \
     PUBLICOMPUTE_PACKAGE="$work/rejected.tar.zst" PUBLICOMPUTE_PACKAGE_SHA256="$rejected_sha" \
     PUBLICOMPUTE_COORDINATOR=localhost:7777 PUBLICOMPUTE_CA_FILE="$work/candidate-ca.pem" \
-    PUBLICOMPUTE_LINK_CODE=fixture-rejected-code sh /src/install.sh --relink
+    PUBLICOMPUTE_LINK_CODE=fixture-rejected-code PUBLICOMPUTE_MODEL=medio sh /src/install.sh --relink
 test "$(cat "$prefix/RELEASE")" = original
 test -x "$prefix/bin/previous-agent"
 test ! -e "$prefix/bin/publicompute-agent"
@@ -450,33 +488,16 @@ identity=$(cat "$state/identity.bin")
 PUBLICOMPUTE_LINK_CODE=fixture-relinked-code sh "$installer" --relink
 test "$(cat "$state/identity.bin")" != "$identity"
 
-alternate=$state/models/fixture-other-Q8_0.gguf
-python3 - "$alternate" <<'PY'
-import struct
-import sys
-from pathlib import Path
-
-header = struct.pack("<4sIQQQ7sIQIQ", b"GGUF", 3, 1, 0, 7, b"weights", 1, 64, 0, 0)
-Path(sys.argv[1]).write_bytes(header.ljust(64, b"\0") + b"\x01" * 256)
-PY
-alternate_size=$(stat -c %s "$alternate")
-alternate_sha=$(sha256sum "$alternate" | cut -d ' ' -f 1)
-chown publicompute-agent:publicompute-agent "$alternate"
-mv "$model" "$work/default.gguf"
-# Recreate the model settings written by the 0.1.1 installer.
-printf '0.1.1\n' > "$prefix/VERSION"
-sed -i -e "s|^MODEL_PATH=.*|MODEL_PATH=$alternate|" -e 's/^MODEL_ID=.*/MODEL_ID=fixture-other/' \
-    -e 's/^QUANTIZATION=.*/QUANTIZATION=Q8_0/' -e '/^MODEL_SIZE=/d' -e '/^MODEL_SHA256=/d' \
-    -e '/^PUBLICOMPUTE_REGION=/d' -e '/^PUBLICOMPUTE_RELAY=/d' \
-    "$conf/agent.conf"
-printf 'qwen3.5-9b Q4_K_M 1099511627776000 %s %s/unavailable.gguf\n' "$model_sha" "$url" > "$work/unreachable.manifest"
-# An upgrade must leave the service's selection and transfer intact.
-printf '%s\n' '{"id":"fixture-other","quant":"Q8_0"}' > "$state/active-model.json"
-printf 'resumable service download\n' > "$alternate.agent.part"
-chown publicompute-agent:publicompute-agent "$state/active-model.json" "$alternate.agent.part"
-sha256sum "$state/active-model.json" "$alternate.agent.part" > "$work/model-state-before"
+# Recreate the model settings and preference left by a 0.1.3 installation.
+printf '%s\n' "$older_version" > "$prefix/VERSION"
+sed -i -e '/^PUBLICOMPUTE_REGION=/d' -e '/^PUBLICOMPUTE_RELAY=/d' "$conf/agent.conf"
+printf 'MODEL_PATH=%s\nMODEL_ID=qwen3.5-9b\nQUANTIZATION=Q4_K_M\n' "$model" >> "$conf/agent.conf"
+printf '%s\n' '{"modo":"uso","modello":{"id":"qwen3.5-9b","quant":"Q4_K_M"},"revisione":900}' > "$preference"
+partial=$state/models/qwen3.6-35b-a3b-UD-Q4_K_XL.gguf.agent.part
+printf 'resumable service download\n' > "$partial"
+chown publicompute-agent:publicompute-agent "$partial"
+sha256sum "$model" "$partial" > "$work/model-state-before"
 for step in migration double-quoted single-quoted; do
-    log=$work/model-$step.log
     expected_region=EU
     set --
     case "$step" in
@@ -490,41 +511,27 @@ for step in migration double-quoted single-quoted; do
             expected_region=EU-DE
             ;;
     esac
-    if ! PUBLICOMPUTE_TEST_MODEL_MANIFEST=$work/unreachable.manifest sh "$installer" "$@" > "$log" 2>&1; then
-        cat "$log" >&2
-        exit 1
-    fi
-    grep -F 'Keeping the configured model fixture-other Q8_0.' "$log"
-    grep -Fx "MODEL_PATH=$alternate" "$conf/agent.conf"
-    grep -Fx 'MODEL_ID=fixture-other' "$conf/agent.conf"
-    grep -Fx 'QUANTIZATION=Q8_0' "$conf/agent.conf"
-    grep -Fx "MODEL_SIZE=$alternate_size" "$conf/agent.conf"
-    grep -Fx "MODEL_SHA256=$alternate_sha" "$conf/agent.conf"
+    sh "$installer" "$@"
+    expect_preference libera
+    test -z "$(sed -n '/^MODEL_/p; /^QUANTIZATION=/p' "$conf/agent.conf")"
     grep -Fx "PUBLICOMPUTE_REGION=$expected_region" "$conf/agent.conf"
     grep -Fx 'PUBLICOMPUTE_RELAY=https://relay.publicompute.com:8443' "$conf/agent.conf"
-    test ! -e "$model"
-    test ! -e "$model.part"
 done
-truncate -s 64 "$alternate"
-test "$(head -c 4 "$alternate")" = GGUF
-expect_failure 'Insufficient free space' env PUBLICOMPUTE_TEST_MODEL_MANIFEST="$work/unreachable.manifest" sh "$installer"
-truncate -s "$alternate_size" "$alternate"
-expect_failure 'Insufficient free space' env PUBLICOMPUTE_TEST_MODEL_MANIFEST="$work/unreachable.manifest" sh "$installer"
-mv "$work/default.gguf" "$model"
-model_inode=$(stat -c %i "$model")
-if ! sh "$installer" > "$work/model-fallback.log" 2>&1; then
-    cat "$work/model-fallback.log" >&2
-    exit 1
-fi
-grep -F 'Could not verify the configured model fixture-other Q8_0. Using the default model qwen3.5-9b Q4_K_M.' "$work/model-fallback.log"
-grep -Fx "MODEL_PATH=$model" "$conf/agent.conf"
-grep -Fx "MODEL_SHA256=$model_sha" "$conf/agent.conf"
-
+test "$(cat "$prefix/VERSION")" = "$version"
+test "$(stat -c %i "$model")" = "$model_inode"
+PUBLICOMPUTE_MODEL=medio sh "$installer"
+expect_preference uso qwen3.6-35b-a3b UD-Q4_K_XL
+PUBLICOMPUTE_MODEL=deepseek sh "$installer"
+expect_preference uso deepseek-v4-flash IQ2XXS-w2Q2K-0731
+PUBLICOMPUTE_MODEL=free sh "$installer"
+expect_preference libera
 sha256sum -c "$work/model-state-before"
+touch "$state/active-model.json"
 touch "$model.part" "$state/models/verified.json"
 runuser -u fixture -- publicompute uninstall --keep-models
 test ! -e "$state/active-model.json"
-test ! -e "$alternate.agent.part"
+test ! -e "$partial"
+test ! -e "$preference"
 test ! -e "$model.part"
 test ! -e "$state/models/verified.json"
 test -f "$model"

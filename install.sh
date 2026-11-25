@@ -2,7 +2,7 @@
 # Install the Linux package, configure the agent service and enroll a node.
 # The privileged phase stages and verifies a candidate before replacing the
 # active installation. Use PUBLICOMPUTE_CA_FILE for a private coordinator.
-# The loopback HTTP, manifest and hardware overrides are for installer tests.
+# The loopback HTTP and hardware overrides are for installer tests.
 set +x
 set -eu
 
@@ -78,7 +78,7 @@ if [ -n "$link_code" ]; then
     unset link_code
 fi
 
-default_version=0.1.3
+default_version=0.1.4
 version=${PUBLICOMPUTE_VERSION:-$default_version}
 case "$version" in
     ''|*[!A-Za-z0-9._-]*) fail 'Invalid package version.' ;;
@@ -97,11 +97,11 @@ esac
 skip_gpu=${PUBLICOMPUTE_SKIP_GPU_CHECK:-0}
 cpuinfo=${PUBLICOMPUTE_TEST_CPUINFO:-/proc/cpuinfo}
 case "$cpuinfo" in /*) ;; *) cpuinfo=$PWD/$cpuinfo ;; esac
-test_manifest=${PUBLICOMPUTE_TEST_MODEL_MANIFEST:-}
-if [ -n "$test_manifest" ]; then
-    [ "$skip_gpu" = 1 ] || fail 'The test model requires PUBLICOMPUTE_SKIP_GPU_CHECK=1.'
-    case "$test_manifest" in /*) ;; *) test_manifest=$PWD/$test_manifest ;; esac
-fi
+model_choice=${PUBLICOMPUTE_MODEL:-}
+case "$model_choice" in
+    ''|medio|deepseek|free) ;;
+    *) fail 'PUBLICOMPUTE_MODEL must be medio, deepseek or free.' ;;
+esac
 
 release_url=https://github.com/dr0p18/PubliCompute/releases/download
 base_url=${PUBLICOMPUTE_BASE_URL:-$release_url/v$version}
@@ -125,7 +125,7 @@ esac
 # Keep the privileged phase inline so piped installation works without a script file.
 as_root sh -s -- "$started" "$downloader" "$version" "$base_url" \
     "$package" "${PUBLICOMPUTE_PACKAGE_SHA256:-}" "${PUBLICOMPUTE_COORDINATOR:-api.publicompute.com:7443}" \
-    "${PUBLICOMPUTE_SERVER_NAME:-}" "$ca" "${PUBLICOMPUTE_SPEED_URL:-}" "$skip_gpu" "$test_manifest" \
+    "${PUBLICOMPUTE_SERVER_NAME:-}" "$ca" "${PUBLICOMPUTE_SPEED_URL:-}" "$skip_gpu" "$model_choice" \
     "$link_file" "$relink" "${SUDO_USER:-$(id -un)}" "$http_fixture" "$allow_downgrade" "$region" \
     "$MIN_DRIVER" "$MIN_DRIVER_BLACKWELL" "$cpuinfo" <<'ROOT' &
 set -eu
@@ -135,7 +135,7 @@ fail() { printf '%s\n' "$*" >&2; exit 1; }
 
 started=$1 downloader=$2 version=$3 base_url=$4 package=$5 package_sha=$6 coordinator=$7 server_name=$8 ca=$9
 shift 9
-speed_url=$1 skip_gpu=$2 test_manifest=$3 link_file=$4 relink=$5 installer=$6 http_fixture=$7 allow_downgrade=$8 region=$9
+speed_url=$1 skip_gpu=$2 model_choice=$3 link_file=$4 relink=$5 installer=$6 http_fixture=$7 allow_downgrade=$8 region=$9
 MIN_DRIVER=${10} MIN_DRIVER_BLACKWELL=${11} cpuinfo=${12}
 
 valid_region() {
@@ -282,6 +282,10 @@ rollback() {
     if [ -f "$previous/identity-saved" ]; then
         restore_file identity.bin "$state/identity.bin" && restore_file key.pem "$state/key.pem" || return 1
     fi
+    if [ -f "$previous/preference-saved" ]; then
+        restore_file contributo.json "$state/contributo.json" &&
+            restore_file active-model.json "$state/active-model.json" || return 1
+    fi
     if [ -f "$previous/new-link" ] && [ "$(readlink "$link" 2>/dev/null || :)" = "$prefix/bin/publicompute" ]; then
         rm -f -- "$link" || return 1
     fi
@@ -412,23 +416,10 @@ WSL: update the Windows NVIDIA driver." ;;
     esac
 fi
 
-model_manifest='qwen3.5-9b Q4_K_M 5680522464 03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8 https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/3885219b6810b007914f3a7950a8d1b469d598a5/Qwen3.5-9B-Q4_K_M.gguf'
-if [ -n "$test_manifest" ]; then
-    model_manifest=$(cat -- "$test_manifest")
-fi
-IFS=' ' read -r model_id quant model_size model_sha model_url extra <<MANIFEST
-$model_manifest
-MANIFEST
-[ -z "$extra" ] || fail 'Invalid model manifest.'
-case "$model_id:$quant" in *[!A-Za-z0-9._:-]*|:*|*:) fail 'Invalid model identifier or quantization.' ;; esac
-case "$model_size" in ''|*[!0-9]*) fail 'Invalid model size.' ;; esac
-case "$model_url" in http://*|https://*) ;; *) fail 'Invalid model URL.' ;; esac
 valid_hash() {
     [ "${#1}" -eq 64 ] || return 1
     case "$1" in *[!0123456789abcdefABCDEF]*) return 1 ;; esac
 }
-valid_hash "$model_sha" || fail 'Invalid model SHA-256.'
-model_sha=$(printf '%s' "$model_sha" | tr 'A-F' 'a-f')
 if [ -n "$package" ]; then
     valid_hash "$package_sha" || fail 'PUBLICOMPUTE_PACKAGE requires PUBLICOMPUTE_PACKAGE_SHA256.'
 fi
@@ -554,32 +545,6 @@ if [ -d "$state/models" ] && [ ! -L "$state/models" ] && [ "$(stat -c %u "$state
 fi
 as_agent() { runuser -u "$account" -- "$@"; }
 as_agent mkdir -p "$state/models"
-model=$state/models/$model_id-$quant.gguf
-# The service keeps its own partial downloads across package upgrades.
-part=$model.part
-
-gguf_header_ok() {
-    # A GGUF v2 or v3 fixed header is 24 bytes. The magic bytes are endian-independent.
-    [ "$2" -ge 24 ] || return 1
-    header=$(as_agent od -An -N8 -tx1 -- "$1") || return 1
-    case "$header" in
-        ' 47 47 55 46 02 00 00 00'|' 47 47 55 46 03 00 00 00'|' 47 47 55 46 00 00 00 03') return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-model_ok() {
-    as_agent test ! -L "$1" && as_agent test -f "$1" || return 1
-    checked_size=$(as_agent stat -c %s -- "$1") || return 1
-    [ -z "$2" ] || [ "$checked_size" = "$2" ] || return 1
-    # Legacy configurations need a format check before recording the measured metadata.
-    if [ -z "$2" ] || [ -z "$3" ]; then
-        gguf_header_ok "$1" "$checked_size" || return 1
-    fi
-    checksum=$(as_agent sh -c 'sha256sum < "$1"' sh "$1") || return 1
-    checked_sha=${checksum%% *}
-    [ -z "$3" ] || [ "$checked_sha" = "$3" ]
-}
 
 config_value() {
     sed -n "s/^$1=//p" "$conf/agent.conf" | head -n 1
@@ -591,40 +556,6 @@ trusted_config() {
     mode=$(stat -c %a "$conf/agent.conf")
     [ "$((0$mode & 022))" -eq 0 ]
 }
-
-configured_model() {
-    trusted_config || return 1
-    old_path=$(config_value MODEL_PATH)
-    old_id=$(config_value MODEL_ID)
-    old_quant=$(config_value QUANTIZATION)
-    old_size=$(config_value MODEL_SIZE)
-    old_sha=$(config_value MODEL_SHA256)
-    case "$old_path" in "$state"/models/*.gguf) ;; *) return 1 ;; esac
-    case "$old_id:$old_quant" in *[!A-Za-z0-9._:-]*|:*|*:) return 1 ;; esac
-    [ "$old_path" != "$model" ] || return 1
-    old_sha=$(printf '%s' "$old_sha" | tr 'A-F' 'a-f')
-    if [ "$old_size" = 0 ] || ! model_ok "$old_path" "$old_size" "$old_sha"; then
-        printf 'Could not verify the configured model %s %s. Using the default model %s %s.\n' \
-            "$old_id" "$old_quant" "$model_id" "$quant" >&2
-        return 1
-    fi
-    printf 'Keeping the configured model %s %s.\n' "$old_id" "$old_quant"
-    model=$old_path model_id=$old_id quant=$old_quant model_size=$checked_size model_sha=$checked_sha
-}
-
-# Check model space after the verified package has been extracted.
-model_kb=0
-need_model=0
-if ! configured_model && ! model_ok "$model" "$model_size" "$model_sha"; then
-    need_model=1
-    model_kb=$((512 * 1024))
-    if ! model_ok "$part" "$model_size" "$model_sha"; then
-        partial=$(as_agent stat -c %s "$part" 2>/dev/null || printf 0)
-        [ "$partial" -lt "$model_size" ] || partial=0
-        model_kb=$((model_kb + (model_size - partial + 1023) / 1024))
-    fi
-fi
-check_space "$state" "$model_kb"
 
 if [ -n "$ca" ]; then
     install -m 0644 -- "$ca" "$scratch/ca.pem"
@@ -684,30 +615,25 @@ if [ "$relink" = 1 ] || [ ! -s "$conf/owner-token" ]; then
     new_token=1
 fi
 
-if [ "$need_model" = 1 ]; then
-    printf 'Preparing %s %s.\n' "$model_id" "$quant"
-    if ! model_ok "$part" "$model_size" "$model_sha"; then
-        as_agent test ! -L "$part" || fail 'Model partial file must not be a symbolic link.'
-        partial=$(as_agent stat -c %s "$part" 2>/dev/null || printf 0)
-        if [ "$partial" -ge "$model_size" ]; then as_agent rm -f -- "$part"; fi
-        begin=$(date +%s)
-        case "$downloader" in
-            curl) as_agent curl -fLsS --connect-timeout 15 --retry 3 -C - -o "$part" -- "$model_url" ||
-                fail 'Model download failed. Rerun to resume.' ;;
-            wget) as_agent wget --timeout=30 --tries=3 -c -O "$part" -- "$model_url" ||
-                fail 'Model download failed. Rerun to resume.' ;;
+# stdin carries the privileged script, even when the user has a terminal.
+if [ -z "$model_choice" ] && [ -t 3 ] 2>/dev/null 3< /dev/tty; then
+    while :; do
+        printf '%s\n' 'Choose how to use this GPU:' \
+            '  1. Qwen3.6-35B-A3B UD-Q4_K_XL (about 21 GiB)' \
+            '  2. DeepSeek V4 Flash 0731 (about 81 GiB)' \
+            '  3. Keep the card free' > /dev/tty
+        printf 'Choice [3]: ' > /dev/tty
+        IFS= read -r answer < /dev/tty || answer=
+        case "$answer" in
+            1|medio) model_choice=medio; break ;;
+            2|deepseek) model_choice=deepseek; break ;;
+            3|free|'') model_choice=free; break ;;
         esac
-        download_seconds=$((download_seconds + $(date +%s) - begin))
-        if ! model_ok "$part" "$model_size" "$model_sha"; then
-            as_agent rm -f -- "$part"
-            fail 'Model size or SHA-256 mismatch.'
-        fi
-    fi
-    as_agent mv -fT -- "$part" "$model"
+    done
 fi
+model_choice=${model_choice:-free}
 
-printf 'COORDINATOR=%s\nSERVER_NAME=%s\nMODEL_PATH=%s\nMODEL_ID=%s\nQUANTIZATION=%s\nMODEL_SIZE=%s\nMODEL_SHA256=%s\n' \
-    "$coordinator" "$server_name" "$model" "$model_id" "$quant" "$model_size" "$model_sha" > "$scratch/agent.conf"
+printf 'COORDINATOR=%s\nSERVER_NAME=%s\n' "$coordinator" "$server_name" > "$scratch/agent.conf"
 if trusted_config; then
     old_region=$(config_value PUBLICOMPUTE_REGION | sed 's/^[[:blank:]]*//; s/[[:blank:]]*$//')
     # EnvironmentFile accepts either style of quotes around the region.
@@ -726,6 +652,19 @@ backup_file() {
     if [ -e "$1" ] || [ -L "$1" ]; then
         [ -f "$1" ] && [ ! -L "$1" ] || fail "Expected a regular file at $1."
         cp -p -- "$1" "$2"
+    fi
+}
+
+backup_preference() {
+    # Root creates the snapshot. The service user opens and reads the source.
+    if (umask 077; as_agent "$prefix/bin/publicompute-agent" --data-dir "$state" backup-preference "$1" > "$2"); then
+        [ -f "$2" ] && [ ! -L "$2" ] && [ -s "$2" ] || fail "Invalid snapshot of $1."
+        chown -- "$account:$account" "$2"
+    elif [ "$?" = 3 ]; then
+        # The state file is absent on this installation.
+        rm -f -- "$2"
+    else
+        fail "Cannot back up $1."
     fi
 }
 
@@ -748,6 +687,11 @@ backup_file "$state/identity.bin" "$previous/identity.bin"
 backup_file "$state/key.pem" "$previous/key.pem"
 : > "$previous/identity-saved"
 "$stage/bin/publicompute-agent" swap-install "$stage" "$prefix" || fail 'Cannot replace the installation directory.'
+backup_preference contributo.json "$previous/contributo.json"
+backup_preference active-model.json "$previous/active-model.json"
+: > "$previous/preference-saved"
+as_agent "$prefix/bin/publicompute-agent" --data-dir "$state" install-preference "$model_choice" ||
+    fail 'Cannot save the contribution preference.'
 install -m 0644 "$scratch/ca.pem" "$conf/ca.pem"
 install -m 0644 "$scratch/agent.conf" "$conf/agent.conf"
 if [ "$new_token" = 1 ]; then
@@ -764,8 +708,14 @@ printf '%s\n' 'Waiting for the agent.'
 deadline=$(($(date +%s) + 300))
 last=
 while [ "$(date +%s)" -lt "$deadline" ]; do
-    case "$(systemctl show --property=SubState --value "$unit")" in
-        failed|dead|auto-restart) fail "The new service failed to start. See journalctl -u $unit." ;;
+    service_state=$(systemctl show --property=SubState --property=ExecMainStatus "$unit")
+    case "$service_state" in
+        *SubState=auto-restart*ExecMainStatus=75*|*ExecMainStatus=75*SubState=auto-restart*)
+            # A cached model can finish switching before the installer sees the first session.
+            sleep 1
+            continue ;;
+        *SubState=failed*|*SubState=dead*|*SubState=auto-restart*)
+            fail "The new service failed to start. See journalctl -u $unit." ;;
     esac
     remaining=$((deadline - $(date +%s)))
     [ "$remaining" -gt 0 ] || break
@@ -779,7 +729,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
             *'"connected":true'*)
                 phase='Waiting for the service to be active'
                 if systemctl is-active --quiet "$unit"; then
-                    "$prefix/bin/publicompute" --socket "$socket" status
+                    "$prefix/bin/publicompute" --socket "$socket" status || :
                     install -d -m 0755 /usr/local/bin
                     ln -sfn -- "$prefix/bin/publicompute" "$link"
                     if [ "$installer" != root ]; then

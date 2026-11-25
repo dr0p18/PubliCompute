@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn aligns_saved_use_and_preserves_free() {
         let d = temp_dir("align");
-        let c = Contribution::open(&d, usage("qwen-9b")).unwrap();
+        let c = Contribution::open(&d, usage("qwen-old")).unwrap();
         let old = c.preference();
         let medium = ModelSelection { id: "qwen-medium".into(), quant: "Q4_K_M".into() };
         c.align_model(medium.clone()).unwrap();
@@ -249,7 +249,7 @@ mod tests {
 
         let chosen = ModelSelection { quant: "Q8_0".into(), ..medium };
         c.align_model(chosen.clone()).unwrap();
-        let reopened = Contribution::open(&d, usage("qwen-9b")).unwrap();
+        let reopened = Contribution::open(&d, usage("qwen-old")).unwrap();
         assert_eq!(reopened.preference().model.as_ref(), Some(&chosen));
         assert!(reopened.preference().revision > aligned.revision);
         let mut saved = reopened.preference();

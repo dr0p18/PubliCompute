@@ -8,10 +8,11 @@ set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 OUT="$HERE/out"
+release_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$REPO/agent/Cargo.toml")
 mkdir -p "$OUT"
 
 if [ "${1:-}" != "--inside" ]; then
-    VERSION=${1:-$(git -C "$REPO" describe --tags --always --dirty 2>/dev/null || echo dev)}
+    VERSION=${1:-$release_version}
     if podman info >/dev/null 2>&1; then
         ENGINE=podman
     elif docker info >/dev/null 2>&1; then
@@ -34,7 +35,7 @@ if [ "${1:-}" != "--inside" ]; then
 fi
 
 # Build and assemble the package inside the container.
-VERSION=${VERSION:-dev}
+VERSION=${VERSION:-$release_version}
 cd /work
 B=/work/tools/pacchetto/build        # Keep the reconstructed source, build directory and Cargo target under this scratch root.
 PKG=/work/tools/pacchetto/out/publicompute

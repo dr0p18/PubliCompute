@@ -392,6 +392,7 @@ enum Cmd {
 
 struct Attivo {
     chain_id: String,
+    role: Role,
     /// Maximum concurrent conversations served by the head of this chain.
     slots: u32,
     epoch: u64,
@@ -633,6 +634,17 @@ impl Stages {
         i.pending_assignments > 0 || i.attivo.is_some() || i.switching.as_ref().is_some_and(|s| s.parked.is_some())
     }
 
+    pub fn model_loaded(&self) -> bool {
+        self.interno.lock().unwrap().attivo.as_ref().is_some_and(|a| {
+            !a.closing && matches!(a.last.state(), State::Ready | State::Running)
+        })
+    }
+
+    /// Return the active stage role while a chain assignment is live.
+    pub fn active_role(&self) -> Option<Role> {
+        self.interno.lock().unwrap().attivo.as_ref().filter(|a| !a.closing).map(|a| a.role)
+    }
+
     pub fn matches_active(&self, a: &StageAssign) -> bool {
         let i = self.interno.lock().unwrap();
         i.attivo.as_ref().is_some_and(|s| s.chain_id == a.chain_id && s.epoch == a.assign_epoch && !s.closing)
@@ -866,6 +878,7 @@ impl Stages {
             }
             i.attivo = Some(Attivo {
                 chain_id: a.chain_id.clone(),
+                role,
                 slots: a.slots,
                 epoch: a.assign_epoch,
                 ferma: Some(ferma_tx),

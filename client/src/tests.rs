@@ -8,6 +8,7 @@ use std::{
 };
 
 use serde_json::{json, Value};
+use unicode_width::UnicodeWidthStr;
 
 use crate::{command, command_with_uninstaller, follow_updates, render, run_uninstaller, sock::{self, Socket}, status::*, Msg};
 
@@ -57,9 +58,9 @@ fn with_reason(reason: &str, free_seat: bool) -> Status {
     s
 }
 
-/// Measure characters after removing terminal styling sequences.
+/// Measure cells after removing terminal styling sequences.
 fn visible(line: &str) -> usize {
-    let mut n = 0;
+    let mut plain = String::new();
     let mut chars = line.chars();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
@@ -69,10 +70,10 @@ fn visible(line: &str) -> usize {
                 }
             }
         } else {
-            n += 1;
+            plain.push(c);
         }
     }
-    n
+    plain.width()
 }
 
 #[test]
@@ -86,32 +87,82 @@ fn parses_status_reply() {
 }
 
 #[test]
-fn render_never_exceeds_width() {
+fn render_adapts_to_30_60_and_100_columns() {
     let mut s = sample();
+    s.gpu.as_mut().unwrap().name = "測試測試測試測試測試測試測試測試 GPU".into();
     s.contribution.as_mut().unwrap().stable_until = Some(i64::MAX);
     s.chain_id = Some("a-very-long-chain-identifier-that-goes-on".into());
-    for w in [40u16, 80, 120] {
+    for w in [30u16, 60, 100] {
         for color in [false, true] {
-            let lines = render::render(&s, w, 40, 0, "Use which model?  [1] qwen3.5-9b Q4_K_M  [2] another-model Q8_0", color);
-            assert!(lines.len() > 8);
-            for l in &lines {
-                assert!(visible(l) <= w as usize, "width {w}: {l:?}");
+            let dashboard = render::render(&s, w, 40, 0, "Use which model? [1] medium Q4_K_M [2] deepseek Q8_0", color);
+            for key in ["[U]", "[F]", "[P]", "[C]", "[Q]"] {
+                assert!(dashboard.iter().any(|line| line.contains(key)));
             }
-            for l in render::render_down(w, "cannot connect to /var/lib/publicompute/agent.sock: No such file", color) {
-                assert!(visible(&l) <= w as usize, "down, width {w}: {l:?}");
-            }
-            for l in render::render_logo(w, color) {
-                assert!(visible(&l) <= w as usize);
+            let frames = [
+                dashboard,
+                render::render_down(w, "cannot connect to /var/lib/publicompute/agent.sock: No such file", color),
+                render::render_logo(w, color),
+                render::render_intro(w, 40, color, Duration::from_millis(540)),
+                render::render_intro(w, 40, color, Duration::from_millis(2400)),
+                render::render_empty_chat("medium", w, color, None),
+                render::render_empty_chat("medium", w, color, Some(Duration::from_secs(7))),
+            ];
+            for line in frames.iter().flatten() {
+                assert!(visible(line) <= w as usize, "width {w}: {line:?}");
+                assert!(color || !line.contains('\x1b'), "{line:?}");
             }
         }
+        let logo = render::render_logo(w, false);
+        match w {
+            30 => assert_eq!(logo, ["PubliCompute"]),
+            60 => {
+                assert_eq!(logo.len(), 6);
+                assert!(logo[0].starts_with("█▀▀█    █▀▀█"));
+                assert!(logo.iter().any(|line| line.contains("PubliCompute")));
+            }
+            100 => {
+                assert_eq!(logo.len(), 6);
+                assert!(logo[0].starts_with("█▀▀█    █▀▀█"));
+                assert!(logo[1].width() > 60);
+                assert!(!logo.iter().any(|line| line.contains("PubliCompute")));
+            }
+            _ => unreachable!(),
+        }
     }
+}
+
+#[test]
+fn render_uses_signal_for_indicators_and_keeps_warnings_visible() {
+    let signal = "\x1b[38;2;198;255;61m";
+    let mut s = sample();
+    let active = render::render(&s, 60, 24, 0, "", true).join("\n");
+    assert_eq!(active.matches(signal).count(), 1);
+    assert!(active.contains(&format!("{signal}ONLINE\x1b[0m")));
+    s.paused = true;
+    let paused = render::render(&s, 60, 24, 0, "! command failed", true).join("\n");
+    assert!(!paused.contains(signal));
+    assert!(paused.contains("\x1b[1;38;2;255;255;255m  ! command failed"));
+    assert!(render::chat_prompt(true).contains(signal));
+}
+
+#[test]
+fn empty_chat_eyes_follow_the_site_cycle() {
+    let frame = |ms| render::chat_eyes(60, true, Some(Duration::from_millis(ms)));
+    assert!(frame(0).iter().all(String::is_empty));
+    assert_ne!(frame(2000), frame(3000));
+    assert_ne!(frame(4000), frame(5000));
+    assert_eq!(frame(2000), frame(9000));
+    assert_eq!(frame(0), frame(13_000));
+    assert!(!frame(5000).join("").contains("198;255;61"));
+    assert!(frame(7000).join("").contains("198;255;61"));
+    assert_eq!(render::chat_eyes(60, true, None), frame(3000)[5..9]);
 }
 
 #[test]
 fn render_fits_height_and_keeps_keys() {
     let lines = render::render(&sample(), 80, 6, 0, "", false);
     assert_eq!(lines.len(), 6);
-    assert_eq!(lines.last().unwrap(), render::KEYS);
+    assert_eq!(lines.last().unwrap(), "[U] use a model  [F] free card  [P] pause/resume  [C] chat link  [Q] quit");
     let notice = "downloading medium (20.8 GiB remaining), see publicompute status";
     let lines = render::render(&sample(), 80, 6, 0, notice, false);
     assert_eq!(lines.len(), 6);
@@ -119,13 +170,14 @@ fn render_fits_height_and_keeps_keys() {
 }
 
 #[test]
-fn render_shows_summary_and_disclaimer() {
+fn render_shows_usage_without_credits() {
     let text = render::render(&sample(), 80, 40, 0, "", false).join("\n");
-    assert!(text.contains("Last 30 days"));
-    assert!(text.contains("1,240 mc  (86 chats)"));
-    assert!(text.contains("credits earned"));
-    assert!(text.contains("71 h   (of which working 9 h)"), "{text}");
-    assert!(text.contains("No earnings guarantee: credits depend on demand."));
+    assert!(text.contains("LAST 30 DAYS"));
+    assert!(text.contains("Free chats 86"));
+    assert!(text.contains("In service 71 h"));
+    assert!(text.contains("Working    9 h"));
+    assert!(!text.contains("credits"));
+    assert!(!text.contains(" mc"));
 }
 
 #[test]
@@ -185,9 +237,11 @@ fn line_warming_up() {
 fn line_mode_free_chosen_and_automatic() {
     let mut s = with_reason("MODE_FREE", false);
     s.preference.mode = "free".into();
-    assert_eq!(line_of(&s), "FARM mode — serving qwen3.5-9b");
+    assert_eq!(line_of(&s), "Free card — serving qwen3.5-9b");
+    s.contribution.as_mut().unwrap().serving = None;
+    assert_eq!(line_of(&s), "Free card — waiting for work");
     s.preference.mode = "use".into();
-    assert_eq!(line_of(&s), "FARM mode (automatic) — back to use at the next chat on qwen3.5-9b");
+    assert_eq!(line_of(&s), "Free card (automatic) — back to use at the next chat on qwen3.5-9b");
 }
 
 #[test]
@@ -196,8 +250,35 @@ fn line_not_placed() {
     s.preference.model = Some("qwen3.6-35b-a3b".into());
     assert_eq!(
         line_of(&s),
-        "Serving qwen3.5-9b. qwen3.6-35b-a3b is paid in credits: the card was not placed in one of its chains"
+        "Serving qwen3.5-9b. The card was not placed in a chain of qwen3.6-35b-a3b"
     );
+}
+
+#[test]
+fn line_new_reasons_prefer_coordinator_detail() {
+    let mut s = with_reason("WAITING_PEERS", false);
+    s.contribution.as_mut().unwrap().detail =
+        "waiting for peers: 1 card(s) online in your region, a chain needs at least 2".into();
+    assert_eq!(line_of(&s), "Waiting for peers: 1 card(s) online in your region, a chain needs at least 2");
+    assert_eq!(line_of(&with_reason("WAITING_PEERS", false)), "Waiting for other cards to form a chain of qwen3.5-9b");
+    assert_eq!(line_of(&with_reason("CHAIN_FULL", false)), "The chains of qwen3.5-9b are full — waiting for a seat");
+    assert_eq!(
+        line_of(&with_reason("NETWORK_BELOW_STANDARD", false)),
+        "Network below the chain standard (100 Mbit/s each way, 25 ms)"
+    );
+    assert_eq!(line_of(&with_reason("VRAM_TOO_SMALL", false)), "This card cannot hold a stage of qwen3.5-9b");
+    assert_eq!(
+        line_of(&with_reason("NAT_BLOCKED", false)),
+        "The router blocks incoming connections — the card cannot join a chain"
+    );
+}
+
+#[test]
+fn line_unknown_reason_uses_detail() {
+    let mut s = with_reason("SOMETHING_NEW", false);
+    assert_eq!(line_of(&s), "Serving qwen3.5-9b");
+    s.contribution.as_mut().unwrap().detail = "a newer coordinator explains it".into();
+    assert_eq!(line_of(&s), "A newer coordinator explains it");
 }
 
 #[test]
@@ -215,13 +296,37 @@ fn line_no_contribution_status() {
     assert_eq!(line_of(&s), "Serving qwen3.5-9b");
 }
 
-/// Render a full-width screen so the test output can be inspected as one frame.
 #[test]
-fn capture_80() {
-    let mut s = sample();
-    s.contribution.as_mut().unwrap().stable_until = Some(1_800_000_000);
-    for l in render::render(&s, 80, 30, 0, "", false) {
-        println!("|{l}");
+#[ignore = "prints the preview on demand"]
+fn capture_ui_preview() {
+    let mut active = sample();
+    active.loaded_model = Some("qwen3.6-35b-a3b".into());
+    active.contribution.as_mut().unwrap().serving = active.loaded_model.clone();
+    active.contribution.as_mut().unwrap().in_chain = true;
+    active.chain_id = Some("chain-012a".into());
+    let mut free = active.clone();
+    free.preference.mode = "free".into();
+    free.loaded_model = None;
+    free.active_leases = 0;
+    free.chain_id = None;
+    free.gpu.as_mut().unwrap().vram_used_bytes = 0;
+    let contribution = free.contribution.as_mut().unwrap();
+    contribution.serving = None;
+    contribution.free_seat = false;
+    contribution.in_chain = false;
+    contribution.reason = "FREE_SEAT_REASON_MODE_FREE".into();
+    let mut paused = active.clone();
+    paused.paused = true;
+    for width in [100, 60] {
+        for (name, frame) in [
+            ("SERVING", render::render(&active, width, 24, 0, "", false)),
+            ("FREE CARD", render::render(&free, width, 24, 0, "", false)),
+            ("PAUSED", render::render(&paused, width, 24, 0, "", false)),
+            ("EMPTY CHAT", render::render_empty_chat("qwen3.6-35b-a3b", width, false, None)),
+            ("LOGO", render::render_logo(width, false)),
+        ] {
+            println!("# {width} COLUMNS / {name}\n\n{}\n", frame.join("\n"));
+        }
     }
 }
 
@@ -427,11 +532,15 @@ fn command_use_shows_agent_refusal() {
 }
 
 #[test]
-fn command_farm() {
-    let p = temp_socket("farm");
+fn command_free_replaces_farm() {
+    let p = temp_socket("free");
     let rx = fake_agent(&p, json!({"ok": true, "revision": 5}));
-    assert_eq!(command(&Socket::Explicit(p.clone()), &["farm".into()]).unwrap(), "FARM mode: set");
+    assert_eq!(command(&Socket::Explicit(p.clone()), &["free".into()]).unwrap(), "Free card: set");
     assert_eq!(rx.recv().unwrap(), json!({"op": "preference", "mode": "free"}));
+    let err = command(&Socket::Explicit(p), &["farm".into()]).unwrap_err();
+    assert!(err.starts_with("unknown command"));
+    assert!(err.contains(" | free | "));
+    assert!(!err.contains("farm"));
 }
 
 /// Serve one reply per connection, in order: pause and start ask for the
@@ -601,5 +710,5 @@ fn status_displays_model_progress_and_failure() {
     status["download"]["state"] = json!("failed");
     status["download"]["error"] = json!("SHA-256 mismatch");
     let s: Status = serde_json::from_value(status).unwrap();
-    assert_eq!(s.download_line().as_deref(), Some("download: medium failed: SHA-256 mismatch"));
+    assert_eq!(s.download_line().as_deref(), Some("! download: medium failed: SHA-256 mismatch"));
 }

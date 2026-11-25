@@ -306,6 +306,12 @@ enum FreeSeatReason {
   FREE_SEAT_REASON_NO_ACCOUNT = 8;      
   FREE_SEAT_REASON_MODEL_MISSING = 9;   
   FREE_SEAT_REASON_SUSPENDED = 10;      // Eligibility is suspended for 24 hours after three abrupt exits in seven days.
+  // Values 11-15 are newer than agent 0.1.3, which shows them as UNSPECIFIED; `detail` carries the explanation.
+  FREE_SEAT_REASON_WAITING_PEERS = 11;          // Not enough cards online to form a chain, or links still being measured.
+  FREE_SEAT_REASON_CHAIN_FULL = 12;             // The chains of the model have all the seats the demand needs.
+  FREE_SEAT_REASON_NETWORK_BELOW_STANDARD = 13; // The connection or the links between cards miss the network standard.
+  FREE_SEAT_REASON_VRAM_TOO_SMALL = 14;         // The card cannot hold any stage of the model.
+  FREE_SEAT_REASON_NAT_BLOCKED = 15;            // The router blocks incoming connections, so the card cannot join a chain.
 }
 
 // Reports what the card is serving and whether the member earns a slot. Sent on change.
@@ -317,6 +323,9 @@ message ContributionStatus {
   FreeSeatReason reason = 5;
   google.protobuf.Timestamp stable_until = 6; // Earliest time the preference can take effect.
   uint64 revision = 7;                        
+  // Short English explanation, shown as is. Fixed texts or rounded numbers only: the coordinator sends this
+  // message again whenever it changes, so it must not change on every pass.
+  string detail = 8;
 }
 
 enum ModelRole {
