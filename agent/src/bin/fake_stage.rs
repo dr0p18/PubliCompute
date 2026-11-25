@@ -146,7 +146,7 @@ fn request(r: pb::Request, ritardo: Duration, write: &Arc<Mutex<std::io::Stdout>
         manda(&mut *w, m)
     };
     if text.contains("rifiuta") {
-        send(pb::FromHead { body: Some(pb::from_head::Body::Done(pb::Done { id: r.id, reason: "error".into(), error: "prompt exceeds the slot context".into(), ..Default::default() })) });
+        send(pb::FromHead { body: Some(pb::from_head::Body::Done(pb::Done { id: r.id, reason: "error".into(), error: "context_length_exceeded".into(), ..Default::default() })) });
         return;
     }
     if matches!(text.as_str(), "stall-chat-output" | "flood-chat-output") {

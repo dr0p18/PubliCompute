@@ -251,6 +251,7 @@ fn condivide(cfg: &NodeConfig, engine: &Engine) -> bool {
 
 struct LeaseDone {
     id: String,
+    chat_id: Option<String>,
     result: Result<(u64, Duration)>,
 }
 
@@ -1142,8 +1143,19 @@ async fn on_lease_done(
             }
         }
         Err(e) => {
-            warn!(lease = %done.id, err = format!("{e:#}"), "releasing failed lease");
-            let outcome = match classify(&e) {
+            let class = classify(&e);
+            if let Some(chat_id) = &done.chat_id {
+                let code = match class {
+                    ErrorClass::Fault(cause) => cause.as_str(),
+                    ErrorClass::Request(code) => code.as_str_name(),
+                    _ if e.is::<OutputStalled>() => "output_stalled",
+                    _ => "work_stream_error",
+                };
+                info!(chat = %chat_id, lease = %done.id, code, "releasing failed chat lease");
+            } else {
+                warn!(lease = %done.id, err = format!("{e:#}"), "releasing failed lease");
+            }
+            let outcome = match class {
                 ErrorClass::Fault(c) => LeaseOutcome::Fault(c),
                 ErrorClass::Request(_) => LeaseOutcome::Clean,
                 ErrorClass::Other => LeaseOutcome::Abandoned,
@@ -1267,9 +1279,13 @@ async fn handle_offer(
 
     let (conn2, engine2, sup2, progress2, done2, id2, own2) =
         (conn.clone(), engine.clone(), cfg.sup.clone(), progress.clone(), done_tx.clone(), lease_id.clone(), own.clone());
+    let chat_id = match &offer.task {
+        Some(work_offer::Task::Chat(chat)) => Some(chat.chat_id.clone()),
+        _ => None,
+    };
     let task = tokio::spawn(async move {
         let result = run_lease(conn2, &id2, offer, engine2, sup2, confirm_rx, progress2, own2).await;
-        let _ = done2.send(LeaseDone { id: id2, result }).await;
+        let _ = done2.send(LeaseDone { id: id2, chat_id, result }).await;
     });
     let (guard_propria, comune) = if condivide(cfg, engine) { (None, guard) } else { (guard, None) };
     if comune.is_some() {
@@ -1435,9 +1451,12 @@ async fn run_chat(
     let (e2, lp2) = (engine.clone(), lp.clone());
     let request_id = req.request_id.clone();
     let top_k = logic_params.top_k;
-    let gen = tokio::spawn(async move { e2.chat_lease(&req, top_k, &lp2, Some(dtx), Some(cancel_rx)).await });
+    let chat_id = chat.chat_id;
+    let trace_id = chat_id.clone();
+    let gen = tokio::spawn(async move { e2.chat_lease(&req, &trace_id, top_k, &lp2, Some(dtx), Some(cancel_rx)).await });
     let (n, gen_time) = {
         let write_reply = async {
+            let mut first = true;
             while let Some(queued) = drx.recv().await {
                 let delta = queued.item;
                 send.write(&WorkStreamNodeMessage {
@@ -1445,6 +1464,10 @@ async fn run_chat(
                         request_id: request_id.clone(), index: delta.index, text: delta.text, token_ids: delta.token_ids,
                     })),
                 }).await?;
+                if first {
+                    first = false;
+                    info!(chat = %chat_id, lease = lease_id, request = %request_id, elapsed_ms = t0.elapsed().as_millis(), "first delta forwarded");
+                }
             }
             if !matches!(&**engine, Engine::Stages(_)) {
                 sup.progress.set_phase(Phase::Finishing);
@@ -1452,7 +1475,12 @@ async fn run_chat(
             lp.set_phase(Phase::Finishing);
             let generation = gen.await.context("chat task")?;
             let (result, count, elapsed) = chat_result(generation, &request_id, logic_params, sup, progress, t0)?;
+            let code = match &result.outcome {
+                Some(request_result::Outcome::Failure(failure)) => failure.code().as_str_name(),
+                _ => "ok",
+            };
             send.write(&WorkStreamNodeMessage { body: Some(work_stream_node_message::Body::RequestResult(result)) }).await?;
+            info!(chat = %chat_id, lease = lease_id, request = %request_id, code, tokens = count, elapsed_ms = t0.elapsed().as_millis(), "chat result forwarded");
             Ok::<_, anyhow::Error>((count, elapsed))
         };
         let read_commands = async {
@@ -1460,7 +1488,7 @@ async fn run_chat(
                 let message = read_chat_command(r).await?;
                 if let Some(work_stream_coordinator_message::Body::CancelRequest(cancel)) = message.body {
                     if cancel.request_id == request_id {
-                        info!(lease = lease_id, request = %cancel.request_id, "coordinator cancelled the chat");
+                        info!(chat = %chat_id, lease = lease_id, request = %cancel.request_id, "coordinator cancelled the chat");
                         if let Some(sender) = cancel_tx.take() {
                             let _ = sender.send(());
                         }
@@ -1479,7 +1507,7 @@ async fn run_chat(
         let m = read_chat_command(r).await?;
         if let Some(work_stream_coordinator_message::Body::ResultAck(a)) = m.body {
             if !a.accepted {
-                warn!(request = %a.request_id, reason = %a.reason, "result rejected");
+                info!(chat = %chat_id, lease = lease_id, request = %a.request_id, "chat result rejected");
             }
             break;
         }
@@ -1522,16 +1550,15 @@ fn chat_result(
                 return Err(e.context(format!("request {request_id}")));
             }
             ErrorClass::Request(code) => {
-                warn!(request = %request_id, ?code, "chat failed: {e:#}");
                 sup.stats.request_failed(&format!("{code:?}"));
-                (RequestResult { request_id: request_id.to_string(), outcome: Some(request_result::Outcome::Failure(RequestFailure { code: code as i32, detail: format!("{e:#}") })) }, 0, Duration::ZERO)
+                (RequestResult { request_id: request_id.to_string(), outcome: Some(request_result::Outcome::Failure(RequestFailure { code: code as i32, detail: String::new() })) }, 0, Duration::ZERO)
             }
             ErrorClass::Other => {
                 progress.lock().unwrap().unclassified_failure = true;
                 (
                     RequestResult {
                         request_id: request_id.to_string(),
-                        outcome: Some(request_result::Outcome::Failure(RequestFailure { code: RequestFailureCode::EngineError as i32, detail: format!("{e:#}") })),
+                        outcome: Some(request_result::Outcome::Failure(RequestFailure { code: RequestFailureCode::EngineError as i32, detail: String::new() })),
                     },
                     0,
                     Duration::ZERO,
@@ -1731,7 +1758,7 @@ mod tests {
         let out = Out(tx);
         let mut last = Availability::Idle;
         let shared = Shared::default();
-        on_lease_done(&cfg, &shared, &out, &mut last, &mut lease, LeaseDone { id: "L1".into(), result: Err(err) }, false).await.unwrap();
+        on_lease_done(&cfg, &shared, &out, &mut last, &mut lease, LeaseDone { id: "L1".into(), chat_id: None, result: Err(err) }, false).await.unwrap();
         let msgs = drain(&mut rx);
         match msgs.as_slice() {
             [node_message::Body::Availability(a), node_message::Body::LeaseRelease(r)] => {
@@ -1762,7 +1789,7 @@ mod tests {
             &Out(tx),
             &mut last,
             &mut lease,
-            LeaseDone { id: "L1".into(), result: Err(anyhow::anyhow!("work stream closed")) },
+            LeaseDone { id: "L1".into(), chat_id: None, result: Err(anyhow::anyhow!("work stream closed")) },
             false,
         )
         .await
@@ -1911,6 +1938,7 @@ mod tests {
             logic: Some(LogicParams { format_version: logic::LOGIC_FORMAT, top_k: 5 }),
             payout: None,
             task: Some(work_offer::Task::Chat(ChatTask {
+                chat_id: "test-chat".into(),
                 request: Some(InferenceRequest {
                     request_id: request_id.into(),
                     messages: vec![ChatMessage { role: publicompute_proto::node::ChatRole::User as i32, content: text.into() }],
@@ -2455,9 +2483,9 @@ mod tests {
         let rb = req("rb", "blocca questa");
         let (e1, e2) = (engine.clone(), engine.clone());
         let (pa2, pb2) = (pa.clone(), pb.clone());
-        let a = tokio::spawn(async move { let Engine::Stages(e) = &*e1 else { unreachable!() }; e.chat_lease(&ra, &pa2, None, None).await });
+        let a = tokio::spawn(async move { let Engine::Stages(e) = &*e1 else { unreachable!() }; e.chat_lease(&ra, "", &pa2, None, None).await });
         let (ctx, crx) = oneshot::channel();
-        let b = tokio::spawn(async move { let Engine::Stages(e) = &*e2 else { unreachable!() }; e.chat_lease(&rb, &pb2, None, Some(crx)).await });
+        let b = tokio::spawn(async move { let Engine::Stages(e) = &*e2 else { unreachable!() }; e.chat_lease(&rb, "", &pb2, None, Some(crx)).await });
         let _ = e;
         let hb = |l: &Leases| {
             let h = heartbeat_msg(l, &cfg, &Shared::default());

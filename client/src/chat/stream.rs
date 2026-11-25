@@ -1,5 +1,5 @@
 use std::{
-    io::{self, BufRead, BufReader, Read},
+    io::{self, BufRead, BufReader, IsTerminal, Read},
     time::Instant,
 };
 
@@ -8,6 +8,8 @@ use serde_json::Value;
 use super::session::Session;
 
 const MAX_EVENT: usize = 1024 * 1024;
+pub(super) const UNFINISHED_REASONING: &str = "the stream ended during reasoning";
+pub(super) const REASONING_TOKEN_LIMIT: &str = "the token limit was reached during reasoning";
 
 struct Sse<R> {
     reader: R,
@@ -89,15 +91,46 @@ pub(super) struct Completion {
     pub(super) tokens_per_second: Option<f64>,
 }
 
+pub(super) enum Progress {
+    Delta(Instant),
+    Error(&'static str),
+}
+
+struct Thinking {
+    terminal: bool,
+    shown: bool,
+}
+
+impl Thinking {
+    fn update(&mut self, hidden: bool) {
+        if self.terminal && hidden != self.shown {
+            if hidden {
+                eprint!("\rThinking…\x1b[K");
+            } else {
+                eprint!("\r\x1b[K");
+            }
+            self.shown = hidden;
+        }
+    }
+}
+
+impl Drop for Thinking {
+    fn drop(&mut self) {
+        self.update(false);
+    }
+}
+
 pub(super) fn consume(
     input: impl Read,
     model: &str,
     session: &Session,
     mut emit: impl FnMut(&str) -> io::Result<()>,
+    mut progress: impl FnMut(Progress),
 ) -> Result<Completion, String> {
     let mut reader = Sse::new(BufReader::new(input));
     let mut reasoning = Reasoning::new(model);
-    let (mut final_chunk, mut free_seat, mut tokens) = (false, None, None);
+    let mut thinking = Thinking { terminal: io::stderr().is_terminal(), shown: false };
+    let (mut finish_reason, mut free_seat, mut tokens) = (None, None, None);
     let (mut first, mut last): (Option<Instant>, Option<Instant>) = (None, None);
     let mut token_prefix = String::new();
     let mut emit_visible = |text: &str, done: bool| {
@@ -119,14 +152,22 @@ pub(super) fn consume(
     let result = loop {
         let (event, data) = match reader.next() {
             Ok(Some(event)) => event,
-            Ok(None) => break Err("incomplete chat stream: missing final chunk or [DONE]".into()),
+            Ok(None) => {
+                if (first.is_some() || finish_reason.is_some()) && reasoning.hidden() {
+                    break Err(reasoning_error(finish_reason));
+                }
+                break Err("incomplete chat stream: missing final chunk or [DONE]".into());
+            }
             Err(e) => break Err(format!("incomplete chat stream: {e}")),
         };
         if event == "publicompute.route" {
             continue;
         }
         if data == "[DONE]" && event != "error" {
-            if !final_chunk {
+            if reasoning.hidden() && (first.is_some() || finish_reason.is_some()) {
+                break Err(reasoning_error(finish_reason));
+            }
+            if finish_reason.is_none() {
                 break Err("incomplete chat stream: missing final chunk".into());
             }
             let tokens_per_second = match (first, last, tokens) {
@@ -142,16 +183,18 @@ pub(super) fn consume(
         }
         let parsed = serde_json::from_str::<Value>(&data);
         if event == "error" || parsed.as_ref().is_ok_and(|v| !v["error"].is_null()) {
-            // The coordinator writes its messages in Italian for the web chat:
-            // the terminal shows its own English text for each error type.
-            let kind = parsed.as_ref().ok().and_then(|v| v["error"]["type"].as_str());
-            break Err(match kind {
-                Some("no_capacity") => "chat stream error: no free seat on this model, try again in a moment".into(),
-                Some("timeout") => "chat stream error: the answer took longer than the time limit".into(),
-                Some("context_length_exceeded") => "chat stream error: the conversation is too long for this model".into(),
-                Some("slow_client") => "chat stream error: the connection was too slow, the answer stopped".into(),
-                _ => "chat stream error: the answer was not completed".into(),
-            });
+            thinking.update(false);
+            let kind = parsed.as_ref().ok().and_then(|v| v["error"]["code"].as_str().or(v["error"]["type"].as_str()));
+            let (code, message) = match kind {
+                Some("no_capacity") => ("no_capacity", "no free seat on this model, try again in a moment"),
+                Some("timeout") => ("timeout", "the answer took longer than the time limit"),
+                Some("context_length_exceeded") => ("context_length_exceeded", "the conversation is too long for this model"),
+                Some("invalid_request") => ("invalid_request", "the chain could not prepare the conversation"),
+                Some("slow_client") => ("slow_client", "the connection was too slow, the answer stopped"),
+                _ => ("server_error", "the answer was not completed"),
+            };
+            progress(Progress::Error(code));
+            break Err(format!("chat stream error: {message}"));
         }
         let Ok(chunk) = parsed else {
             break Err("invalid JSON in chat stream".into());
@@ -159,18 +202,33 @@ pub(super) fn consume(
         let choice = &chunk["choices"][0];
         if let Some(text) = choice["delta"]["content"].as_str().filter(|s| !s.is_empty()) {
             let now = Instant::now();
+            progress(Progress::Delta(now));
             first.get_or_insert(now);
             last = Some(now);
-            emit_visible(&reasoning.push(text)?, false)?;
+            let visible = reasoning.push(text)?;
+            if !visible.is_empty() {
+                thinking.update(false);
+            }
+            emit_visible(&visible, false)?;
+            thinking.update(reasoning.hidden());
         }
-        if choice["finish_reason"].as_str().is_some_and(|s| !s.is_empty()) {
-            final_chunk = true;
+        if let Some(reason) = choice["finish_reason"].as_str().filter(|s| !s.is_empty()) {
+            finish_reason = Some(reason == "length");
             free_seat = chunk["publicompute"]["free_seat"].as_bool();
         }
         tokens = chunk["usage"]["completion_tokens"].as_u64().or(tokens);
     };
+    thinking.update(false);
     emit_visible(&reasoning.finish(), true)?;
     result
+}
+
+fn reasoning_error(hit_limit: Option<bool>) -> String {
+    if hit_limit == Some(true) {
+        REASONING_TOKEN_LIMIT.into()
+    } else {
+        UNFINISHED_REASONING.into()
+    }
 }
 
 fn output_error(e: io::Error) -> String {
@@ -208,6 +266,10 @@ impl Reasoning {
             trim_start: false,
             pending: String::new(),
         }
+    }
+
+    fn hidden(&self) -> bool {
+        matches!(self.phase, Phase::Hidden)
     }
 
     fn push(&mut self, text: &str) -> Result<String, String> {
@@ -282,6 +344,21 @@ mod tests {
     const DONE: &str = "data: [DONE]\n\n";
 
     #[test]
+    fn reports_stream_ending_during_reasoning_without_printing_it() {
+        for (final_chunk, end, expected) in [
+            (FINAL.replace("stop", "length"), DONE, REASONING_TOKEN_LIMIT),
+            (FINAL.into(), DONE, UNFINISHED_REASONING),
+            (String::new(), "", UNFINISHED_REASONING),
+        ] {
+            let input = format!("{TEXT}{final_chunk}{end}");
+            let result = consume(input.as_bytes(), "qwen3", &session(), |_| panic!("reasoning leaked"), |_| {});
+            assert!(matches!(result, Err(message) if message == expected));
+        }
+        let input = format!("{}{TEXT}{}{DONE}", TEXT.replace("caffè", "</think>"), FINAL.replace("stop", "length"));
+        assert!(consume(input.as_bytes(), "qwen3", &session(), |_| Ok(()), |_| {}).is_ok());
+    }
+
+    #[test]
     fn reads_split_sse_lines_utf8_comments_and_named_route() {
         let input = format!("\u{feff}: ok\r\n\r\n: keepalive\r\revent: publicompute.route\r\ndata: route\r\ndata: details\r\n\r\n{TEXT}{FINAL}{DONE}");
         let mut reader = Sse::new(BufReader::new(Split(input.as_bytes())));
@@ -293,7 +370,7 @@ mod tests {
         let done = consume(Split(input.as_bytes()), "gemma", &session(), |text| {
             answer.push_str(text);
             Ok(())
-        })
+        }, |_| {})
         .unwrap();
         assert_eq!(answer, "caffè");
         assert_eq!(done.free_seat, Some(false));
@@ -307,7 +384,7 @@ mod tests {
             let result = consume(input.as_bytes(), "gemma", &session(), |text| {
                 answer.push_str(text);
                 Ok(())
-            });
+            }, |_| {});
             assert!(matches!(result, Err(message) if message == "chat stream error: no free seat on this model, try again in a moment"));
             assert_eq!(answer, "caffè");
         }
@@ -322,7 +399,7 @@ mod tests {
             format!("{FINAL}data: [DONE]\n"),
         ] {
             let input = format!("{TEXT}{suffix}");
-            assert!(matches!(consume(input.as_bytes(), "gemma", &session(), |_| Ok(())),
+            assert!(matches!(consume(input.as_bytes(), "gemma", &session(), |_| Ok(()), |_| {}),
                 Err(error) if error.starts_with("incomplete chat stream")));
         }
     }
@@ -340,7 +417,7 @@ mod tests {
         consume(events.as_bytes(), "gemma", &session(), |text| {
             answer.push_str(text);
             Ok(())
-        })
+        }, |_| {})
         .unwrap();
         assert_eq!(answer, "before [redacted] after");
     }

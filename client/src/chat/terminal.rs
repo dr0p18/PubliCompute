@@ -254,23 +254,18 @@ pub(super) fn escape_controls(text: &str, multiline: bool) -> Cow<'_, str> {
 
 pub(super) struct AnswerOutput<'a> {
     stdout: io::StdoutLock<'static>,
-    cancel: Option<&'a AtomicBool>,
-    original_flags: Option<OFlags>,
+    cancel: &'a AtomicBool,
+    original_flags: OFlags,
     pub(super) terminal: bool,
 }
 
 impl<'a> AnswerOutput<'a> {
-    pub(super) fn open(cancel: Option<&'a AtomicBool>) -> io::Result<Self> {
+    pub(super) fn open(cancel: &'a AtomicBool) -> io::Result<Self> {
         let stdout = io::stdout().lock();
         let terminal = stdout.is_terminal();
-        let original_flags = if cancel.is_some() {
-            let flags = fcntl_getfl(&stdout)?;
-            // A full redirected pipe must not block the worker after an interrupt.
-            fcntl_setfl(&stdout, flags | OFlags::NONBLOCK)?;
-            Some(flags)
-        } else {
-            None
-        };
+        // A full pipe must still let the worker stop on Ctrl-C or at the deadline.
+        let original_flags = fcntl_getfl(&stdout)?;
+        fcntl_setfl(&stdout, original_flags | OFlags::NONBLOCK)?;
         Ok(Self {
             stdout,
             cancel,
@@ -286,12 +281,8 @@ impl<'a> AnswerOutput<'a> {
             Cow::Borrowed(text)
         };
         let mut bytes = text.as_bytes();
-        let Some(cancel) = self.cancel else {
-            self.stdout.write_all(bytes)?;
-            return self.stdout.flush();
-        };
         while !bytes.is_empty() {
-            if cancel.load(Ordering::Relaxed) {
+            if self.cancel.load(Ordering::Relaxed) {
                 return Err(io::ErrorKind::Interrupted.into());
             }
             match rustix::io::write(&self.stdout, bytes) {
@@ -314,9 +305,7 @@ impl<'a> AnswerOutput<'a> {
 
 impl Drop for AnswerOutput<'_> {
     fn drop(&mut self) {
-        if let Some(flags) = self.original_flags {
-            while fcntl_setfl(&self.stdout, flags) == Err(Errno::INTR) {}
-        }
+        while fcntl_setfl(&self.stdout, self.original_flags) == Err(Errno::INTR) {}
     }
 }
 

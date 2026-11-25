@@ -26,7 +26,7 @@ use sock::Socket;
 use status::Status;
 
 const CHAT_URL: &str = "https://publicompute.com/chat";
-const USAGE: &str = "usage: publicompute [--data-dir DIR | --socket FILE] [--version | version | status [--json] | use <model> [--quant Q] | free | pause | start | uninstall [--keep-models | --remove-models] | login | logout | chat [--model ID] [--api URL] [\"question\"]]";
+const USAGE: &str = "usage: publicompute [--data-dir DIR | --socket FILE] [--version | version | status [--json] | use <model> [--quant Q] | free | pause | start | uninstall [--keep-models | --remove-models] | login | logout | chat [-v] [--model ID] [--api URL] [\"question\"]]";
 const UNINSTALLER: &str = "/opt/publicompute-agent/uninstall.sh";
 
 fn main() {

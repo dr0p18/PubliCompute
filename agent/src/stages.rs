@@ -997,7 +997,7 @@ impl Stages {
                 return status_message(a, State::Failed, &format!("could not start publicompute-stage: {e:#}"), 0, 0.0);
             }
         };
-        info!(chain = %a.chain_id, role = role.comando(), log = %log_path.display(), "stage started");
+        info!(chain = %a.chain_id, role = role.comando(), epoch = a.assign_epoch, ctx_per_slot = a.ctx_per_slot, log = %log_path.display(), "stage started");
         let scadenza = tokio::time::sleep(self.cfg.load_timeout);
         tokio::pin!(scadenza);
         let esito: Outcome = {
