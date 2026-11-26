@@ -169,7 +169,11 @@ fn parse(v: &[String]) -> Result<Args, String> {
             i += 1;
         }
     }
-    Ok(Args { m, pos })
+    let args = Args { m, pos };
+    if args.num("slots", 1_u32)? == 0 {
+        return Err("--slots must be positive".into());
+    }
+    Ok(args)
 }
 
 #[cfg_attr(not(feature = "llama"), allow(dead_code))]

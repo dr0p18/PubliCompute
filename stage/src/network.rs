@@ -19,7 +19,8 @@ const INGRESS_EVENT_OVERHEAD: usize = 256;
 const STEP_ROW_OVERHEAD: usize = 64;
 pub const CONTROL_INGRESS_BYTES: usize = 3 * MAX_FRAME_SIZE + INGRESS_EVENT_OVERHEAD;
 
-pub const WIRE_VERSION: (u32, u32) = (0, 1);
+// Peers must agree on which slot IDs exist in each group.
+pub const WIRE_VERSION: (u32, u32) = (1, 0);
 
 // Time limits cover connection setup, stalled writes, and optional idle
 // reads. A silent stream may be healthy while no work is active, so idle
@@ -1596,6 +1597,28 @@ mod test {
         sc.terminate();
         t.join().unwrap();
     }
+
+    #[test]
+    fn rejects_hello_from_peer_with_padded_slot_groups() {
+        let listener = listen("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let hello = msg(Body::Hello(pb::Hello {
+            protocol_major: 0,
+            protocol_minor: 1,
+            stream: pb::Stream::Prefill as i32,
+            epoch: 1,
+            mtp: false,
+        }));
+        write_sync(&mut peer, &hello).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let error = read_hello(socket).err().expect("accepted an incompatible peer");
+        assert!(error.contains("unsupported protocol version"), "{error}");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let reply = Reader::new(peer).leggi_limitato(HELLO_FRAME_MAX, deadline).unwrap().unwrap();
+        assert!(matches!(reply.body, Some(Body::Ack(ack)) if !ack.ok && ack.error.contains("unsupported version")));
+    }
+
     /// A client waiting to send its hello must leave the listener free for another client.
     #[test]
     fn silent_client_does_not_block_accept() {

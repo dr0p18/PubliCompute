@@ -2173,9 +2173,8 @@ fn run_service(mut engine: Engine, o: &HeadOptions, network: Option<&HeadLinks>,
     if slots as usize > engine.n_batch {
         return Err("slots exceed n_batch; a group step must fit in one batch".into());
     }
-    let g = o.groups.max(1);
-    let per_ctx = (slots as usize).div_ceil(g).max(1);
-    let amm = Admission::con_classi(Vec::new(), Vec::new(), g, per_ctx, slots as usize, o.riserva_interattive);
+    let g = engine.per_ctx.len();
+    let amm = Admission::con_gruppi(Vec::new(), Vec::new(), &engine.per_ctx, slots as usize, o.riserva_interattive);
     let valle = connect_downstream(network, Duration::from_secs(o.attesa_s), o.draft_source == DraftSource::Mtp)?;
     let service = if o.service_pipe { Service::pipes()? } else { Service::listen(o.service.as_deref().unwrap_or_default())? };
     if let Some(addr) = service.address() {
@@ -2208,6 +2207,8 @@ pub fn run(mut engine: Engine, mut options: HeadOptions, network: Option<&HeadLi
             target
         };
     }
+    // With fewer slots than groups the engine creates fewer contexts: schedule only those.
+    options.groups = engine.per_ctx.len();
     let o = &options;
     if !engine.head {
         return Err("head must start at layer 0".into());
@@ -2274,7 +2275,6 @@ pub fn run(mut engine: Engine, mut options: HeadOptions, network: Option<&HeadLi
         return Err("conversations exceed n_batch; a group step must fit in one batch".into());
     }
     let g_eff = o.groups.max(1).min(prompt.len());
-    let per_ctx = (slots as usize).div_ceil(o.groups.max(1)).max(1);
     let classi = match &o.classi {
         Some(t) => parse_classes(t, prompt.len())?,
         None => vec![Class::Interactive; prompt.len()],
@@ -2282,7 +2282,7 @@ pub fn run(mut engine: Engine, mut options: HeadOptions, network: Option<&HeadLi
     if o.classi.is_some() && o.forma_verificatore {
         return Err("--classes cannot be used with --verifier-mode".into());
     }
-    let amm = Admission::con_classi(soglie, classi.clone(), g_eff, per_ctx, slots as usize, o.riserva_interattive);
+    let amm = Admission::con_gruppi(soglie, classi.clone(), &engine.per_ctx[..g_eff], slots as usize, o.riserva_interattive);
     let mut convs = Vec::new();
     for (i, (id, text)) in prompt.iter().enumerate() {
         let (tok, testo_tmpl, usato) = engine.prepara_prompt(text)?;

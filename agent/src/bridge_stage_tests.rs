@@ -322,7 +322,7 @@ async fn real_bridge_matches_direct_chain_with_small_overhead() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires both stage executables and fixture GGUF"]
+#[ignore = "requires two wire-compatible stage executables and fixture weights"]
 async fn mixed_stage_versions_replay_a_failed_conversation_in_both_directions() {
     let (current, model) = ambiente().expect("set PUBLICOMPUTE_STAGE_BIN and PUBLICOMPUTE_STAGE_MODEL");
     let legacy = PathBuf::from(std::env::var_os("PUBLICOMPUTE_STAGE_LEGACY_BIN").expect("set PUBLICOMPUTE_STAGE_LEGACY_BIN"));
@@ -342,7 +342,7 @@ async fn mixed_stage_versions_replay_a_failed_conversation_in_both_directions() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires both stage executables and fixture GGUF"]
+#[ignore = "requires two wire-compatible stage executables and fixture weights"]
 async fn mixed_stage_versions_reconnect_a_three_stage_chain_and_replay_tokens() {
     let (current, model) = ambiente().expect("set PUBLICOMPUTE_STAGE_BIN and PUBLICOMPUTE_STAGE_MODEL");
     let legacy = PathBuf::from(std::env::var_os("PUBLICOMPUTE_STAGE_LEGACY_BIN").expect("set PUBLICOMPUTE_STAGE_LEGACY_BIN"));

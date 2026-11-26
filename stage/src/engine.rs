@@ -103,8 +103,8 @@ pub struct Engine {
     pub head: bool,
     pub tail: bool,
     pub n_batch: usize,
-    /// Slots (sequences) per context.
-    pub per_ctx: u32,
+    /// Slots (sequences) of each context, from `admission::slots_per_group`.
+    pub per_ctx: Vec<u32>,
     /// One draft context per group when the tail loads the draft block.
     ctxs_mtp: Vec<*mut sys::llama_context>,
     /// MTP context of the last MTP batch (for `mtp_logits`).
@@ -209,7 +209,7 @@ impl Engine {
                 head: o.layer_start == 0,
                 tail: layer_end == n_layer,
                 n_batch: o.n_batch as usize,
-                per_ctx: 1,
+                per_ctx: Vec::new(),
                 ctxs_mtp: Vec::new(),
                 ultimo_mtp: 0,
                 mtp_state_width: 0,
@@ -225,9 +225,9 @@ impl Engine {
                 }
                 m.mtp_state_width = sys::llama_model_n_embd_out(model) as usize;
             }
-            let groups = o.groups.max(1);
-            let per_ctx = o.slots.div_ceil(groups).max(1);
-            for _ in 0..groups {
+            // Allocate context memory for exactly the configured slots, not groups x ceil(slots / groups).
+            let per_gruppo = crate::admission::slots_per_group(o.slots, o.groups);
+            for &per_ctx in &per_gruppo {
                 let mut cp = sys::llama_context_default_params();
                 cp.n_ctx = o.ctx_per_slot * per_ctx;
                 cp.n_batch = o.n_batch;
@@ -272,7 +272,7 @@ impl Engine {
                     m.ctxs_mtp.push(c);
                 }
             }
-            m.per_ctx = per_ctx;
+            m.per_ctx = per_gruppo;
             Ok(m)
         }
     }
@@ -442,7 +442,7 @@ impl Engine {
 
     /// Is this slot valid for the current configuration?
     pub fn posto_valido(&self, slot: u32) -> bool {
-        ((slot >> 16) as usize) < self.ctxs.len() && (slot & 0xffff) < self.per_ctx
+        self.per_ctx.get((slot >> 16) as usize).is_some_and(|&k| (slot & 0xffff) < k)
     }
 
     /// Run one batch. `state` is the input (rows × state width) for stages downstream of the head.

@@ -992,7 +992,13 @@ mod test {
         let k = catena();
         let (addr_b, rx_b) = listen(&k.b);
         let mut s = TcpStream::connect(&addr_b).unwrap();
-        let _ = write_sync(&mut s, &msg(Body::Hello(publicompute_proto::stage::Hello { protocol_major: 0, protocol_minor: 1, stream: Stream::Control as i32, epoch: 1, mtp: false })));
+        let _ = write_sync(&mut s, &msg(Body::Hello(publicompute_proto::stage::Hello {
+            protocol_major: network::WIRE_VERSION.0,
+            protocol_minor: network::WIRE_VERSION.1,
+            stream: Stream::Control as i32,
+            epoch: 1,
+            mtp: false,
+        })));
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut b = [0u8; 64];
         // Server closes or sends a TLS alert. A plaintext HelloAck would be invalid.
