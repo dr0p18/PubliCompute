@@ -1,6 +1,6 @@
 [package]
 name = "publicompute-agent"
-version = "0.1.5"
+version = "0.1.6"
 description = "Registers a node and runs inference assignments"
 edition.workspace = true
 license.workspace = true
@@ -53,6 +53,7 @@ libc = "0.2"
 rustix = { version = "1.1", features = ["fs", "process"] }
 
 [dev-dependencies]
+tokio = { version = "1.53.3", features = ["test-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 # Sign fixture capabilities with the same Ed25519 scheme used by stage authentication.
 ring = "0.17.14"

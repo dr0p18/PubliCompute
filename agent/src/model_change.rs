@@ -25,6 +25,8 @@ use crate::{
 };
 
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(600);
+// Large weights can take hours to download, so time only the wait for progress.
+const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const RETRY_SECONDS: [u64; 4] = [10, 30, 60, 300];
 
 #[derive(Debug)]
@@ -391,7 +393,11 @@ async fn fetch_weights(
         let mut response = tokio::select! {
             biased;
             _ = &mut replaced => bail!("model request replaced"),
-            response = request.send() => response.map_err(|err| request_error(err, "request model weights"))?,
+            response = tokio::time::timeout(DOWNLOAD_STALL_TIMEOUT, request.send()) => {
+                response.context("wait for model response headers")
+                    .context(RetryDownload)?
+                    .map_err(|err| request_error(err, "request model weights"))?
+            }
         };
         let start = response_start(response.status(), response.headers(), offset, model.bytes)?;
         if start == 0 && offset > 0 {
@@ -402,13 +408,22 @@ async fn fetch_weights(
             report(live, ticket, Phase::Downloading, offset);
         }
         part.seek(SeekFrom::Start(start)).await?;
+        let stalled = tokio::time::sleep(DOWNLOAD_STALL_TIMEOUT);
+        tokio::pin!(stalled);
         loop {
             let chunk = tokio::select! {
                 biased;
                 _ = &mut replaced => bail!("model request replaced"),
+                _ = &mut stalled => {
+                    return Err(anyhow::anyhow!("no model weight bytes received for {} s", DOWNLOAD_STALL_TIMEOUT.as_secs())
+                        .context(RetryDownload));
+                }
                 chunk = response.chunk() => chunk.map_err(|err| request_error(err, "read model weights"))?,
             };
             let Some(chunk) = chunk else { break };
+            if chunk.is_empty() {
+                continue;
+            }
             let next = offset.saturating_add(chunk.len() as u64);
             ensure!(next <= model.bytes, "model response exceeds the expected size");
             part.write_all(&chunk).await.context("write model partial")?;
@@ -416,6 +431,7 @@ async fn fetch_weights(
             part.flush().await?;
             offset = next;
             report(live, ticket, Phase::Downloading, offset);
+            stalled.as_mut().reset(Instant::now() + DOWNLOAD_STALL_TIMEOUT);
         }
     }
     if offset != model.bytes {
@@ -492,7 +508,7 @@ mod tests {
     use crate::models::tests::{fixture_model, fixture_store};
     use std::fs;
     use tokio::{
-        io::{AsyncBufReadExt, BufReader},
+        io::{AsyncBufReadExt, AsyncReadExt, BufReader},
         net::TcpListener,
         task::JoinHandle,
         time::timeout,
@@ -502,7 +518,7 @@ mod tests {
 
     async fn https_fixture(
         replies: &[&'static str],
-        stall: bool,
+        stall_first: bool,
     ) -> (reqwest::Client, String, watch::Receiver<String>, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -526,7 +542,7 @@ mod tests {
         let replies = replies.to_vec();
         let task = tokio::spawn(async move {
             let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
-            for reply in replies {
+            for (index, reply) in replies.into_iter().enumerate() {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut stream = BufReader::new(acceptor.accept(stream).await.unwrap());
                 let mut request = String::new();
@@ -539,8 +555,11 @@ mod tests {
                 headers.send_replace(request);
                 stream.get_mut().write_all(reply.as_bytes()).await.unwrap();
                 stream.get_mut().flush().await.unwrap();
-                if stall {
-                    std::future::pending::<()>().await;
+                if stall_first && index == 0 {
+                    // Keep the response open until the client gives up on it.
+                    let read = stream.read(&mut [0]).await;
+                    assert!(matches!(read, Ok(0) | Err(_)), "expected the client to close: {read:?}");
+                    continue;
                 }
                 stream.get_mut().shutdown().await.unwrap();
             }
@@ -614,6 +633,48 @@ mod tests {
         assert!(received.borrow().to_ascii_lowercase().contains("range: bytes=3-\r\n"));
         assert!(live.changes.switching().is_some());
         assert!(live.changes.view().unwrap().error.is_none());
+        assert_eq!(fs::read(store.path(model)).unwrap(), WEIGHTS);
+        assert!(!store.partial(model).exists());
+    }
+
+    #[tokio::test]
+    async fn stalled_download_retries_from_the_saved_offset() {
+        let (client, url, received, server) = https_fixture(&[
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nabc",
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-7/8\r\nContent-Length: 5\r\nConnection: close\r\n\r\ndefgh",
+        ], true).await;
+        let mut model = fixture_model("stall", WEIGHTS);
+        model.url = url;
+        let model = Box::leak(Box::new(model));
+        let store = fixture_store("https-stall");
+        let live = Live::new();
+        let mut state = live.changes.subscribe();
+        let (ticket, _, _) = live.changes.begin(&live, &store, model).unwrap();
+        let worker = tokio::spawn(prepare(live.clone(), store.clone(), ticket, model, move || Ok(client.clone())));
+        timeout(Duration::from_secs(5), async {
+            while live.changes.view().unwrap().bytes < 3 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+
+        // Advance the clock only while the client is waiting for data or its next attempt.
+        tokio::time::pause();
+        timeout(DOWNLOAD_STALL_TIMEOUT + Duration::from_secs(1), state.wait_for(|state| {
+            state.as_ref().is_some_and(|change| change.error.is_some())
+        })).await.unwrap().unwrap();
+        let status = live.changes.view().unwrap();
+        assert_eq!(status.state, "downloading");
+        let error = status.error.unwrap();
+        assert!(error.contains("retrying in 10 s"));
+        assert!(error.contains("no model weight bytes received for 60 s"));
+        assert_eq!(fs::read(store.partial(model)).unwrap(), b"abc");
+
+        tokio::time::advance(Duration::from_secs(RETRY_SECONDS[0])).await;
+        tokio::time::resume();
+        timeout(Duration::from_secs(5), worker).await.unwrap().unwrap();
+        server.await.unwrap();
+        assert!(received.borrow().to_ascii_lowercase().contains("range: bytes=3-\r\n"));
+        assert!(live.changes.switching().is_some());
         assert_eq!(fs::read(store.path(model)).unwrap(), WEIGHTS);
         assert!(!store.partial(model).exists());
     }

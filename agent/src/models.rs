@@ -446,8 +446,7 @@ pub fn download_client_builder(roots: rustls::RootCertStore) -> Result<reqwest::
         .no_brotli()
         .no_deflate()
         .no_zstd()
-        .connect_timeout(Duration::from_secs(15))
-        .read_timeout(Duration::from_secs(60)))
+        .connect_timeout(Duration::from_secs(15)))
 }
 
 pub fn allowed_url(url: &reqwest::Url) -> bool {

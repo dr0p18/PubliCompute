@@ -123,10 +123,20 @@ fn porta_di(addr: &str, cosa: &str) -> Result<u16> {
 }
 
 /// Validate assignment parameters before reading files or starting a child.
-fn validate(a: &StageAssign) -> Result<Role> {
+fn validate(cfg: &StagesConfig, a: &StageAssign) -> Result<Role> {
     let r = ruolo_di(a)?;
     if a.slots == 0 || a.ctx_per_slot == 0 || a.groups == 0 || a.n_batch == 0 {
         bail!("slots, ctx_per_slot, groups and n_batch must be greater than zero");
+    }
+    if a.slots > a.n_batch {
+        bail!("slots exceed n_batch");
+    }
+    // The assigned slots and batch size must fit in a group step.
+    for arg in &cfg.extra_args {
+        let option = arg.split_once('=').map_or(arg.as_str(), |(name, _)| name);
+        if matches!(option, "--slots" | "--ctx-per-slot" | "--groups" | "--n-batch") {
+            bail!("{option} cannot be passed through --stage-arg because the coordinator sets it");
+        }
     }
     if a.layer_end >= 0 && (a.layer_end as u32) <= a.layer_start {
         bail!("empty layer range: [{}, {})", a.layer_start, a.layer_end);
@@ -160,7 +170,7 @@ fn validate(a: &StageAssign) -> Result<Role> {
 
 /// Build stage command arguments for the local child.
 pub fn arguments(cfg: &StagesConfig, a: &StageAssign) -> Result<Vec<String>> {
-    let role = validate(a)?;
+    let role = validate(cfg, a)?;
     let format = if a.state_format.is_empty() { "fp32" } else { a.state_format.as_str() };
     let timeout = cfg.load_timeout.as_secs().max(1);
     let mut v: Vec<String> = vec![role.comando().into()];
@@ -932,7 +942,7 @@ impl Stages {
     }
 
     fn controlla(&self, a: &StageAssign) -> Result<Role> {
-        let role = validate(a)?;
+        let role = validate(&self.cfg, a)?;
         if a.capability.is_empty() && !self.cfg.in_chiaro {
             bail!("Rejecting StageAssign without a signed capability; stage links must use TLS");
         }
@@ -997,7 +1007,7 @@ impl Stages {
                 return status_message(a, State::Failed, &format!("could not start publicompute-stage: {e:#}"), 0, 0.0);
             }
         };
-        info!(chain = %a.chain_id, role = role.comando(), epoch = a.assign_epoch, ctx_per_slot = a.ctx_per_slot, log = %log_path.display(), "stage started");
+        info!(chain = %a.chain_id, role = role.comando(), epoch = a.assign_epoch, ctx_per_slot = a.ctx_per_slot, slots = a.slots, log = %log_path.display(), "stage started");
         let scadenza = tokio::time::sleep(self.cfg.load_timeout);
         tokio::pin!(scadenza);
         let esito: Outcome = {
@@ -1394,6 +1404,31 @@ pub(crate) mod tests {
         let mut a = assignment("c", 1, 2, 3, 0);
         a.listen_addr = "127.0.0.1:0".into();
         assert!(arguments(&cfg, &a).is_err(), "port 0");
+    }
+
+    #[test]
+    fn arguments_reject_local_slot_layout_overrides() {
+        let d = tempdir("slot-layout-overrides");
+        let mut cfg = cfg_test(&d);
+        let a = assignment("c", 1, 1, 3, 0);
+        for option in ["--slots", "--ctx-per-slot", "--groups", "--n-batch"] {
+            for extra_args in [vec![option.into(), "3".into()], vec![format!("{option}=3")]] {
+                cfg.extra_args = extra_args;
+                let error = arguments(&cfg, &a).unwrap_err();
+                assert_eq!(error.to_string(), format!("{option} cannot be passed through --stage-arg because the coordinator sets it"));
+            }
+        }
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn arguments_reject_slots_above_batch() {
+        let d = tempdir("slots-above-batch");
+        let cfg = cfg_test(&d);
+        let mut a = assignment("c", 1, 1, 3, 0);
+        a.n_batch = a.slots - 1;
+        assert_eq!(arguments(&cfg, &a).unwrap_err().to_string(), "slots exceed n_batch");
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     fn righe_log(d: &Path, chain: &str, epoch: u64) -> String {
@@ -2201,8 +2236,8 @@ mod real_tests {
         let mut tls = rustls::StreamOwned::new(conn, tcp);
         let hello = publicompute_proto::stage::Message {
             body: Some(publicompute_proto::stage::message::Body::Hello(publicompute_proto::stage::Hello {
-                protocol_major: 0,
-                protocol_minor: 1,
+                protocol_major: 1,
+                protocol_minor: 0,
                 stream: publicompute_proto::stage::Stream::Prefill as i32,
                 epoch: 1,
                 mtp: false,

@@ -623,7 +623,7 @@ impl Stage {
 
     fn open(&mut self, a: pb::Open) -> Result<(), String> {
         if !self.m.posto_valido(a.slot) {
-            self.error(a.conversation_id, a.attempt_id, format!("slot {:#x} is outside the configured range ({} groups, {} slots per group)", a.slot, self.m.groups(), self.m.per_ctx));
+            self.error(a.conversation_id, a.attempt_id, format!("slot {:#x} is outside the configured range (slots per group {:?})", a.slot, self.m.per_ctx));
             return Ok(());
         }
         if a.context_limit > self.ctx_per_slot {

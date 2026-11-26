@@ -1,6 +1,6 @@
 [package]
 name = "publicompute"
-version = "0.1.5"
+version = "0.1.6"
 description = "Command-line client for the PubliCompute agent"
 edition.workspace = true
 license.workspace = true

@@ -14,6 +14,17 @@
 
 use std::collections::VecDeque;
 
+/// Split `slots` over at most `groups` contexts so the stage allocates
+/// exactly `slots` sequences of context memory. The first groups take the
+/// remainder; with fewer slots than groups, each group holds one slot.
+/// Every stage and the head call this with the same values, so they agree
+/// on the slot ids (group << 16 | local).
+pub fn slots_per_group(slots: u32, groups: u32) -> Vec<u32> {
+    let slots = slots.max(1);
+    let g = groups.max(1).min(slots);
+    (0..g).map(|i| slots / g + u32::from(i < slots % g)).collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum St {
     Futura,
@@ -86,7 +97,13 @@ impl Admission {
 
     /// Create an admission queue with an explicit class per conversation and an interactive reserve.
     pub fn con_classi(soglie: Vec<u64>, classi: Vec<Class>, groups: usize, per_gruppo: usize, slots: usize, riserva: usize) -> Self {
-        let g = groups.max(1);
+        Self::con_gruppi(soglie, classi, &vec![per_gruppo as u32; groups.max(1)], slots, riserva)
+    }
+
+    /// Like `con_classi`, with the local slot count of each group (see `slots_per_group`).
+    pub fn con_gruppi(soglie: Vec<u64>, classi: Vec<Class>, per_gruppo: &[u32], slots: usize, riserva: usize) -> Self {
+        assert!(!per_gruppo.is_empty(), "expected at least one group");
+        let g = per_gruppo.len();
         let n = soglie.len();
         assert_eq!(classi.len(), n, "expected one class per conversation");
         Admission {
@@ -97,7 +114,7 @@ impl Admission {
             riserva,
             sospensioni: 0,
             tail: VecDeque::new(),
-            liberi: (0..g).map(|_| (0..per_gruppo as u32).collect()).collect(),
+            liberi: per_gruppo.iter().map(|&k| (0..k).collect()).collect(),
             membri: vec![0; g],
             slots,
             occupati: 0,
@@ -444,6 +461,31 @@ mod test {
         let mut c = Admission::con_classi(vec![0], vec![Batch], 1, 1, 0, 0);
         c.arriva(0, false);
         assert!(c.pendenti() && c.prossima().is_none());
+    }
+
+    #[test]
+    fn slots_split_exactly_over_groups() {
+        assert_eq!(slots_per_group(1, 2), vec![1]);
+        assert_eq!(slots_per_group(2, 2), vec![1, 1]);
+        assert_eq!(slots_per_group(3, 2), vec![2, 1]);
+        assert_eq!(slots_per_group(4, 2), vec![2, 2]);
+        assert_eq!(slots_per_group(5, 2), vec![3, 2]);
+        assert_eq!(slots_per_group(4, 0), vec![4]);
+        assert_eq!(slots_per_group(0, 2), vec![1]);
+        for s in 1..=17 {
+            for g in 1..=5 {
+                assert_eq!(slots_per_group(s, g).iter().sum::<u32>(), s);
+            }
+        }
+    }
+
+    #[test]
+    fn uneven_groups_never_hand_out_missing_slots() {
+        let mut a = Admission::con_gruppi(vec![0; 3], vec![Class::Interactive; 3], &slots_per_group(3, 2), 3, 0);
+        a.arriva(0, false);
+        let mut posti: Vec<(usize, u32)> = std::iter::from_fn(|| a.prossima()).map(|x| (x.1, x.2)).collect();
+        posti.sort();
+        assert_eq!(posti, vec![(0, 0), (0, 1), (1, 0)]);
     }
 
     #[test]

@@ -78,7 +78,7 @@ if [ -n "$link_code" ]; then
     unset link_code
 fi
 
-default_version=0.1.5
+default_version=0.1.6
 version=${PUBLICOMPUTE_VERSION:-$default_version}
 case "$version" in
     ''|*[!A-Za-z0-9._-]*) fail 'Invalid package version.' ;;
