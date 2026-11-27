@@ -103,6 +103,9 @@ async fn avvia_catena(name: &str, d: &Path, bin: &Path, model: &Path, sha: &[u8]
         n_batch: 64,
         state_format: "fp32".into(),
         assign_epoch: 1,
+        park_ttl_s: 0,
+        park_grace_s: 0,
+        engine_profile: Some(super::tests::f16_profile()),
         ..Default::default()
     };
     let (mut a_testa, mut a_coda) = (base(1), base(2));

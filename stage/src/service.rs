@@ -178,13 +178,15 @@ impl Service {
 
     /// Queue output or fail promptly when the active client falls behind.
     pub fn manda(&self, m: FromHead) -> bool {
-        let terminal = matches!(m.body, Some(pb::from_head::Body::Done(_)));
+        // Admission and completion carry the slot generation. Losing either would leave
+        // the coordinator with an incomplete view of the head's slots.
+        let required = matches!(m.body, Some(pb::from_head::Body::Admission(_) | pb::from_head::Body::Done(_)));
         let output = self.output.lock().unwrap();
         let Some(writer) = output.as_ref() else { return false };
         if writer.send(m) {
             return true;
         }
-        if terminal {
+        if required {
             writer.close();
         }
         false
@@ -327,6 +329,31 @@ pub fn gemma4_conversation<'a>(msgs: impl IntoIterator<Item = &'a pb::Message>) 
     Ok(t)
 }
 
+/// Use the visible reply when the client sends a raw prefix delimited by think tags.
+pub fn strip_reasoning(text: &mut String) {
+    if let Some((_, answer)) = text.split_once("</think>") {
+        *text = answer.trim_start().to_owned();
+    } else if text.trim_start().starts_with("<think>") {
+        text.clear();
+    }
+}
+
+#[cfg(any(feature = "llama", test))]
+pub(crate) fn template_uses_think_tags(template: &str) -> bool {
+    template.contains("<think>") || template.contains("</think>")
+}
+
+#[cfg(any(feature = "llama", test))]
+pub(crate) fn strip_assistant_reasoning(messages: &mut [pb::Message], uses_think_tags: bool) {
+    if uses_think_tags {
+        for message in messages.iter_mut().filter(|m| m.role == "assistant") {
+            strip_reasoning(&mut message.text);
+        }
+    }
+}
+
+pub(crate) const DEEPSEEK_ASSISTANT_PREFIX: &str = "<\u{ff5c}Assistant\u{ff5c}></think>";
+
 /// Render the chat form for weight files without a usable template. The
 /// prompt begins with an explicit BOS marker and the system text. User
 /// turns open an assistant segment with reasoning disabled, and assistant
@@ -339,7 +366,7 @@ pub fn deepseek4_conversation<'a>(msgs: impl IntoIterator<Item = &'a pb::Message
             "user" => {
                 t.push_str("<\u{ff5c}User\u{ff5c}>");
                 t.push_str(&m.text);
-                t.push_str("<\u{ff5c}Assistant\u{ff5c}></think>");
+                t.push_str(DEEPSEEK_ASSISTANT_PREFIX);
             }
             "assistant" => {
                 t.push_str(&m.text);
@@ -355,11 +382,11 @@ const CONTEXT_ATTEMPTS: usize = 8;
 pub const LAST_MESSAGE_TOO_LONG: &str = "the last message alone exceeds the slot context";
 
 /// Keep enough room for a useful reply when history can be shortened.
-pub fn fit_chat_context<T>(
-    messages: &[pb::Message],
+pub fn fit_chat_context<'a, T>(
+    messages: &'a [pb::Message],
     context: usize,
     ceiling: u32,
-    mut prepare: impl FnMut(&[&pb::Message]) -> Result<(T, usize), String>,
+    mut prepare: impl FnMut(&[&'a pb::Message]) -> Result<(T, usize), String>,
 ) -> Result<(T, usize), String> {
     let preferred = ceiling.min(512) as usize;
     let result = fit_context(messages, context.saturating_sub(preferred), &mut prepare);
@@ -376,10 +403,10 @@ pub fn output_budget(context: usize, prompt: usize, ceiling: u32) -> Option<u32>
 }
 
 /// Try a bounded search over whole turns and keep the prepared prompt that fit.
-pub fn fit_context<T>(
-    messages: &[pb::Message],
+pub fn fit_context<'a, T>(
+    messages: &'a [pb::Message],
     limit: usize,
-    mut prepare: impl FnMut(&[&pb::Message]) -> Result<(T, usize), String>,
+    mut prepare: impl FnMut(&[&'a pb::Message]) -> Result<(T, usize), String>,
 ) -> Result<(T, usize), String> {
     let last = messages.last().ok_or("empty conversation")?;
     let last_index = messages.len() - 1;
@@ -447,6 +474,37 @@ mod test {
 
     fn m(r: &str, t: &str) -> pb::Message {
         pb::Message { role: r.into(), text: t.into() }
+    }
+
+    #[test]
+    fn assistant_history_keeps_only_the_visible_reply() {
+        for (raw, visible) in [
+            ("<think>private</think>\n  answer", "answer"),
+            ("private</think> answer", "answer"),
+            (" <think>interrupted", ""),
+            ("already visible", "already visible"),
+        ] {
+            let mut text = raw.to_owned();
+            strip_reasoning(&mut text);
+            assert_eq!(text, visible);
+        }
+    }
+
+    #[test]
+    fn assistant_history_preserves_literal_think_tags_for_other_templates() {
+        let literal = "The closing tag is </think> in this example.";
+        for (template, expected) in [
+            ("", literal),
+            ("<|im_start|>assistant", literal),
+            ("<|channel>thought\n<channel|>", literal),
+            ("<|im_start|>assistant\n<think>", "in this example."),
+            (DEEPSEEK_ASSISTANT_PREFIX, "in this example."),
+        ] {
+            let mut history = [m("user", literal), m("assistant", literal)];
+            strip_assistant_reasoning(&mut history, template_uses_think_tags(template));
+            assert_eq!(history[0].text, literal);
+            assert_eq!(history[1].text, expected, "{template:?}");
+        }
     }
 
     #[test]
@@ -674,7 +732,7 @@ mod test {
         assert!(sv.manda(FromHead { body: Some(CT::Status(pb::Status { free_slots: 3, pending: 1 })) }));
         assert!(sv.manda(FromHead { body: Some(CT::Token(pb::OutputToken { id: 41, token: 9, text: "è".into(), logprob: -0.5, step: 0, eog: false })) }));
         assert!(sv.manda(FromHead {
-            body: Some(CT::Done(pb::Done { id: 41, reason: "cancelled".into(), usage: Some(pb::Usage { prompt_tokens: 5, generated_tokens: 1 }), ..Default::default() })),
+            body: Some(CT::Done(pb::Done { id: 41, reason: "cancelled".into(), usage: Some(pb::Usage { prompt_tokens: 5, generated_tokens: 1, cached_prompt_tokens: 2 }), ..Default::default() })),
         }));
         match read(&mut c, &mut buf).body {
             Some(CT::Status(s)) => assert_eq!((s.free_slots, s.pending), (3, 1)),

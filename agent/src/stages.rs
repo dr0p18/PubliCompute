@@ -122,8 +122,25 @@ fn porta_di(addr: &str, cosa: &str) -> Result<u16> {
     Ok(p)
 }
 
+/// Reject `--stage-arg` flags that would silently override coordinator layout, the verified weights file,
+/// or the chain's engine profile.
+pub fn validate_extra_args(extra_args: &[String]) -> Result<()> {
+    for arg in extra_args {
+        let option = arg.split_once('=').map_or(arg.as_str(), |(name, _)| name);
+        if matches!(option, "--slots" | "--ctx-per-slot" | "--groups" | "--n-batch") {
+            bail!("{option} cannot be passed through --stage-arg because the coordinator sets it");
+        }
+        // Extra arguments come last and the stage keeps the last occurrence of an option, so one of these
+        // would silently replace the measured profile or the verified weights file.
+        if matches!(option, "--model" | "--cache-type-k" | "--cache-type-v" | "--flash-attn" | "--draft-max-tokens" | "--draft-source" | "--mtp" | "--park-ttl-s" | "--park-grace-s" | "--stop-on-stdin-eof") {
+            bail!("{option} cannot be passed through --stage-arg because the agent or the engine profile sets it");
+        }
+    }
+    Ok(())
+}
+
 /// Validate assignment parameters before reading files or starting a child.
-fn validate(cfg: &StagesConfig, a: &StageAssign) -> Result<Role> {
+fn validate(cfg: &StagesConfig, a: &StageAssign) -> Result<(Role, EngineProfile)> {
     let r = ruolo_di(a)?;
     if a.slots == 0 || a.ctx_per_slot == 0 || a.groups == 0 || a.n_batch == 0 {
         bail!("slots, ctx_per_slot, groups and n_batch must be greater than zero");
@@ -132,12 +149,8 @@ fn validate(cfg: &StagesConfig, a: &StageAssign) -> Result<Role> {
         bail!("slots exceed n_batch");
     }
     // The assigned slots and batch size must fit in a group step.
-    for arg in &cfg.extra_args {
-        let option = arg.split_once('=').map_or(arg.as_str(), |(name, _)| name);
-        if matches!(option, "--slots" | "--ctx-per-slot" | "--groups" | "--n-batch") {
-            bail!("{option} cannot be passed through --stage-arg because the coordinator sets it");
-        }
-    }
+    validate_extra_args(&cfg.extra_args)?;
+    let profile = engine_profile(a)?;
     if a.layer_end >= 0 && (a.layer_end as u32) <= a.layer_start {
         bail!("empty layer range: [{}, {})", a.layer_start, a.layer_end);
     }
@@ -165,12 +178,59 @@ fn validate(cfg: &StagesConfig, a: &StageAssign) -> Result<Role> {
             porta_di(&a.listen_addr, "listen_addr")?;
         }
     }
-    Ok(r)
+    Ok((r, profile))
+}
+
+/// Engine settings of the chain, from the assignment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EngineProfile {
+    cache_type_k: &'static str,
+    cache_type_v: &'static str,
+    flash_attn: &'static str,
+    mtp: bool,
+    park_ttl_s: u32,
+    park_grace_s: u32,
+}
+
+fn cache_type_str(name: &str, value: &str) -> Result<&'static str> {
+    match value {
+        "f16" => Ok("f16"),
+        "q8_0" => Ok("q8_0"),
+        "q4_0" => Ok("q4_0"),
+        _ => bail!("engine_profile.{name} \"{value}\" (f16 | q8_0 | q4_0)"),
+    }
+}
+
+/// Check the profile before any file is read or child started. An absent profile comes from an older
+/// coordinator and means f16/f16/auto/none/0; a present profile with any missing or invalid field is refused.
+fn engine_profile(a: &StageAssign) -> Result<EngineProfile> {
+    // A coordinator that omits engine_profile can only mean the pre-profile default f16/f16/auto/none/0.
+    let Some(p) = a.engine_profile.as_ref() else {
+        return Ok(EngineProfile { cache_type_k: "f16", cache_type_v: "f16", flash_attn: "auto", mtp: false, park_ttl_s: a.park_ttl_s, park_grace_s: a.park_grace_s });
+    };
+    let cache_type_k = cache_type_str("cache_type_k", &p.cache_type_k)?;
+    let cache_type_v = cache_type_str("cache_type_v", &p.cache_type_v)?;
+    let flash_attn = match p.flash_attn.as_str() {
+        "auto" => "auto",
+        "on" => "on",
+        "off" => "off",
+        other => bail!("engine_profile.flash_attn \"{other}\" (auto | on | off)"),
+    };
+    if cache_type_v != "f16" && flash_attn != "on" {
+        bail!("engine_profile.cache_type_v {cache_type_v} requires flash_attn \"on\", not \"{flash_attn}\"");
+    }
+    let depth = p.draft_max_tokens.context("engine_profile.draft_max_tokens is missing")?;
+    let mtp = match (p.draft_source.as_str(), depth) {
+        ("none", 0) => false,
+        ("mtp", 1) => true,
+        (source, depth) => bail!("engine_profile.draft_source \"{source}\" with draft_max_tokens {depth}: use none with 0 or mtp with 1"),
+    };
+    Ok(EngineProfile { cache_type_k, cache_type_v, flash_attn, mtp, park_ttl_s: a.park_ttl_s, park_grace_s: a.park_grace_s })
 }
 
 /// Build stage command arguments for the local child.
 pub fn arguments(cfg: &StagesConfig, a: &StageAssign) -> Result<Vec<String>> {
-    let role = validate(cfg, a)?;
+    let (role, profile) = validate(cfg, a)?;
     let format = if a.state_format.is_empty() { "fp32" } else { a.state_format.as_str() };
     let timeout = cfg.load_timeout.as_secs().max(1);
     let mut v: Vec<String> = vec![role.comando().into()];
@@ -188,9 +248,22 @@ pub fn arguments(cfg: &StagesConfig, a: &StageAssign) -> Result<Vec<String>> {
     op("--groups", a.groups.to_string());
     op("--n-batch", a.n_batch.to_string());
     op("--timeout-s", timeout.to_string());
+    op("--park-ttl-s", profile.park_ttl_s.to_string());
+    op("--park-grace-s", profile.park_grace_s.to_string());
+    // Every stage uses the same cache types and, with a draft, the same depth. Only the head asks for the draft
+    // source and only the tail loads the draft block.
+    op("--cache-type-k", profile.cache_type_k.into());
+    op("--cache-type-v", profile.cache_type_v.into());
+    op("--flash-attn", profile.flash_attn.into());
+    if profile.mtp {
+        op("--draft-max-tokens", "1".into());
+    }
     match role {
         Role::Head => {
             op("--state-format", format.into());
+            if profile.mtp {
+                op("--draft-source", "mtp".into());
+            }
             op("--next", a.next_addr.clone());
             op("--listen-token", a.head_token_addr.clone());
             // Bound the wait for a response so a dead stage becomes a recoverable chain fault.
@@ -210,6 +283,11 @@ pub fn arguments(cfg: &StagesConfig, a: &StageAssign) -> Result<Vec<String>> {
     }
     if role == Role::Head {
         v.push("--service-pipe".into());
+    } else if profile.park_ttl_s > 0 {
+        v.push("--stop-on-stdin-eof".into());
+    }
+    if role == Role::Tail && profile.mtp {
+        v.push("--mtp".into());
     }
     v.extend(cfg.extra_args.iter().cloned());
     Ok(v)
@@ -226,6 +304,7 @@ fn status_message(a: &StageAssign, state: State, error: &str, port: u32, load_se
 #[derive(Debug)]
 pub enum OutgoingLink {
     Token(pb::OutputToken),
+    Admission(publicompute_proto::common::SlotTaken),
     Done(pb::Done),
 }
 
@@ -233,6 +312,7 @@ impl OutputSize for OutgoingLink {
     fn bytes(&self) -> usize {
         match self {
             Self::Token(token) => token.text.capacity(),
+            Self::Admission(_) => 0,
             Self::Done(done) => done.remaining_text.capacity() + done.error.capacity() + done.reason.capacity() + done.prompt_token.capacity() * size_of::<i32>(),
         }
     }
@@ -260,7 +340,7 @@ impl HeadResponses {
 /// Multiplex concurrent requests through one head connection. Route each
 /// response to its request ID because token messages can be interleaved.
 pub struct HeadConnection {
-    scrittore: AsyncMutex<Box<dyn AsyncWrite + Send + Unpin>>,
+    scrittore: AsyncMutex<Option<Box<dyn AsyncWrite + Send + Unpin>>>,
     in_volo: Mutex<HashMap<u64, OutputSender<OutgoingLink>>>,
     prossimo: AtomicU64,
     state: Mutex<pb::Status>,
@@ -271,7 +351,7 @@ impl HeadConnection {
     fn from_io(mut lettura: impl AsyncRead + Send + Unpin + 'static, scrittura: impl AsyncWrite + Send + Unpin + 'static, mut buf: BytesMut) -> Arc<Self> {
         let (chiuso, _) = watch::channel(false);
         let link = Arc::new(HeadConnection {
-            scrittore: AsyncMutex::new(Box::new(scrittura)),
+            scrittore: AsyncMutex::new(Some(Box::new(scrittura))),
             in_volo: Mutex::new(HashMap::new()),
             prossimo: AtomicU64::new(1),
             state: Mutex::new(pb::Status::default()),
@@ -308,11 +388,21 @@ impl HeadConnection {
         pending.clear();
     }
 
+    async fn close_input(&self) {
+        self.close();
+        self.scrittore.lock().await.take();
+    }
+
     fn smista(&self, m: pb::FromHead) {
         match m.body {
             Some(pb::from_head::Body::Token(t)) => {
                 if let Some(tx) = self.in_volo.lock().unwrap().get(&t.id) {
                     let _ = tx.send(OutgoingLink::Token(t));
+                }
+            }
+            Some(pb::from_head::Body::Admission(a)) => {
+                if let (Some(tx), Some(slot)) = (self.in_volo.lock().unwrap().get(&a.id), a.slot_taken) {
+                    let _ = tx.send(OutgoingLink::Admission(slot));
                 }
             }
             Some(pb::from_head::Body::Done(f)) => {
@@ -352,6 +442,7 @@ impl HeadConnection {
             if !self.aperto() {
                 return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "head pipe closed"));
             }
+            let writer = writer.as_mut().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "head pipe closed"))?;
             writer.write_all(&v).await
         }).await.context("head pipe write timed out").and_then(|result| result.context("write to the head"));
         if result.is_err() {
@@ -406,6 +497,7 @@ struct Attivo {
     /// Maximum concurrent conversations served by the head of this chain.
     slots: u32,
     epoch: u64,
+    engine_profile: EngineProfile,
     /// Ask the stage task to stop and pass along the reason.
     ferma: Option<oneshot::Sender<String>>,
     /// Completion means the child has exited and its final state was reported.
@@ -798,18 +890,22 @@ impl Stages {
         self.interno.lock().unwrap().attivo.as_ref().map(|a| a.last.clone())
     }
 
-    async fn report(&self, s: StageStatus) {
-        let tx = {
-            let mut i = self.interno.lock().unwrap();
-            if let Some(a) = i.attivo.as_mut().filter(|a| a.chain_id == s.chain_id && a.epoch == s.assign_epoch) {
-                a.last = s.clone();
-            }
-            i.tx.clone()
-        };
+    async fn send_status(&self, s: StageStatus) {
+        let tx = self.interno.lock().unwrap().tx.clone();
         info!(chain = %s.chain_id, epoch = s.assign_epoch, state = ?s.state(), error = %s.error, "stage status");
         if let Some(tx) = tx {
             let _ = tx.send(s).await;
         }
+    }
+
+    async fn report(&self, s: StageStatus) {
+        {
+            let mut i = self.interno.lock().unwrap();
+            if let Some(a) = i.attivo.as_mut().filter(|a| a.chain_id == s.chain_id && a.epoch == s.assign_epoch) {
+                a.last = s.clone();
+            }
+        }
+        self.send_status(s).await;
     }
 
     async fn assign(self: &Arc<Self>, a: StageAssign, sup: Option<Arc<Supervisor>>) {
@@ -832,8 +928,8 @@ impl Stages {
         let failed = |e: anyhow::Error| status_message(a, State::Failed, &format!("{e:#}"), 0, 0.0);
         let stopped = || status_message(a, State::Stopped, "assignment cancelled", 0, 0.0);
         // Validate the assignment before allocating child resources.
-        let role = match self.controlla(a) {
-            Ok(r) => r,
+        let (role, profile) = match self.controlla(a) {
+            Ok(x) => x,
             Err(e) => return Some(failed(e)),
         };
         let gpu = if let Some(sup) = sup {
@@ -850,9 +946,9 @@ impl Stages {
         // An agent owns one active stage, so classify duplicates before launching another.
         let previous = {
             let i = self.interno.lock().unwrap();
-            i.attivo.as_ref().map(|p| (p.chain_id.clone(), p.epoch, p.last.clone()))
+            i.attivo.as_ref().map(|p| (p.chain_id.clone(), p.epoch, p.engine_profile, p.last.clone()))
         };
-        if let Some((chain, epoch, last)) = previous {
+        if let Some((chain, epoch, active_profile, last)) = previous {
             if chain != a.chain_id {
                 let m = format!("node already hosts a stage for chain {chain}");
                 return Some(status_message(a, State::Failed, &m, 0, 0.0));
@@ -862,7 +958,7 @@ impl Stages {
                 return None;
             }
             if a.assign_epoch == epoch {
-                self.renew(a, last).await;
+                self.renew(a, active_profile, last).await;
                 return None;
             }
             self.stop_active("stage reassigned").await;
@@ -891,6 +987,7 @@ impl Stages {
                 role,
                 slots: a.slots,
                 epoch: a.assign_epoch,
+                engine_profile: profile,
                 ferma: Some(ferma_tx),
                 finito: fin_rx,
                 last: status_message(a, State::Loading, "", 0, 0.0),
@@ -920,18 +1017,36 @@ impl Stages {
     }
 
     async fn renew_switch(&self, a: &StageAssign) {
-        let last = {
+        let active = {
             let i = self.interno.lock().unwrap();
             i.attivo.as_ref().filter(|s| s.chain_id == a.chain_id && s.epoch == a.assign_epoch && !s.closing)
-                .map(|s| s.last.clone())
+                .map(|s| (s.engine_profile, s.last.clone()))
         };
         // A renewal queued during teardown must never resurrect the stage.
-        if let Some(last) = last {
-            self.renew(a, last).await;
+        if let Some((active_profile, last)) = active {
+            self.renew(a, active_profile, last).await;
         }
     }
 
-    async fn renew(&self, a: &StageAssign, last: StageStatus) {
+    async fn renew(&self, a: &StageAssign, active_profile: EngineProfile, last: StageStatus) {
+        match engine_profile(a) {
+            Ok(p) if p == active_profile => {}
+            Ok(_) => {
+                let msg = format!(
+                    "cannot change engine_profile or parking settings on renewal for chain {} epoch {}",
+                    a.chain_id, a.assign_epoch
+                );
+                warn!(chain = %a.chain_id, epoch = a.assign_epoch, "{msg}");
+                self.send_status(status_message(a, State::Failed, &msg, 0, 0.0)).await;
+                return;
+            }
+            Err(e) => {
+                let msg = format!("invalid engine_profile on renewal: {e:#}");
+                warn!(chain = %a.chain_id, epoch = a.assign_epoch, "{msg}");
+                self.send_status(status_message(a, State::Failed, &msg, 0, 0.0)).await;
+                return;
+            }
+        }
         // The stage reloads the capability file while continuing to serve.
         if !a.capability.is_empty() {
             if let Err(e) = self.write_capability(a) {
@@ -941,8 +1056,8 @@ impl Stages {
         self.report(last).await;
     }
 
-    fn controlla(&self, a: &StageAssign) -> Result<Role> {
-        let role = validate(&self.cfg, a)?;
+    fn controlla(&self, a: &StageAssign) -> Result<(Role, EngineProfile)> {
+        let checked = validate(&self.cfg, a)?;
         if a.capability.is_empty() && !self.cfg.in_chiaro {
             bail!("Rejecting StageAssign without a signed capability; stage links must use TLS");
         }
@@ -956,7 +1071,7 @@ impl Stages {
         if !self.cfg.model_path.exists() {
             bail!("GGUF not found: {}", self.cfg.model_path.display());
         }
-        Ok(role)
+        Ok(checked)
     }
 
     async fn release(&self, r: StageRelease) {
@@ -1007,11 +1122,17 @@ impl Stages {
                 return status_message(a, State::Failed, &format!("could not start publicompute-stage: {e:#}"), 0, 0.0);
             }
         };
+        // Waiting for child exit closes any stdin still owned by Child.
+        let lifetime = if role == Role::Head { None } else { figlio.child.stdin.take() };
         info!(chain = %a.chain_id, role = role.comando(), epoch = a.assign_epoch, ctx_per_slot = a.ctx_per_slot, slots = a.slots, log = %log_path.display(), "stage started");
         let scadenza = tokio::time::sleep(self.cfg.load_timeout);
         tokio::pin!(scadenza);
         let esito: Outcome = {
-            let pipes = figlio.child.stdout.take().zip(figlio.child.stdin.take());
+            let pipes = if role == Role::Head {
+                figlio.child.stdout.take().zip(figlio.child.stdin.take())
+            } else {
+                None
+            };
             let attesa_pronto = async {
                 match pipes {
                     Some((reader, writer)) => head_ready(reader, writer).await.map(Some),
@@ -1054,7 +1175,7 @@ impl Stages {
                         if let Some(link) = &link {
                             link.close();
                         }
-                        self.terminate(a, &mut figlio, "stage launcher exited").await;
+                        self.terminate(a, &mut figlio, lifetime, "stage launcher exited").await;
                         let m = descrivi_uscita(st.map_err(|e| e.to_string()), &ultime);
                         status_message(a, State::Failed, &m, porta, carico)
                     }
@@ -1063,33 +1184,33 @@ impl Stages {
                         if let Some(link) = &link {
                             link.close();
                         }
-                        self.terminate(a, &mut figlio, &reason).await;
+                        self.terminate(a, &mut figlio, lifetime, &reason).await;
                         status_message(a, State::Stopped, &reason, porta, carico)
                     }
                     _ = done => {
                         let m = "lost the connection to the head service".to_string();
-                        self.terminate(a, &mut figlio, &m).await;
+                        self.terminate(a, &mut figlio, lifetime, &m).await;
                         status_message(a, State::Failed, &m, porta, carico)
                     }
                 }
             }
             Outcome::Invalid(error) => {
-                self.terminate(a, &mut figlio, "invalid stage readiness signal").await;
+                self.terminate(a, &mut figlio, lifetime, "invalid stage readiness signal").await;
                 let message = format!("stage readiness failed: {error:#}; {}", ultime_righe(&ultime));
                 status_message(a, State::Failed, &message, 0, t0.elapsed().as_secs_f64())
             }
             Outcome::Uscito(st) => {
-                self.terminate(a, &mut figlio, "stage launcher exited during load").await;
+                self.terminate(a, &mut figlio, lifetime, "stage launcher exited during load").await;
                 let m = descrivi_uscita(st, &ultime);
                 status_message(a, State::Failed, &format!("stage exited during load: {m}"), 0, t0.elapsed().as_secs_f64())
             }
             Outcome::Fermato(reason) => {
-                self.terminate(a, &mut figlio, &reason).await;
+                self.terminate(a, &mut figlio, lifetime, &reason).await;
                 status_message(a, State::Stopped, &reason, 0, t0.elapsed().as_secs_f64())
             }
             Outcome::Scaduto => {
                 let m = format!("loading exceeded {} s: {}", self.cfg.load_timeout.as_secs(), ultime_righe(&ultime));
-                self.terminate(a, &mut figlio, "stage load timed out").await;
+                self.terminate(a, &mut figlio, lifetime, "stage load timed out").await;
                 status_message(a, State::Failed, &m, 0, t0.elapsed().as_secs_f64())
             }
         }
@@ -1115,9 +1236,26 @@ impl Stages {
     }
 
     /// Escalate to SIGKILL after the grace period and reap before reporting exit.
-    async fn terminate(&self, a: &StageAssign, figlio: &mut managed::Process, reason: &str) {
+    async fn terminate(&self, a: &StageAssign, figlio: &mut managed::Process, lifetime: Option<ChildStdin>, reason: &str) {
         info!(reason, "stopping the stage");
-        if let Err(error) = managed::stop(figlio, self.cfg.stop_grace, self.cfg.kill_wait, "publicompute-stage").await {
+        let mut grace = self.cfg.stop_grace;
+        drop(lifetime);
+        if a.park_ttl_s > 0 {
+            // Closing stdin lets a stage clear its retained host buffers on
+            // its compute thread. Bound this by the usual stop grace.
+            let deadline = Instant::now() + grace;
+            let link = self.interno.lock().unwrap().link.clone();
+            if let Ok(Ok(())) = tokio::time::timeout(grace, async {
+                if let Some(link) = link {
+                    link.close_input().await;
+                }
+                figlio.wait_for_exit("publicompute-stage").await
+            }).await {
+                return;
+            }
+            grace = deadline.saturating_duration_since(Instant::now());
+        }
+        if let Err(error) = managed::stop(figlio, grace, self.cfg.kill_wait, "publicompute-stage").await {
             self.close_assignment(&a.chain_id, a.assign_epoch);
             let switching = self.interno.lock().unwrap().switching.as_ref().is_some_and(|s| s.matches(a));
             warn!(%error, "could not confirm stage group exit; waiting for it to empty");
@@ -1245,7 +1383,8 @@ async fn start(cfg: &StagesConfig, args: &[String], log_path: &Path, use_pipes: 
     if use_pipes {
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
     } else {
-        cmd.stdin(Stdio::null()).stdout(Stdio::null());
+        let stop_on_eof = args.iter().any(|arg| arg == "--stop-on-stdin-eof");
+        cmd.stdin(if stop_on_eof { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::null());
     }
     // Make the stage exit with its parent so an orphan cannot hold the GPU.
     #[cfg(target_os = "linux")]
@@ -1284,6 +1423,22 @@ async fn start(cfg: &StagesConfig, args: &[String], log_path: &Path, use_pipes: 
 pub(crate) mod tests {
     use super::*;
     use publicompute_proto::common::ModelRef;
+    use publicompute_proto::node::StageEngineProfile;
+
+    pub fn profile(k: &str, v: &str, flash_attn: &str, source: &str, depth: u32) -> StageEngineProfile {
+        StageEngineProfile {
+            cache_type_k: k.into(),
+            cache_type_v: v.into(),
+            flash_attn: flash_attn.into(),
+            draft_source: source.into(),
+            draft_max_tokens: Some(depth),
+        }
+    }
+
+    /// The engine as it was before the profile existed.
+    pub fn f16_profile() -> StageEngineProfile {
+        profile("f16", "f16", "auto", "none", 0)
+    }
 
     #[tokio::test]
     async fn stage_only_is_busy_for_network_before_the_worker_reports_loading() {
@@ -1351,6 +1506,9 @@ pub(crate) mod tests {
             head_token_addr: "127.0.0.1:19999".into(),
             capability: vec![],
             assign_epoch: epoch,
+            engine_profile: Some(f16_profile()),
+            park_ttl_s: 0,
+            park_grace_s: 0,
             ..Default::default()
         }
     }
@@ -1370,7 +1528,10 @@ pub(crate) mod tests {
     fn arguments_for_role() {
         let d = tempdir("argomenti");
         let cfg = StagesConfig { extra_args: vec!["--log-top".into(), "x".into(), "--ingress-max-mib".into(), "96".into()], ..cfg_test(&d) };
-        let head = arguments(&cfg, &assignment("c", 1, 1, 3, 0)).unwrap();
+        let with_parking = |index, port| StageAssign {
+            park_ttl_s: 900, park_grace_s: 60, ..assignment("c", 1, index, 3, port)
+        };
+        let head = arguments(&cfg, &with_parking(1, 0)).unwrap();
         let s = head.join(" ");
         assert_eq!(head[0], "head");
         for expected in [
@@ -1380,6 +1541,8 @@ pub(crate) mod tests {
             "--ctx-per-slot 512",
             "--groups 2",
             "--n-batch 64",
+            "--park-ttl-s 900",
+            "--park-grace-s 60",
             "--state-format fp16",
             "--next 127.0.0.1:9",
             "--listen-token 127.0.0.1:19999",
@@ -1390,9 +1553,10 @@ pub(crate) mod tests {
         }
         assert!(!s.contains("--index"), "head has an unexpected --index: {s}");
         assert!(!s.contains("--block"), "head should calculate the default block: {s}");
-        let medio = arguments(&cfg, &assignment("c", 1, 2, 3, 7001)).unwrap().join(" ");
+        let medio = arguments(&cfg, &with_parking(2, 7001)).unwrap().join(" ");
         assert!(medio.starts_with("middle ") && medio.contains("--listen 127.0.0.1:7001") && medio.contains("--next 127.0.0.1:9") && medio.contains("--index 2"), "{medio}");
         assert!(medio.contains("--ingress-max-mib 96"));
+        assert!(medio.contains("--stop-on-stdin-eof"));
         let tail = arguments(&cfg, &assignment("c", 1, 3, 3, 7002)).unwrap().join(" ");
         assert!(tail.starts_with("tail ") && tail.contains("--head-token 127.0.0.1:19999") && tail.contains("--index 3") && tail.contains("--layer-end -1"), "{tail}");
         assert!(!tail.contains("--state-format"));
@@ -1428,6 +1592,86 @@ pub(crate) mod tests {
         let mut a = assignment("c", 1, 1, 3, 0);
         a.n_batch = a.slots - 1;
         assert_eq!(arguments(&cfg, &a).unwrap_err().to_string(), "slots exceed n_batch");
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn arguments_carry_engine_profile_to_every_role() {
+        let d = tempdir("engine-profile-args");
+        let cfg = cfg_test(&d);
+        let quantized = |index, n| StageAssign { engine_profile: Some(profile("q8_0", "q4_0", "on", "none", 0)), ..assignment("c", 1, index, n, 7001) };
+        for index in 1..=3 {
+            let s = arguments(&cfg, &quantized(index, 3)).unwrap().join(" ");
+            assert!(s.contains("--cache-type-k q8_0 --cache-type-v q4_0 --flash-attn on"), "{s}");
+            for absent in ["--draft-max-tokens", "--draft-source", "--mtp"] {
+                assert!(!s.contains(absent), "{absent} without a draft: {s}");
+            }
+        }
+        // f16/f16/auto/none/0 is passed explicitly too: the stage never guesses.
+        let s = arguments(&cfg, &assignment("c", 1, 2, 3, 7001)).unwrap().join(" ");
+        assert!(s.contains("--cache-type-k f16 --cache-type-v f16 --flash-attn auto"), "{s}");
+
+        // With MTP every stage gets the depth, only the head the source and only the tail the block.
+        let mtp = |index, n| StageAssign { engine_profile: Some(profile("q8_0", "q8_0", "on", "mtp", 1)), ..assignment("c", 1, index, n, 7001) };
+        let (head, middle, tail) = (arguments(&cfg, &mtp(1, 3)).unwrap(), arguments(&cfg, &mtp(2, 3)).unwrap(), arguments(&cfg, &mtp(3, 3)).unwrap());
+        for args in [&head, &middle, &tail] {
+            assert!(args.join(" ").contains("--draft-max-tokens 1"), "{args:?}");
+        }
+        assert!(head.join(" ").contains("--draft-source mtp") && !head.contains(&"--mtp".to_string()));
+        assert!(!middle.join(" ").contains("--draft-source") && !middle.contains(&"--mtp".to_string()));
+        assert!(tail.contains(&"--mtp".to_string()) && !tail.join(" ").contains("--draft-source"));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn arguments_treat_absent_engine_profile_as_f16() {
+        let d = tempdir("engine-profile-absent");
+        let cfg = cfg_test(&d);
+        let a = StageAssign { engine_profile: None, ..assignment("c", 1, 1, 3, 0) };
+        let s = arguments(&cfg, &a).unwrap().join(" ");
+        assert!(s.contains("--cache-type-k f16 --cache-type-v f16 --flash-attn auto"), "{s}");
+        for absent in ["--draft-max-tokens", "--draft-source", "--mtp"] {
+            assert!(!s.contains(absent), "{absent} in: {s}");
+        }
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn arguments_reject_invalid_engine_profile() {
+        let d = tempdir("engine-profile-invalid");
+        let cfg = cfg_test(&d);
+        let with = |p: StageEngineProfile| StageAssign { engine_profile: Some(p), ..assignment("c", 1, 1, 3, 0) };
+        let error = |p: StageEngineProfile| arguments(&cfg, &with(p)).unwrap_err().to_string();
+        assert!(error(profile("q5_0", "f16", "auto", "none", 0)).contains("cache_type_k"));
+        assert!(error(profile("f16", "bf16", "auto", "none", 0)).contains("cache_type_v"));
+        assert!(error(profile("f16", "f16", "yes", "none", 0)).contains("flash_attn"));
+        assert!(error(profile("f16", "q8_0", "off", "none", 0)).contains("requires flash_attn \"on\""));
+        assert!(error(profile("f16", "q8_0", "auto", "none", 0)).contains("requires flash_attn \"on\""));
+        assert!(error(profile("f16", "q4_0", "auto", "none", 0)).contains("requires flash_attn \"on\""));
+        assert!(error(profile("f16", "f16", "auto", "mtp", 0)).contains("draft_source"));
+        assert!(error(profile("f16", "f16", "auto", "none", 1)).contains("draft_source"));
+        assert!(error(profile("f16", "f16", "auto", "mtp", 2)).contains("draft_source"));
+        let mut missing_depth = f16_profile();
+        missing_depth.draft_max_tokens = None;
+        assert!(error(missing_depth).contains("draft_max_tokens is missing"));
+        let mut missing_k = f16_profile();
+        missing_k.cache_type_k.clear();
+        assert!(error(missing_k).contains("cache_type_k"));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn arguments_reject_overrides_of_engine_profile_and_model() {
+        let d = tempdir("engine-profile-overrides");
+        let mut cfg = cfg_test(&d);
+        let a = assignment("c", 1, 3, 3, 7002);
+        for option in ["--model", "--cache-type-k", "--cache-type-v", "--flash-attn", "--draft-max-tokens", "--draft-source", "--mtp"] {
+            for extra_args in [vec![option.into(), "x".into()], vec![format!("{option}=x")], vec![option.into()]] {
+                cfg.extra_args = extra_args;
+                let error = arguments(&cfg, &a).unwrap_err().to_string();
+                assert_eq!(error, format!("{option} cannot be passed through --stage-arg because the agent or the engine profile sets it"));
+            }
+        }
         std::fs::remove_dir_all(d).unwrap();
     }
 
@@ -1515,6 +1759,52 @@ pub(crate) mod tests {
         stages.stop_all().await;
     }
 
+    #[tokio::test]
+    async fn renewal_with_different_engine_profile_is_rejected() {
+        let d = tempdir("renew-profile-diff");
+        let cfg = StagesConfig { ca_path: Some(d.join("ca.pem")), ..cfg_test(&d) };
+        let stages = Stages::new(cfg);
+        let (tx, mut rx) = mpsc::channel(16);
+        stages.connect_peer(tx);
+        stages.set_tls_files(TlsFiles { cert: Some(d.join("c.pem")), key: Some(d.join("k.pem")), cap_pub: Some(d.join("p")) });
+        let porta = porta_libera().unwrap();
+        let mut a = assignment("rinnovo-profilo", 2, 3, 3, porta);
+        a.capability = vec![1, 2, 3];
+        stages.queue_assignment(a.clone());
+        assert_eq!(prossimo(&mut rx).await.state(), State::Loading);
+        assert_eq!(prossimo(&mut rx).await.state(), State::Ready);
+        let cap = d.join("tls/capability-rinnovo-profilo-2.bin");
+        assert_eq!(std::fs::read(&cap).unwrap(), vec![1, 2, 3]);
+
+        // Changing cache types or MTP at the same epoch must fail instead of returning READY or rewriting capability.
+        let mut changed_kv = a.clone();
+        changed_kv.capability = vec![9, 9, 9];
+        changed_kv.engine_profile = Some(profile("q8_0", "q8_0", "on", "none", 0));
+        stages.queue_assignment(changed_kv);
+        let s = prossimo(&mut rx).await;
+        assert_eq!((s.state(), s.chain_id.as_str(), s.assign_epoch), (State::Failed, "rinnovo-profilo", 2));
+        assert!(s.error.contains("engine_profile"), "{}", s.error);
+        assert_eq!(std::fs::read(&cap).unwrap(), vec![1, 2, 3]);
+
+        let mut changed_mtp = a.clone();
+        changed_mtp.engine_profile = Some(profile("f16", "f16", "auto", "mtp", 1));
+        stages.queue_assignment(changed_mtp);
+        let s = prossimo(&mut rx).await;
+        assert_eq!(s.state(), State::Failed, "{s:?}");
+        assert!(s.error.contains("engine_profile"), "{}", s.error);
+
+        for (ttl, grace) in [(900, 0), (0, 60)] {
+            stages.queue_assignment(StageAssign { park_ttl_s: ttl, park_grace_s: grace, ..a.clone() });
+            let s = prossimo(&mut rx).await;
+            assert_eq!(s.state(), State::Failed, "{s:?}");
+            assert!(s.error.contains("parking settings"), "{}", s.error);
+        }
+
+        stages.stop_all().await;
+        assert_eq!(prossimo(&mut rx).await.state(), State::Stopped);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
     /// Pass the handshake's clock correction only to signed assignments.
     #[tokio::test]
     async fn clock_offset_passed_only_with_capability() {
@@ -1575,7 +1865,8 @@ pub(crate) mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         stages.connect_peer(tx);
         let porta = porta_libera().unwrap();
-        stages.queue_assignment(assignment("catena-1", 3, 3, 3, porta));
+        let assign = StageAssign { park_ttl_s: 900, park_grace_s: 60, ..assignment("catena-1", 3, 3, 3, porta) };
+        stages.queue_assignment(assign.clone());
         let s = prossimo(&mut rx).await;
         assert_eq!((s.state(), s.assign_epoch, s.chain_id.as_str()), (State::Loading, 3, "catena-1"));
         let s = prossimo(&mut rx).await;
@@ -1583,7 +1874,7 @@ pub(crate) mod tests {
         assert_eq!(s.port, porta as u32);
         assert!(s.load_seconds > 0.0);
         // A duplicate announces the existing stage without spawning another child.
-        stages.queue_assignment(assignment("catena-1", 3, 3, 3, porta));
+        stages.queue_assignment(assign);
         assert_eq!(prossimo(&mut rx).await.state(), State::Ready);
         // A conflicting assignment must leave the active chain alone.
         stages.queue_assignment(assignment("altra", 1, 3, 3, porta_libera().unwrap()));
@@ -1602,6 +1893,7 @@ pub(crate) mod tests {
         stages.queue_assignment(assignment("catena-1", 4, 3, 3, porta_libera().unwrap()));
         assert_eq!(prossimo(&mut rx).await.state(), State::Loading);
         assert_eq!(prossimo(&mut rx).await.state(), State::Ready);
+        assert!(righe_log(&d, "catena-1", 3).contains("received release EOF"));
         stages.stop_all().await;
         assert_eq!(prossimo(&mut rx).await.state(), State::Stopped);
     }
@@ -1694,7 +1986,48 @@ pub(crate) mod tests {
         let pid = child.child.id().unwrap();
         tokio::time::timeout(Duration::from_secs(5), ready).await.unwrap().unwrap();
         let stages = Stages::new(cfg);
-        stages.terminate(&assign, &mut child, "test").await;
+        stages.terminate(&assign, &mut child, None, "test").await;
+        assert_stage_reaped(&child, pid);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forced_stop_reaps_stage_that_ignores_release_eof() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let d = tempdir("kill-reap-after-eof");
+        let cfg = StagesConfig { kill_wait: Duration::ZERO, ..cfg_test(&d) };
+        let assign = StageAssign { park_ttl_s: 900, ..assignment("c", 1, 3, 3, 0) };
+        let script = r#"
+trap '' TERM
+printf 'ready\n'
+while IFS= read -r line; do :; done
+printf 'eof\n'
+exec sleep 60
+"#;
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", script]).stdin(Stdio::piped()).stdout(Stdio::piped());
+        let mut child = managed::Process::spawn(cmd).unwrap();
+        let pid = child.child.id().unwrap();
+        let lifetime = child.child.stdin.take().unwrap();
+        let mut lines = BufReader::new(child.child.stdout.take().unwrap()).lines();
+        let ready = tokio::time::timeout(Duration::from_secs(5), lines.next_line()).await.unwrap().unwrap();
+        assert_eq!(ready.as_deref(), Some("ready"));
+
+        let grace = cfg.stop_grace;
+        let stages = Stages::new(cfg);
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), stages.terminate(&assign, &mut child, Some(lifetime), "test"))
+            .await.unwrap();
+        assert!(started.elapsed() >= grace);
+        assert_stage_reaped(&child, pid);
+        assert_eq!(child.child.wait().await.unwrap().signal(), Some(libc::SIGKILL));
+        assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("eof"));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn assert_stage_reaped(child: &managed::Process, pid: u32) {
         assert!(child.child.id().is_none());
         assert_eq!(unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) }, -1);
         assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
@@ -1720,6 +2053,7 @@ pub(crate) mod tests {
         let done = loop {
             match u.recv().await.expect("response stream ended") {
                 OutgoingLink::Token(t) => text.push_str(&t.text),
+                OutgoingLink::Admission(_) => {}
                 OutgoingLink::Done(f) => break f,
             }
         };
@@ -1728,6 +2062,80 @@ pub(crate) mod tests {
         // A lost head connection clears readiness.
         stages.stop_all().await;
         assert!(stages.head().is_none());
+    }
+
+    #[tokio::test]
+    async fn closed_chat_output_cancels_admission_and_final_flush() {
+        use crate::engine::{
+            output::OutputStalled,
+            stages::{delta_channel, StadiEngine},
+            Limits,
+        };
+        use publicompute_proto::node::{ChatMessage, ChatRole, InferenceRequest};
+
+        async fn read_head_command(io: &mut tokio::io::DuplexStream, buf: &mut BytesMut) -> pb::FromAgent {
+            loop {
+                if let Some(command) = wire::try_decode_frame(buf).unwrap() {
+                    return command;
+                }
+                assert_ne!(io.read_buf(buf).await.unwrap(), 0, "head input closed");
+            }
+        }
+
+        let dir = tempdir("closed-chat-output");
+        let stages = Stages::new(cfg_test(&dir));
+        let (agent, mut head) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(agent);
+        let link = HeadConnection::from_io(reader, writer, BytesMut::new());
+        stages.interno.lock().unwrap().link = Some(link.clone());
+        let limit = Duration::from_secs(5);
+        let engine = StadiEngine {
+            stages,
+            attive: Default::default(),
+            progress: Default::default(),
+            limits: Limits {
+                prefill_stall: limit, decode_stall: limit, request_max: limit,
+                call_timeout: limit, step_timeout: limit, probe_timeout: limit,
+            },
+        };
+        let req = InferenceRequest {
+            messages: vec![ChatMessage { role: ChatRole::User as i32, content: "hello".into() }],
+            ..Default::default()
+        };
+        let mut incoming = BytesMut::new();
+        for admission in [true, false] {
+            let (deltas, output, _) = delta_channel();
+            let simulate_head = async {
+                let Some(pb::from_agent::Body::Request(request)) = read_head_command(&mut head, &mut incoming).await.body else {
+                    panic!("expected a request");
+                };
+                let id = request.id;
+                drop(output);
+                let body = if admission {
+                    pb::from_head::Body::Admission(pb::Admission {
+                        id, slot_taken: Some(publicompute_proto::common::SlotTaken { slot: 0, generation: 1 }),
+                    })
+                } else {
+                    pb::from_head::Body::Done(pb::Done {
+                        id, reason: "stop".into(), remaining_text: "final text".into(), ..Default::default()
+                    })
+                };
+                let mut frame = Vec::new();
+                wire::encode_frame(&pb::FromHead { body: Some(body) }, &mut frame).unwrap();
+                head.write_all(&frame).await.unwrap();
+                let Some(pb::from_agent::Body::Cancel(cancel)) = read_head_command(&mut head, &mut incoming).await.body else {
+                    panic!("expected a cancellation");
+                };
+                assert_eq!(cancel.id, id);
+                assert!(!link.in_volo.lock().unwrap().contains_key(&id));
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(engine.chat(&req, Some(deltas), None), simulate_head)
+            }).await.expect("the head should receive cancellation when the delta cannot be forwarded");
+            let Err(error) = result else { panic!("expected the dropped output to fail the chat") };
+            assert!(error.is::<OutputStalled>(), "{error:#}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]
@@ -1845,6 +2253,9 @@ mod real_tests {
             head_token_addr: format!("127.0.0.1:{p_token}"),
             capability: vec![],
             assign_epoch: 1,
+            engine_profile: Some(super::tests::f16_profile()),
+            park_ttl_s: 0,
+            park_grace_s: 0,
             ..Default::default()
         }
     }
@@ -2236,7 +2647,7 @@ mod real_tests {
         let mut tls = rustls::StreamOwned::new(conn, tcp);
         let hello = publicompute_proto::stage::Message {
             body: Some(publicompute_proto::stage::message::Body::Hello(publicompute_proto::stage::Hello {
-                protocol_major: 1,
+                protocol_major: 2,
                 protocol_minor: 0,
                 stream: publicompute_proto::stage::Stream::Prefill as i32,
                 epoch: 1,

@@ -78,7 +78,7 @@ if [ -n "$link_code" ]; then
     unset link_code
 fi
 
-default_version=0.1.6
+default_version=0.1.7
 version=${PUBLICOMPUTE_VERSION:-$default_version}
 case "$version" in
     ''|*[!A-Za-z0-9._-]*) fail 'Invalid package version.' ;;
@@ -724,6 +724,9 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
             *'"gpu_lost":true'*) phase='GPU unavailable; waiting for the NVIDIA driver' ;;
             *'"engine":"starting"'*) phase='Checking the model and starting the engine' ;;
             *'"engine":"quarantined"'*) fail "The engine is quarantined. See journalctl -u $unit." ;;
+            *'"engine":"blocked"'*)
+                "$prefix/bin/publicompute" --socket "$socket" status || :
+                fail "This release cannot join the network. Run the installer again." ;;
             *'"engine":"recovering"'*) phase='Recovering the engine' ;;
             *'"connected":false'*) phase='Waiting for the coordinator session' ;;
             *'"connected":true'*)

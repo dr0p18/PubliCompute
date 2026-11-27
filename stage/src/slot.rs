@@ -147,6 +147,40 @@ pub struct Scaduto {
     pub conversation_id: u64,
     pub liberato: Freed,
     pub era_riservato: bool,
+    pub generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotKey {
+    pub seq: u32,
+    pub generation: u64,
+    pub conversation: u64,
+    pub attempt: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenerationState {
+    Live,
+    Parked { position: u32, until: Duration },
+    Miss { position: u32 },
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Generation {
+    key: SlotKey,
+    start: u32,
+    previous: Option<SlotKey>,
+    state: GenerationState,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum GenerationOpen {
+    Ready { displaced: Option<u64>, retired: Option<SlotKey>, reused: bool },
+    Duplicate,
+    Miss { displaced: Option<u64>, retired: Option<SlotKey> },
+    DuplicateMiss { position: u32 },
+    Stale,
 }
 
 pub struct Slots<C: Clock> {
@@ -158,11 +192,118 @@ pub struct Slots<C: Clock> {
     ttl_filigrana: Duration,
     conv_max: usize,
     ultima_pulizia: Duration,
+    // One watermark per physical slot for the entire link epoch. A
+    // conversation watermark alone can age out before a delayed frame.
+    generations: HashMap<u32, Generation>,
 }
 
 impl<C: Clock> Slots<C> {
     pub fn new(orologio: C, scadenze: Deadlines) -> Self {
-        Self { orologio, scadenze, conv: HashMap::new(), proprietari: HashMap::new(), ttl_filigrana: FILIGRANA_TTL, conv_max: CONV_MAX, ultima_pulizia: Duration::ZERO }
+        Self { orologio, scadenze, conv: HashMap::new(), proprietari: HashMap::new(), ttl_filigrana: FILIGRANA_TTL, conv_max: CONV_MAX, ultima_pulizia: Duration::ZERO, generations: HashMap::new() }
+    }
+
+    pub fn open_generation(&mut self, key: SlotKey, start: u32, previous: Option<SlotKey>) -> GenerationOpen {
+        if key.generation == 0 {
+            return GenerationOpen::Stale;
+        }
+        let old = self.generations.get(&key.seq).copied();
+        if let Some(old) = old {
+            if key.generation <= old.key.generation {
+                return match (key == old.key && start == old.start && previous == old.previous, old.state) {
+                    (true, GenerationState::Live) => GenerationOpen::Duplicate,
+                    (true, GenerationState::Miss { position }) => GenerationOpen::DuplicateMiss { position },
+                    _ => GenerationOpen::Stale,
+                };
+            }
+        }
+        let active = self.slot(key.conversation);
+        if key.attempt <= self.watermark(key.conversation) || active.is_some_and(|(attempt, _)| attempt >= key.attempt) {
+            return GenerationOpen::Stale;
+        }
+        let retired = match active {
+            Some((attempt, seq)) if seq != key.seq => {
+                let Some(old_key) = self.live_key(key.conversation, attempt) else {
+                    return GenerationOpen::Stale;
+                };
+                Some(old_key)
+            }
+            _ => None,
+        };
+        if let Some(old) = old {
+            if old.state == GenerationState::Live {
+                if key.conversation == old.key.conversation && key.attempt <= old.key.attempt {
+                    return GenerationOpen::Stale;
+                }
+                self.close(old.key.conversation, old.key.attempt);
+            }
+        }
+        if let Some(retired) = retired {
+            self.close_generation(retired, None);
+        }
+        let reused = previous.is_some_and(|prev| {
+            old.is_some_and(|old| {
+                old.key == prev && matches!(old.state, GenerationState::Parked { position, until }
+                    if position == start && self.orologio.adesso() < until)
+            })
+        });
+        // Parking and closing already removed the conversation's live
+        // state. It may have resumed on another slot since then.
+        let displaced = old.filter(|old| old.state == GenerationState::Live).map(|old| old.key.conversation);
+        let miss = previous.is_some() && !reused;
+        if !miss && !matches!(self.open(key.conversation, key.attempt, key.seq, start), OpenOutcome::Riservato { libera: None }) {
+            return GenerationOpen::Stale;
+        }
+        let state = if miss { GenerationState::Miss { position: start } } else { GenerationState::Live };
+        self.generations.insert(key.seq, Generation { key, start, previous, state });
+        if miss {
+            GenerationOpen::Miss { displaced, retired }
+        } else {
+            GenerationOpen::Ready { displaced, retired, reused }
+        }
+    }
+
+    pub fn live_key(&self, conversation: u64, attempt: u32) -> Option<SlotKey> {
+        let (_, seq) = self.slot(conversation)?;
+        self.generations.get(&seq).filter(|g| {
+            g.key.conversation == conversation && g.key.attempt == attempt && g.state == GenerationState::Live
+        }).map(|g| g.key)
+    }
+
+    pub fn invalidate_open(&mut self, key: SlotKey, position: u32) {
+        if self.close_generation(key, None) {
+            self.generations.get_mut(&key.seq).unwrap().state = GenerationState::Miss { position };
+        }
+    }
+
+    /// Retire this generation once. Duplicate closes must not extend its deadline.
+    pub fn close_generation(&mut self, key: SlotKey, park: Option<(u32, Duration)>) -> bool {
+        if self.live_key(key.conversation, key.attempt) != Some(key) {
+            return false;
+        }
+        self.close(key.conversation, key.attempt);
+        self.generations.get_mut(&key.seq).unwrap().state = match park {
+            Some((position, ttl)) => GenerationState::Parked { position, until: self.orologio.adesso() + ttl },
+            None => GenerationState::Closed,
+        };
+        true
+    }
+
+    pub fn expire_parked(&mut self) -> Vec<u32> {
+        let now = self.orologio.adesso();
+        self.generations.values_mut().filter_map(|g| {
+            if matches!(g.state, GenerationState::Parked { until, .. } if now >= until) {
+                g.state = GenerationState::Closed;
+                Some(g.key.seq)
+            } else {
+                None
+            }
+        }).collect()
+    }
+
+    pub fn reset(&mut self) -> Vec<u32> {
+        self.conv.clear();
+        self.proprietari.clear();
+        self.generations.drain().map(|(seq, _)| seq).collect()
     }
 
     /// Change the age limit and cap for remembered closed conversations. Defaults usually suffice.
@@ -377,28 +518,33 @@ impl<C: Clock> Slots<C> {
     /// Free expired slots and set their watermarks to the slot attempts. The caller clears memory and sends
     /// an error `Confirmation` to the head.
     pub fn scadenze(&mut self) -> Vec<Scaduto> {
-        let scaduti = self.expire_except(|_, _| false);
+        let scaduti = self.expire_except(|_, _, _| false);
         self.pulisci();
         scaduti
     }
 
-    pub fn expire_except(&mut self, pending: impl Fn(u64, u32) -> bool) -> Vec<Scaduto> {
+    pub fn expire_except(&mut self, pending: impl Fn(u64, u32, u64) -> bool) -> Vec<Scaduto> {
         let adesso = self.orologio.adesso();
         let mut v = Vec::new();
         // Closed conversations can outnumber occupied slots by orders of magnitude.
         self.proprietari.retain(|&seq, &mut (id, tentativo)| {
             let c = self.conv.get_mut(&id).unwrap();
             let p = c.slot.unwrap();
-            if adesso < p.scadenza || pending(id, tentativo) {
+            let generation = self.generations.get(&seq).map_or(0, |g| g.key.generation);
+            if adesso < p.scadenza || pending(id, tentativo, generation) {
                 return true;
             }
             c.last = adesso;
             c.watermark = c.watermark.max(tentativo);
             c.slot = None;
+            if let Some(g) = self.generations.get_mut(&seq) {
+                g.state = GenerationState::Closed;
+            }
             v.push(Scaduto {
                 conversation_id: id,
                 liberato: Freed { seq, tentativo },
                 era_riservato: p.state == Status::Riservato,
+                generation,
             });
             false
         });
@@ -415,6 +561,116 @@ mod test {
 
     fn slots() -> Slots<ManualClock> {
         Slots::new(ManualClock::default(), Deadlines { riserva: 30 * S, inattivo: 120 * S })
+    }
+
+    fn key(conversation: u64, generation: u64) -> SlotKey {
+        SlotKey { seq: 0, generation, conversation, attempt: 1 }
+    }
+
+    #[test]
+    fn parked_generation_is_claimed_once_and_fences_late_work() {
+        let mut slots = slots();
+        let first = key(1, 1);
+        let second = key(2, 2);
+        assert_eq!(slots.open_generation(first, 0, None), GenerationOpen::Ready { displaced: None, retired: None, reused: false });
+        assert_eq!(slots.block(1, 1, 0, 20), WorkOutcome::Compute);
+        assert!(slots.close_generation(first, Some((10, 900 * S))));
+        assert_eq!(slots.live_key(1, 1), None);
+        assert_eq!(slots.open_generation(second, 10, Some(first)), GenerationOpen::Ready { displaced: None, retired: None, reused: true });
+        assert_eq!(slots.open_generation(second, 10, Some(first)), GenerationOpen::Duplicate);
+        assert_eq!(slots.open_generation(first, 0, None), GenerationOpen::Stale);
+        assert!(!slots.close_generation(first, None));
+        assert_eq!(slots.live_key(2, 1), Some(second));
+        assert_eq!(slots.block(2, 1, 10, 3), WorkOutcome::Compute);
+        assert_eq!(slots.block(2, 1, 10, 3), WorkOutcome::Duplicate);
+        assert_eq!(slots.step(1, 1, 20), WorkOutcome::Discarded);
+    }
+
+    #[test]
+    fn duplicate_close_does_not_extend_parking_and_expiry_is_silent() {
+        let mut slots = slots();
+        let first = key(1, 1);
+        slots.open_generation(first, 0, None);
+        assert!(slots.close_generation(first, Some((10, 900 * S))));
+        slots.orologio().avanza(899 * S);
+        assert!(slots.expire_parked().is_empty());
+        assert!(!slots.close_generation(first, Some((10, 900 * S))));
+        slots.orologio().avanza(S);
+        assert_eq!(slots.expire_parked(), vec![first.seq]);
+        assert!(slots.scadenze().is_empty());
+        assert_eq!(slots.open_generation(first, 0, None), GenerationOpen::Stale);
+        let next = key(2, 2);
+        assert_eq!(slots.open_generation(next, 10, Some(first)), GenerationOpen::Miss { displaced: None, retired: None });
+        assert_eq!(slots.open_generation(next, 10, Some(first)), GenerationOpen::DuplicateMiss { position: 10 });
+        let replay = SlotKey { generation: 3, attempt: 2, ..next };
+        assert_eq!(slots.open_generation(replay, 0, None), GenerationOpen::Ready { displaced: None, retired: None, reused: false });
+        assert_eq!(slots.block(2, 2, 0, 3), WorkOutcome::Compute);
+    }
+
+    #[test]
+    fn bad_previous_generation_and_lost_close_require_a_cold_open() {
+        for park in [false, true] {
+            let mut slots = slots();
+            let first = key(1, 1);
+            slots.open_generation(first, 0, None);
+            if park {
+                slots.close_generation(first, Some((10, 900 * S)));
+            }
+            let previous = SlotKey { attempt: if park { 2 } else { 1 }, ..first };
+            assert!(matches!(slots.open_generation(key(2, 2), 10, Some(previous)), GenerationOpen::Miss { .. }));
+            assert_eq!(slots.live_key(first.conversation, first.attempt), None);
+            let cold = key(3, 3);
+            assert!(matches!(slots.open_generation(cold, 0, None), GenerationOpen::Ready { reused: false, .. }));
+            assert_eq!(slots.reset(), vec![first.seq]);
+            assert_eq!(slots.live_key(cold.conversation, cold.attempt), None);
+        }
+    }
+
+    #[test]
+    fn duplicate_open_reports_the_original_checkpoint_failure() {
+        let mut slots = slots();
+        let first = key(1, 1);
+        slots.open_generation(first, 0, None);
+        slots.invalidate_open(first, 20);
+        assert_eq!(slots.open_generation(first, 0, None), GenerationOpen::DuplicateMiss { position: 20 });
+        assert_eq!(slots.live_key(first.conversation, first.attempt), None);
+    }
+
+    #[test]
+    fn recycling_a_closed_slot_leaves_a_resumed_conversation_alone() {
+        let mut slots = slots();
+        let original = key(1, 1);
+        slots.open_generation(original, 0, None);
+        slots.close_generation(original, None);
+        let resumed = SlotKey { seq: 1, generation: 2, attempt: 2, ..original };
+        slots.open_generation(resumed, 0, None);
+        assert_eq!(slots.open_generation(key(2, 3), 0, None), GenerationOpen::Ready { displaced: None, retired: None, reused: false });
+        assert_eq!(slots.live_key(1, 2), Some(resumed));
+    }
+
+    #[test]
+    fn a_new_attempt_retires_the_old_slot_when_close_is_lost() {
+        let mut slots = slots();
+        let first = key(1, 1);
+        assert!(matches!(slots.open_generation(first, 0, None), GenerationOpen::Ready { .. }));
+
+        let same_attempt = SlotKey { seq: 1, ..first };
+        assert_eq!(slots.open_generation(same_attempt, 0, None), GenerationOpen::Stale);
+        assert_eq!(slots.live_key(1, 1), Some(first));
+
+        let next = SlotKey { attempt: 2, ..same_attempt };
+        assert_eq!(slots.open_generation(next, 0, None), GenerationOpen::Ready {
+            displaced: None, retired: Some(first), reused: false,
+        });
+        assert_eq!(slots.proprietario(first.seq), None);
+        assert_eq!(slots.live_key(1, 2), Some(next));
+        assert_eq!(slots.open_generation(first, 0, None), GenerationOpen::Stale);
+        assert!(!slots.close_generation(first, Some((10, 900 * S))));
+        assert_eq!(slots.step(1, 1, 0), WorkOutcome::Discarded);
+        assert_eq!(slots.open_generation(key(2, 2), 0, None), GenerationOpen::Ready {
+            displaced: None, retired: None, reused: false,
+        });
+        assert_eq!(slots.live_key(1, 2), Some(next));
     }
 
     // Slot transitions, expiry, and attempt ordering.
@@ -605,7 +861,7 @@ mod test {
         assert!(p.scadenze().is_empty());
         p.orologio().avanza(1 * S);
         let s = p.scadenze();
-        assert_eq!(s, vec![Scaduto { conversation_id: 7, liberato: Freed { seq: 2, tentativo: 1 }, era_riservato: true }]);
+        assert_eq!(s, vec![Scaduto { conversation_id: 7, liberato: Freed { seq: 2, tentativo: 1 }, era_riservato: true, generation: 0 }]);
         assert_eq!(p.watermark(7), 1);
         assert_eq!(p.slot(7), None);
         assert_eq!(p.open(7, 1, 2, 0), OpenOutcome::Scartato);
@@ -681,7 +937,7 @@ mod test {
         slots.open(3, 1, 2, 0);
         clock.avanza(35 * S);
         let pending = [(1, 2), (2, 2)];
-        let expired = slots.expire_except(|id, attempt| pending.contains(&(id, attempt)));
+        let expired = slots.expire_except(|id, attempt, _| pending.contains(&(id, attempt)));
         assert_eq!(expired.iter().map(|slot| slot.conversation_id).collect::<Vec<_>>(), [2, 3]);
         assert_eq!(slots.block(1, 2, 0, 16), WorkOutcome::Compute);
         assert!(slots.scadenze().is_empty());

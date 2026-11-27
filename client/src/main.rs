@@ -26,7 +26,7 @@ use sock::Socket;
 use status::Status;
 
 const CHAT_URL: &str = "https://publicompute.com/chat";
-const USAGE: &str = "usage: publicompute [--data-dir DIR | --socket FILE] [--version | version | status [--json] | use <model> [--quant Q] | free | pause | start | uninstall [--keep-models | --remove-models] | login | logout | chat [-v] [--model ID] [--api URL] [\"question\"]]";
+const USAGE: &str = "usage: publicompute [--data-dir DIR | --socket FILE] [--version | version | status [--json] | use <model> [--quant Q] [--weights-sha256 SHA] | free | pause | start | uninstall [--keep-models | --remove-models] | login | logout | chat [-v] [--model ID] [--api URL] [\"question\"]]";
 const UNINSTALLER: &str = "/opt/publicompute-agent/uninstall.sh";
 
 fn main() {
@@ -116,8 +116,11 @@ fn command_with_uninstaller(
             Ok(v["status"].to_string())
         }
         ["free"] => free_card(socket),
-        ["use", model] => use_model(socket, model, None),
-        ["use", model, "--quant", q] => use_model(socket, model, Some(q)),
+        ["use", model] => use_model(socket, model, None, None),
+        ["use", model, "--quant", q] => use_model(socket, model, Some(q), None),
+        ["use", model, "--weights-sha256", sha] => use_model(socket, model, None, Some(sha)),
+        ["use", model, "--quant", q, "--weights-sha256", sha]
+        | ["use", model, "--weights-sha256", sha, "--quant", q] => use_model(socket, model, Some(q), Some(sha)),
         ["pause"] => switch_pause(socket, true),
         ["start"] => switch_pause(socket, false),
         ["uninstall"] | ["uninstall", "--keep-models" | "--remove-models"] => {
@@ -131,7 +134,11 @@ fn command_with_uninstaller(
 /// Pause or start the card. Asking first lets us tell the user when the card is
 /// already in that state, instead of silently doing nothing.
 fn switch_pause(socket: &Socket, pause: bool) -> Result<String, String> {
-    if sock::get_status(socket)?.paused == pause {
+    let status = sock::get_status(socket)?;
+    if let Some(message) = status.update_message() {
+        return Err(message);
+    }
+    if status.paused == pause {
         if pause {
             sock::set_pause(socket, true)?;
         }
@@ -180,13 +187,13 @@ fn version(socket: &Socket) -> String {
     text
 }
 
-fn use_model(socket: &Socket, model: &str, quant: Option<&str>) -> Result<String, String> {
-    let reply = sock::set_preference(socket, Some(model), quant)?;
+fn use_model(socket: &Socket, model: &str, quant: Option<&str>, weights_sha256: Option<&str>) -> Result<String, String> {
+    let reply = sock::set_preference(socket, Some(model), quant, weights_sha256)?;
     Ok(use_reply_text(&reply, model))
 }
 
 fn free_card(socket: &Socket) -> Result<String, String> {
-    sock::set_preference(socket, None, None)?;
+    sock::set_preference(socket, None, None, None)?;
     Ok("Free card: set".into())
 }
 
@@ -195,14 +202,15 @@ fn use_reply_text(reply: &serde_json::Value, model: &str) -> String {
     reply["text"].as_str().map_or_else(|| format!("using {model}"), str::to_owned)
 }
 
-fn clear_finished_switch(status: &Status, pending: &mut Option<(String, String)>, notice: &mut String) {
-    if let Some((id, quant)) = pending {
+fn clear_finished_switch(status: &Status, pending: &mut Option<sock::LocalModel>, notice: &mut String) {
+    if let Some(selected) = pending {
         // The switch is done once the weights are verified: in a chain the
         // stage loads only when the scheduler assigns one.
         let ready = |model: &Option<String>, q: &Option<String>| {
-            model.as_ref() == Some(id) && q.as_ref().is_none_or(|got| got == quant)
+            model.as_ref() == Some(&selected.id) && q.as_ref().is_none_or(|got| got == &selected.quant)
         };
         if status.download.is_none()
+            && selected.weights_sha256.as_ref().is_none_or(|sha| status.weights_sha256.as_ref() == Some(sha))
             && (ready(&status.loaded_model, &status.loaded_quant) || ready(&status.weights_model, &status.weights_quant))
         {
             *pending = None;
@@ -363,10 +371,10 @@ fn interactive(socket: &Socket) -> std::io::Result<()> {
                         KeyCode::Char(c) => match c.to_digit(10).filter(|d| *d >= 1 && *d as usize <= picking.len()) {
                             Some(d) => {
                                 let m = &picking[d as usize - 1];
-                                match sock::set_preference(socket, Some(&m.id), Some(&m.quant)) {
+                                match sock::set_preference(socket, Some(&m.id), Some(&m.quant), m.weights_sha256.as_deref()) {
                                     Ok(reply) => {
                                         if matches!(reply["state"].as_str(), Some("switching" | "downloading")) {
-                                            pending_switch = Some((m.id.clone(), m.quant.clone()));
+                                            pending_switch = Some(m.clone());
                                         }
                                         use_reply_text(&reply, &m.id)
                                     }
@@ -384,11 +392,21 @@ fn interactive(socket: &Socket) -> std::io::Result<()> {
                 pending_switch = None;
                 match k.code {
                     _ if quit_key(k) => return Ok(()),
+                    KeyCode::Char('u') | KeyCode::Char('U') if status.as_ref().and_then(|s| s.update_message()).is_some() => {
+                        notice = format!("! {}", status.as_ref().and_then(|s| s.update_message()).unwrap_or_default());
+                    }
                     KeyCode::Char('u') | KeyCode::Char('U') if status.is_some() => match sock::get_models(socket) {
                         Ok(m) if m.is_empty() => notice = "no models installed".into(),
                         Ok(m) => {
-                            let list: Vec<String> =
-                                m.iter().enumerate().map(|(i, x)| format!("[{}] {} {}", i + 1, x.id, x.quant)).collect();
+                            let list: Vec<String> = m.iter().enumerate().map(|(i, x)| {
+                                let mut label = format!("[{}] {} {}", i + 1, x.id, x.quant);
+                                if m.iter().filter(|other| other.id == x.id && other.quant == x.quant).nth(1).is_some() {
+                                    if let Some(sha) = x.weights_sha256.as_deref().and_then(|h| h.get(..8)) {
+                                        label.push_str(&format!(" ({sha})"));
+                                    }
+                                }
+                                label
+                            }).collect();
                             notice = format!("Use which model?  {}  (any other key cancels)", list.join("  "));
                             picking = m;
                         }

@@ -20,7 +20,7 @@ const STEP_ROW_OVERHEAD: usize = 64;
 pub const CONTROL_INGRESS_BYTES: usize = 3 * MAX_FRAME_SIZE + INGRESS_EVENT_OVERHEAD;
 
 // Peers must agree on which slot IDs exist in each group.
-pub const WIRE_VERSION: (u32, u32) = (1, 0);
+pub const WIRE_VERSION: (u32, u32) = (2, 0);
 
 // Time limits cover connection setup, stalled writes, and optional idle
 // reads. A silent stream may be healthy while no work is active, so idle
@@ -93,9 +93,9 @@ pub fn msg(c: Body) -> pb::Message {
     pb::Message { body: Some(c) }
 }
 
-/// Keep opens, prefill blocks, and closes on one stream. TCP preserves
+/// Keep resets, opens, prefill blocks, and closes on one stream. TCP preserves
 /// order only within one connection, so a close sent elsewhere could arrive
-/// after the open that reuses its slot. Generation carries Passo messages.
+/// after the open that reuses its slot.
 pub fn on_generation_stream(c: &Body) -> bool {
     matches!(c, Body::Step(_))
 }
@@ -242,10 +242,10 @@ fn check_ingress(mut payload: &[u8], stream: pb::Stream, n_batch: usize) -> Resu
     while !payload.is_empty() {
         let (tag, wire) = decode_key(&mut payload)?;
         match (stream, tag) {
-            (pb::Stream::Prefill, 3 | 4 | 8) |
+            (pb::Stream::Prefill, 3 | 4 | 8 | 9) |
             (pb::Stream::Generation, 5) |
             (pb::Stream::Control, 7) => seen = true,
-            (_, 1..=8) => return Err(prost::DecodeError::new("unexpected message on stage stream")),
+            (_, 1..=9) => return Err(prost::DecodeError::new("unexpected message on stage stream")),
             _ => {}
         }
         if !matches!((stream, tag), (pb::Stream::Generation, 5) | (pb::Stream::Prefill, 4)) {
@@ -1061,6 +1061,9 @@ mod test {
         check_ingress(&step, pb::Stream::Generation, 3).unwrap();
         let confirmation = msg(Body::Confirmation(pb::Confirmation::default())).encode_to_vec();
         check_ingress(&confirmation, pb::Stream::Control, 0).unwrap();
+        let reset = msg(Body::Reset(pb::Reset { chain_epoch: 7 })).encode_to_vec();
+        check_ingress(&reset, pb::Stream::Prefill, 0).unwrap();
+        assert!(check_ingress(&reset, pb::Stream::Generation, 0).is_err());
     }
 
     #[test]
@@ -1409,6 +1412,9 @@ mod test {
                     stream_count: 0,
                     token: Vec::new(),
                     draft_count: u32::MAX,
+                    save_checkpoint: true,
+                    slot: u32::MAX,
+                    slot_generation: u64::MAX,
                 }))
             };
             assert!(encode(&block(n)).is_ok(), "width {width}, {format:?}: {n} tokens should fit");
@@ -1582,15 +1588,15 @@ mod test {
         let t = std::thread::spawn(move || {
             let (s, _) = l.accept().unwrap();
             let (f, mut lett, mut w) = read_hello(s).unwrap();
-            assert_eq!(f, pb::Stream::Generation);
+            assert_eq!(f, pb::Stream::Prefill);
             assert_eq!(lett.epoca_hello, 7, "the acceptor should see the epoch from Hello");
             ack_ok(&mut w).unwrap();
             let m = lett.read().unwrap().unwrap();
             let _ = write_sync(&mut w, &m);
         });
-        let (mut lett, w) = connect(&addr, pb::Stream::Generation, Duration::from_secs(5), 7).unwrap();
+        let (mut lett, w) = connect(&addr, pb::Stream::Prefill, Duration::from_secs(5), 7).unwrap();
         let sc = Writer::new(w, "test");
-        let m = msg(Body::Close(pb::Close { conversation_id: 9, attempt_id: 2 }));
+        let m = msg(Body::Close(pb::Close { conversation_id: 9, attempt_id: 2, slot: 0, slot_generation: 3, keep_parked: true }));
         sc.send(&m).unwrap();
         let eco = lett.read().unwrap().unwrap();
         assert_eq!(eco, m);
@@ -1599,12 +1605,12 @@ mod test {
     }
 
     #[test]
-    fn rejects_hello_from_peer_with_padded_slot_groups() {
+    fn rejects_previous_protocol_major() {
         let listener = listen("127.0.0.1:0").unwrap();
         let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let hello = msg(Body::Hello(pb::Hello {
-            protocol_major: 0,
-            protocol_minor: 1,
+            protocol_major: 1,
+            protocol_minor: 0,
             stream: pb::Stream::Prefill as i32,
             epoch: 1,
             mtp: false,

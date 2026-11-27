@@ -27,7 +27,7 @@ mod session;
 mod stages;
 mod transport;
 
-use std::{io::Read, path::PathBuf, sync::Arc, time::Duration};
+use std::{io::Read, path::{Path, PathBuf}, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
@@ -255,7 +255,12 @@ enum Command {
     CoordinatorCheck,
     /// Save the installer's choice while the service is stopped.
     #[command(hide = true)]
-    InstallPreference { choice: String },
+    InstallPreference {
+        choice: String,
+        /// Select a manifest variant by the hexadecimal SHA-256 of its weights.
+        #[arg(long)]
+        weights_sha256: Option<String>,
+    },
     /// Copy service-owned preference state to the installer's snapshot.
     #[cfg(target_os = "linux")]
     #[command(hide = true)]
@@ -285,6 +290,7 @@ fn main() {
 
 fn run_command(args: Args) -> Result<i32> {
     let local = if args.command.is_none() {
+        stages::validate_extra_args(&args.stage_args)?;
         if args.ca.is_none() {
             bail!("--ca is required for the coordinator QUIC certificate");
         }
@@ -311,7 +317,9 @@ fn run_command(args: Args) -> Result<i32> {
                 println!("Coordinator reachable over QUIC");
                 Ok(0)
             }
-            Some(Command::InstallPreference { choice }) => install_preference(&args.data_dir, choice).map(|()| 0),
+            Some(Command::InstallPreference { choice, weights_sha256 }) => {
+                install_preference(&args.data_dir, choice, weights_sha256.as_deref().or(args.weights_sha256.as_deref())).map(|()| 0)
+            }
             #[cfg(target_os = "linux")]
             Some(Command::BackupPreference { name }) => backup_preference(&args.data_dir, name),
             #[cfg(target_os = "linux")]
@@ -327,18 +335,21 @@ fn run_command(args: Args) -> Result<i32> {
     result
 }
 
-fn install_preference(data_dir: &std::path::Path, choice: &str) -> Result<()> {
+fn install_preference(data_dir: &std::path::Path, choice: &str, weights_sha256: Option<&str>) -> Result<()> {
     let id = match choice {
         "free" => None,
         "medio" => Some("qwen3.6-35b-a3b"),
         "deepseek" => Some("deepseek-v4-flash"),
         _ => bail!("expected medio, deepseek or free"),
     };
+    if id.is_none() && weights_sha256.is_some() {
+        bail!("--weights-sha256 requires a model choice");
+    }
     // Use the same lock as the service so a running agent cannot overwrite the choice.
     let _lock = control::Live::open(data_dir)?;
     let mut model = None;
     if let Some(id) = id {
-        let entry = models::find(id, None).context("installer model is absent from the manifest")?;
+        let entry = models::select(id, None, weights_sha256).context("installer model variant is absent from the manifest")?;
         let store = models::Store::new(data_dir);
         store.prepare()?;
         println!("{id} needs {:.1} GiB of disk space for its weights.", models::gib(entry.bytes));
@@ -347,7 +358,7 @@ fn install_preference(data_dir: &std::path::Path, choice: &str) -> Result<()> {
             None => Ok(()),
         });
         match space {
-            Ok(()) => model = Some(ModelSelection { id: entry.id.clone(), quant: entry.quant.clone() }),
+            Ok(()) => model = Some(entry.into()),
             Err(err) => eprintln!("Cannot prepare {id}: {err:#}. Keeping the card free. Use publicompute use when ready."),
         }
     }
@@ -423,6 +434,20 @@ fn read_owner_token(file: Option<&std::path::Path>, fallback: Option<String>) ->
     Ok(Some(token.to_string()))
 }
 
+async fn check_stage_release(bin: &Path) -> Result<()> {
+    // The release in Hello represents both the agent and its installed stage.
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new(bin).arg("--version").kill_on_drop(true).output(),
+    ).await;
+    if !matches!(output, Ok(Ok(out)) if out.status.success()
+        && String::from_utf8_lossy(&out.stdout).trim() == concat!("publicompute-stage ", env!("CARGO_PKG_VERSION")))
+    {
+        bail!("{} must be publicompute-stage {}", bin.display(), env!("CARGO_PKG_VERSION"));
+    }
+    Ok(())
+}
+
 async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Live>) -> Result<i32> {
     // An externally managed engine can keep serving its old weights after this agent restarts.
     let can_switch = cfg!(unix) && !matches!((args.engine, args.llama_mode), (EngineArg::Llama, LlamaMode::External));
@@ -449,16 +474,22 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
         None if from_store && args.selected_model.is_none() => PreferenceMode::Free,
         None => PreferenceMode::Usage,
     };
-    let selected = |model: &ModelRef, override_model: Option<&str>| match override_model {
-        Some(m) => match m.split_once(':') {
-            Some((id, quant)) => ModelSelection { id: id.into(), quant: quant.into() },
-            None if model.model_id.is_empty() => ModelSelection {
-                id: m.into(),
-                quant: models::find(m, None).map_or_else(|| model.quantization.clone(), |entry| entry.quant.clone()),
-            },
-            None => ModelSelection { id: m.into(), quant: model.quantization.clone() },
-        },
-        None => ModelSelection { id: model.model_id.clone(), quant: model.quantization.clone() },
+    let selected = |model: &ModelRef, override_model: Option<&str>| {
+        let Some(name) = override_model else { return ModelSelection::from(model) };
+        let (id, quant) = name.split_once(':').unwrap_or_else(|| {
+            let quant = if model.model_id.is_empty() {
+                models::find(name, None).map_or(model.quantization.as_str(), |entry| entry.quant.as_str())
+            } else {
+                &model.quantization
+            };
+            (name, quant)
+        });
+        if id == model.model_id && quant == model.quantization {
+            ModelSelection::from(model)
+        } else {
+            let selection = ModelSelection { id: id.into(), quant: quant.into(), weights_sha256: None };
+            selection.manifest_entry().map_or(selection, ModelSelection::from)
+        }
     };
     let contribution = Contribution::open(&args.data_dir, Preference {
         modo: mode,
@@ -488,6 +519,14 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
     tokio::spawn(inoltra_segnali(segnali_tx));
     tokio::spawn(arresto(segnali_rx, uscita_tx, stop_tx, session::ATTESA_USCITA + Duration::from_secs(5)));
 
+    if let Some(bin) = &args.stage_bin {
+        if let Err(error) = check_stage_release(bin).await {
+            control.require_update(error.to_string());
+            let _ = uscita_rx.wait_for(|stop| *stop).await;
+            return Ok(0);
+        }
+    }
+
     let configured_path = args.model_path.clone();
     let restore = store.is_some();
     let requested = from_store.then(|| startup_preference.clone());
@@ -515,7 +554,7 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
         let preference = contribution.preference();
         if preference.revision == startup_preference.revision {
             if model.model_id.is_empty() && preference.modo == PreferenceMode::Usage {
-                let requested = preference.model.as_ref().and_then(|m| models::find(&m.id, Some(&m.quant)));
+                let requested = preference.model.as_ref().and_then(ModelSelection::manifest_entry);
                 if requested.is_none() {
                     // A preference from an older release may name weights we no longer serve.
                     contribution.imposta(PreferenceMode::Free, None)?;
@@ -797,7 +836,7 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
         contribution,
         gpu: telemetria_gpu,
         model_path: args.model_path.clone(),
-        output: uscita_rx,
+        output: uscita_rx.clone(),
         live,
         model_store: store,
     };
@@ -805,10 +844,21 @@ async fn run(mut args: Args, listener: control::Listener, live: Arc<control::Liv
 
     let live = cfg.live.clone();
     let result = connect_loop(&args, &t, cfg, &engine, &shared, stop_rx).await;
+    let blocked = match &result {
+        Err(error) if error.is::<session::IncompatibleRelease>() => {
+            control.require_update(error.to_string());
+            true
+        }
+        _ => false,
+    };
     if let Some(p) = &bridge {
         p.close().await;
     }
     sup.shutdown().await;
+    if blocked {
+        let _ = uscita_rx.wait_for(|stop| *stop).await;
+        return Ok(0);
+    }
     result?;
     Ok(if live.changes.committed() { MODEL_SWITCH_EXIT_CODE } else { 0 })
 }
@@ -848,7 +898,7 @@ async fn connect_loop(
                 }
             }
             session::SessionEnd::Banned => bail!("coordinator banned this node"),
-            session::SessionEnd::TroppoVecchio(msg) => bail!("{msg}"),
+            session::SessionEnd::IncompatibleRelease(error) => return Err(error.into()),
             session::SessionEnd::Unauthenticated => {
                 warn!("coordinator did not recognize the node; enrolling again");
                 identity::forget(&args.data_dir)?;
@@ -933,6 +983,7 @@ async fn connect(
                 };
                 match result {
                     Ok(id) => id,
+                    Err(e) if e.is::<session::IncompatibleRelease>() => return Err(e),
                     Err(e) => {
                         warn!("enrollment failed: {e:#}");
                         sleep_or_stop(stop_rx, &cfg.output, backoff).await;
@@ -1035,9 +1086,9 @@ fn verify_startup_weights(
 ) -> Result<StartupWeights> {
     let mut error = None;
     if restore {
-        match store.active(|active| preference.is_none_or(|pref| {
+        match store.active(|model, active| preference.is_none_or(|pref| {
             pref.modo == PreferenceMode::Free || active.use_revision == Some(pref.revision)
-                || pref.model.as_ref().is_none_or(|m| m.id == active.id && m.quant == active.quant)
+                || pref.model.as_ref().is_none_or(|m| m.manifest_entry().is_some_and(|selected| std::ptr::eq(selected, model)))
         })) {
             Ok(Some((model, active))) => return Ok(StartupWeights {
                 model: model.reference(), path: Some(store.path(model)), restored: Some(active), error: None, needs_repair: false,
@@ -1146,6 +1197,81 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn manifest_selects_variant_by_sha256() {
+        let dir = stages::tests::tempdir("install-variant");
+        let store = models::Store::new(&dir);
+        store.prepare().unwrap();
+        let base = models::find("qwen3.6-35b-a3b", None).unwrap();
+        let sha = "55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1";
+        let draft = models::find_by_sha256(&base.id, Some(&base.quant), sha).unwrap();
+        assert_eq!(draft.bytes, 22_853_663_008);
+        assert_eq!(draft.file, "qwen3.6-35b-a3b-mtp-UD-Q4_K_XL.gguf");
+        assert_ne!(store.path(base), store.path(draft));
+        assert_ne!(store.partial(base), store.partial(draft));
+        for (model, partial) in [(base, 1), (draft, 3)] {
+            std::fs::File::create(store.partial(model)).unwrap().set_len(partial).unwrap();
+            assert_eq!(store.download_size(model).unwrap(), Some(model.bytes - partial));
+            models::tests::cached_weights(&store, model);
+        }
+        let uppercase = sha.to_ascii_uppercase();
+        let args = Args::try_parse_from([
+            "publicompute-agent", "--data-dir", dir.to_str().unwrap(), "install-preference", "medio",
+            "--weights-sha256", &uppercase,
+        ]).unwrap();
+        assert_eq!(run_command(args).unwrap(), 0);
+        let initial = Preference { modo: PreferenceMode::Free, model: None, revision: 0 };
+        let saved = Contribution::open(&dir, initial.clone()).unwrap().preference();
+        assert_eq!(saved.model.as_ref().unwrap().weights_sha256.as_deref(), Some(sha));
+
+        store.save_active(base, None).unwrap();
+        let restarted = models::Store::new(&dir);
+        let configured = || Ok(ModelRef::default());
+        let stale = verify_startup_weights(&restarted, true, configured(), None, Some(&saved)).unwrap();
+        assert!(stale.path.is_none());
+        store.save_active(draft, None).unwrap();
+        let saved = Contribution::open(&dir, initial).unwrap();
+        let weights = verify_startup_weights(&restarted, true, configured(), None, Some(&saved.preference())).unwrap();
+        assert_eq!(weights.path, Some(store.path(draft)));
+        assert_eq!(weights.model, draft.reference());
+        assert_eq!(saved.to_proto(&[base.reference(), weights.model]).model, Some(draft.reference()));
+        for model in [base, draft] {
+            // A cancelled verification only succeeds if both fingerprints survived in the cache.
+            restarted.verify(model, || false).unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn old_preference_without_sha256_selects_base_weights() {
+        let dir = stages::tests::tempdir("install-legacy-preference");
+        let store = models::Store::new(&dir);
+        store.prepare().unwrap();
+        let base = models::find("qwen3.6-35b-a3b", None).unwrap();
+        let draft = models::MANIFEST.iter().find(|m| m.id == base.id && m.sha256 != base.sha256).unwrap();
+        for model in [base, draft] {
+            models::tests::cached_weights(&store, model);
+        }
+        std::fs::write(dir.join("contributo.json"), br#"{
+            "modo":"uso","modello":{"id":"qwen3.6-35b-a3b","quant":"UD-Q4_K_XL"},"revisione":123
+        }"#).unwrap();
+        let initial = Preference { modo: PreferenceMode::Free, model: None, revision: 0 };
+        let saved = Contribution::open(&dir, initial).unwrap();
+        assert_eq!(saved.to_proto(&[draft.reference(), base.reference()]).model, Some(base.reference()));
+        assert!(saved.to_proto(&[draft.reference()]).model.unwrap().weights_sha256.is_empty());
+        let configured = || Ok(ModelRef::default());
+        store.save_active(draft, None).unwrap();
+        assert!(verify_startup_weights(&store, true, configured(), None, Some(&saved.preference())).unwrap().path.is_none());
+
+        std::fs::write(dir.join("active-model.json"), br#"{"id":"qwen3.6-35b-a3b","quant":"UD-Q4_K_XL"}"#).unwrap();
+        let weights = verify_startup_weights(&store, true, configured(), None, Some(&saved.preference())).unwrap();
+        assert_eq!(weights.path, Some(store.path(base)));
+        assert_eq!(weights.model, base.reference());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn installer_choice_takes_priority_over_a_previous_switch() {
         let dir = stages::tests::tempdir("install-preference");
         let store = models::Store::new(&dir);
@@ -1183,6 +1309,17 @@ mod tests {
         assert!(preference.model.is_none());
         assert!(store.installed(deepseek).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_rejects_forbidden_stage_args() {
+        for flag in ["--model", "--cache-type-k", "--cache-type-v", "--flash-attn", "--draft-max-tokens", "--draft-source", "--mtp"] {
+            let args = Args::try_parse_from([
+                "publicompute-agent", "--ca", "ca.pem", "--stage-arg", &format!("{flag}=x"),
+            ]).unwrap();
+            let err = run_command(args).unwrap_err().to_string();
+            assert!(err.contains(flag), "{flag}: {err}");
+        }
     }
 
     #[test]

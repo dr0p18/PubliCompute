@@ -51,6 +51,30 @@ impl PreferenceMode {
 pub struct ModelSelection {
     pub id: String,
     pub quant: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights_sha256: Option<String>,
+}
+
+impl ModelSelection {
+    pub fn manifest_entry(&self) -> Option<&'static crate::models::Model> {
+        crate::models::select(&self.id, Some(&self.quant), self.weights_sha256.as_deref())
+    }
+}
+
+impl From<&crate::models::Model> for ModelSelection {
+    fn from(model: &crate::models::Model) -> Self {
+        Self { id: model.id.clone(), quant: model.quant.clone(), weights_sha256: Some(model.sha256.clone()) }
+    }
+}
+
+impl From<&ModelRef> for ModelSelection {
+    fn from(model: &ModelRef) -> Self {
+        Self {
+            id: model.model_id.clone(),
+            quant: model.quantization.clone(),
+            weights_sha256: (!model.weights_sha256.is_empty()).then(|| hex::encode(&model.weights_sha256)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -155,13 +179,19 @@ impl Contribution {
 
 pub fn preference_to_proto(p: &Preference, inventory: &[ModelRef]) -> ContributionPreference {
     let model = match (p.modo, &p.model) {
-        (PreferenceMode::Usage, Some(m)) => Some(
-            inventory
+        (PreferenceMode::Usage, Some(m)) => {
+            // A preference saved before variants refers to the default manifest entry.
+            let sha = m.weights_sha256.as_deref().or_else(|| m.manifest_entry().map(|model| model.sha256.as_str()));
+            let expected = sha.map(hex::decode);
+            Some(inventory
                 .iter()
-                .find(|r| r.model_id == m.id && r.quantization == m.quant)
+                .find(|r| {
+                    r.model_id == m.id && r.quantization == m.quant
+                        && expected.as_ref().is_none_or(|hash| hash.as_ref().is_ok_and(|hash| *hash == r.weights_sha256))
+                })
                 .cloned()
-                .unwrap_or(ModelRef { model_id: m.id.clone(), quantization: m.quant.clone(), weights_sha256: vec![] }),
-        ),
+                .unwrap_or(ModelRef { model_id: m.id.clone(), quantization: m.quant.clone(), weights_sha256: vec![] }))
+        }
         _ => None,
     };
     ContributionPreference { mode: p.modo.to_proto() as i32, model, revision: p.revision }
@@ -199,7 +229,7 @@ mod tests {
     }
 
     fn usage(id: &str) -> Preference {
-        Preference { modo: PreferenceMode::Usage, model: Some(ModelSelection { id: id.into(), quant: "Q4_K_M".into() }), revision: 0 }
+        Preference { modo: PreferenceMode::Usage, model: Some(ModelSelection { id: id.into(), quant: "Q4_K_M".into(), weights_sha256: None }), revision: 0 }
     }
 
     #[test]
@@ -241,7 +271,7 @@ mod tests {
         let d = temp_dir("align");
         let c = Contribution::open(&d, usage("qwen-old")).unwrap();
         let old = c.preference();
-        let medium = ModelSelection { id: "qwen-medium".into(), quant: "Q4_K_M".into() };
+        let medium = ModelSelection { id: "qwen-medium".into(), quant: "Q4_K_M".into(), weights_sha256: None };
         c.align_model(medium.clone()).unwrap();
         let aligned = c.preference();
         assert_eq!(aligned.model.as_ref(), Some(&medium));

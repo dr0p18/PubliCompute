@@ -279,6 +279,16 @@ impl Conversation {
         Ok(vec![Action::Open { tentativo: self.tentativo, start_position: 0 }])
     }
 
+    /// A failed cache check occurs before any token of this attempt. Replay
+    /// its full prefix on a fresh attempt without spending the fault budget.
+    pub fn retry_prefill(&mut self, adesso: Duration) -> Outcome {
+        self.vietato(matches!(self.state, Status::Opening | Status::Rebuilding))?;
+        let closed = self.tentativo;
+        self.tentativo += 1;
+        self.accept_incoming(Status::Rebuilding, adesso);
+        Ok(vec![Action::Close { tentativo: closed }, Action::Open { tentativo: self.tentativo, start_position: 0 }])
+    }
+
     /// Start another attempt once the chain is complete. Fail if the recovery
     /// limit is exhausted. A conversation suspended between turns must wake first.
     pub fn chain_ready(&mut self, adesso: Duration) -> Outcome {

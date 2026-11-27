@@ -441,6 +441,8 @@ impl LlamaEngine {
                 token_ids: r.tokens,
                 finish_reason: FinishReason::Cancelled,
                 prompt_tokens: prompt.len() as u32,
+                cached_prompt_tokens: 0,
+                slot_report: None,
                 prompt_tokens_sha256: prompt_tokens_sha256(&prompt),
                 probs,
                 verification_incomplete: true,
@@ -523,6 +525,8 @@ impl LlamaEngine {
             token_ids: r.tokens,
             finish_reason: finish,
             prompt_tokens: prompt.len() as u32,
+            cached_prompt_tokens: 0,
+            slot_report: None,
             prompt_tokens_sha256: prompt_tokens_sha256(prompt),
             probs,
             verification_incomplete,
@@ -639,7 +643,7 @@ impl LlamaEngine {
                 }
                 if let Some(d) = deltas {
                     if !text.is_empty() || !tokens.is_empty() {
-                        d.send(Delta { index: index as u32, text: text.to_string(), token_ids: tokens })?;
+                        d.send(Delta { index: index as u32, text: text.to_string(), token_ids: tokens, ..Default::default() })?;
                     }
                 }
                 if let Some(ps) = v.get("completion_probabilities").filter(|p| p.is_array()) {

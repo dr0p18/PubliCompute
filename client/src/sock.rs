@@ -24,6 +24,7 @@ use crate::status::Status;
 pub struct LocalModel {
     pub id: String,
     pub quant: String,
+    pub weights_sha256: Option<String>,
     #[serde(default)]
     pub loaded: bool,
 }
@@ -207,11 +208,14 @@ pub fn get_models(socket: &Socket) -> Result<Vec<LocalModel>, String> {
     serde_json::from_value(v["models"].clone()).map_err(|e| format!("unexpected model list: {e}"))
 }
 
-pub fn set_preference(socket: &Socket, model: Option<&str>, quant: Option<&str>) -> Result<Value, String> {
-    let req = match model {
+pub fn set_preference(socket: &Socket, model: Option<&str>, quant: Option<&str>, weights_sha256: Option<&str>) -> Result<Value, String> {
+    let mut req = match model {
         Some(m) => json!({"op": "preference", "mode": "use", "model": m, "quant": quant}),
         None => json!({"op": "preference", "mode": "free"}),
     };
+    if let Some(sha) = weights_sha256 {
+        req["weights_sha256"] = json!(sha);
+    }
     request(socket, &req)
 }
 

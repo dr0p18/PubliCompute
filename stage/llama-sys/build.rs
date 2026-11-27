@@ -21,6 +21,7 @@ fn main() {
     });
     let dir = PathBuf::from(dir);
     let header = dir.join("include/llama.h");
+    println!("cargo:rerun-if-changed={}", header.display());
     assert!(header.exists(), "Missing {}: check PUBLICOMPUTE_LLAMA_DIR", header.display());
     assert!(
         PathBuf::from(&lib).join("libllama.so").exists(),

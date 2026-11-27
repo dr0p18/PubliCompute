@@ -34,7 +34,9 @@ fn sample() -> Status {
 #[test]
 fn tui_clears_the_switch_notice_only_after_the_requested_weights_are_loaded() {
     let mut status = sample_json();
-    let mut pending = Some(("qwen3.6-35b-a3b".into(), "UD-Q4_K_XL".into()));
+    let mut pending = Some(sock::LocalModel {
+        id: "qwen3.6-35b-a3b".into(), quant: "UD-Q4_K_XL".into(), weights_sha256: Some("cc".repeat(32)), loaded: false,
+    });
     let mut notice = "switching to qwen3.6-35b-a3b".to_string();
     crate::clear_finished_switch(&serde_json::from_value(status.clone()).unwrap(), &mut pending, &mut notice);
     assert!(!notice.is_empty());
@@ -45,6 +47,11 @@ fn tui_clears_the_switch_notice_only_after_the_requested_weights_are_loaded() {
     assert!(!notice.is_empty());
 
     status["loaded_quant"] = json!("UD-Q4_K_XL");
+    status["weights_sha256"] = json!("bb".repeat(32));
+    crate::clear_finished_switch(&serde_json::from_value(status.clone()).unwrap(), &mut pending, &mut notice);
+    assert!(!notice.is_empty());
+
+    status["weights_sha256"] = json!("cc".repeat(32));
     crate::clear_finished_switch(&serde_json::from_value(status).unwrap(), &mut pending, &mut notice);
     assert!(notice.is_empty());
     assert!(pending.is_none());
@@ -251,6 +258,12 @@ fn line_not_placed() {
     assert_eq!(
         line_of(&s),
         "Serving qwen3.5-9b. The card was not placed in a chain of qwen3.6-35b-a3b"
+    );
+    s.contribution.as_mut().unwrap().detail =
+        "this model is waiting for memory measurements before it can run in a chain".into();
+    assert_eq!(
+        status_line(&s),
+        ("This model is waiting for memory measurements before it can run in a chain".into(), Tone::Plain)
     );
 }
 
@@ -515,12 +528,43 @@ fn command_status_and_json() {
 }
 
 #[test]
+fn blocked_agent_displays_update_reason_in_status_and_dashboard() {
+    let mut status = sample_json();
+    status["connected"] = json!(false);
+    status["engine"] = json!("blocked");
+    status["gpu_lost"] = json!(true);
+    status["update_required"] = json!("the coordinator requires agent version 0.1.7");
+    let expected = "Update required: the coordinator requires agent version 0.1.7 — run the installer again";
+    for (name, args) in [("blocked-default", vec![]), ("blocked-status", vec!["status".into()])] {
+        let p = temp_socket(name);
+        let rx = fake_agent(&p, json!({"ok": true, "status": status}));
+        assert_eq!(command(&Socket::Explicit(p), &args).unwrap(), format!("! {expected}"));
+        assert_eq!(rx.recv().unwrap(), json!({"op":"status"}));
+    }
+    let p = temp_socket("blocked-start");
+    fake_agent(&p, json!({"ok": true, "status": status}));
+    assert_eq!(command(&Socket::Explicit(p), &["start".into()]).unwrap_err(), expected);
+    let status = serde_json::from_value(status).unwrap();
+    let rows = render::render(&status, 100, 30, 0, "", false);
+    assert!(rows.iter().any(|row| row.trim() == format!("! {expected}")), "{rows:?}");
+}
+
+#[test]
 fn command_use_sends_preference() {
     let p = temp_socket("use");
     let rx = fake_agent(&p, json!({"ok": true, "revision": 4}));
     let out = command(&Socket::Explicit(p.clone()), &["use".into(), "qwen3.5-9b".into(), "--quant".into(), "Q4_K_M".into()]).unwrap();
     assert_eq!(out, "using qwen3.5-9b");
     assert_eq!(rx.recv().unwrap(), json!({"op": "preference", "mode": "use", "model": "qwen3.5-9b", "quant": "Q4_K_M"}));
+
+    let p = temp_socket("use-variant");
+    let rx = fake_agent(&p, json!({"ok": true, "revision": 5}));
+    let sha = "cc".repeat(32);
+    let args = ["use", "qwen3.6-35b-a3b", "--weights-sha256", &sha].map(str::to_owned);
+    command(&Socket::Explicit(p), &args).unwrap();
+    assert_eq!(rx.recv().unwrap(), json!({
+        "op": "preference", "mode": "use", "model": "qwen3.6-35b-a3b", "quant": null, "weights_sha256": sha,
+    }));
 }
 
 #[test]

@@ -1004,6 +1004,9 @@ impl AdessoPub for ManualClock {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::parking::OpenReply;
+    use crate::slot::{GenerationOpen, SlotKey};
+    use publicompute_proto::stage::{AckKind, Confirmation};
 
     fn corri(da: u64, a: u64, eventi: usize) -> Statistiche {
         let mut tot = Statistiche::default();
@@ -1033,6 +1036,99 @@ mod test {
         let (mut a, mut b) = (Rng::new(5), Rng::new(5));
         assert!((0..50).all(|_| a.next() == b.next()));
         assert_ne!(Rng::new(5).next(), Rng::new(6).next());
+    }
+
+    #[test]
+    fn parked_turns_replay_cold_after_lost_close_expiry_or_restart() {
+        let ttl = Duration::from_secs(900);
+        for count in [2, 3] {
+            for disruption in [None, Some("lost close"), Some("expiry"), Some("restart")] {
+                let clocks: Vec<_> = (0..count).map(|_| ManualClock::default()).collect();
+                let mut slots: Vec<_> = clocks.iter().cloned().map(|c| Slots::new(c, SC)).collect();
+                let mut memories = vec![Vec::<i32>::new(); count];
+                let mut prior: Option<SlotKey> = None;
+                let mut previous_position = 0;
+                let mut generation = 0;
+                let mut full = Vec::new();
+                for turn in 1..=5 {
+                    // Two tokens are the user's question. The visible reply on
+                    // the next turn replaces the previous assistant suffix.
+                    full.extend([10 + turn as i32, 20 + turn as i32]);
+                    let position = full.len() as u32;
+                    let prompt: Vec<_> = full.iter().copied().chain([91, 92, 93]).collect();
+                    let now = Duration::from_secs(turn * 20);
+                    let mut conversation = Conversation::new(turn, prompt.len() as u32, Config::default(), now).0;
+                    generation += 1;
+                    let mut key = SlotKey { seq: 0, conversation: turn, attempt: 1, generation };
+                    let mut start = previous_position;
+                    let mut miss = false;
+                    for (stage, (slots, memory)) in slots.iter_mut().zip(&mut memories).enumerate() {
+                        let result = slots.open_generation(key, start, prior);
+                        let kind = match result {
+                            GenerationOpen::Ready { reused, .. } => {
+                                assert_eq!(reused, prior.is_some());
+                                memory.truncate(start as usize);
+                                if stage + 1 != count {
+                                    continue;
+                                }
+                                AckKind::Open
+                            }
+                            GenerationOpen::Miss { .. } => {
+                                assert_eq!(stage + 1, count, "exercise partial restore before the tail misses");
+                                memory.clear();
+                                AckKind::CacheMiss
+                            }
+                            _ => panic!("unexpected open result: {result:?}"),
+                        };
+                        let pending = OpenReply { key, epoch: 1, chain_epoch: 2, position: start };
+                        let reply = Confirmation {
+                            kind: kind as i32, ok: kind == AckKind::Open, epoch: 1, chain_epoch: 2, start_position: start,
+                            conversation_id: key.conversation, attempt_id: key.attempt, slot_generation: generation,
+                            ..Default::default()
+                        };
+                        miss = pending.status(&reply) == Some(AckKind::CacheMiss);
+                    }
+                    assert_eq!(miss, turn == 3 && disruption.is_some());
+                    if miss {
+                        conversation.retry_prefill(now).unwrap();
+                        generation += 1;
+                        key = SlotKey { attempt: conversation.tentativo(), generation, ..key };
+                        start = 0;
+                        for (slots, memory) in slots.iter_mut().zip(&mut memories) {
+                            assert!(matches!(slots.open_generation(key, start, None), GenerationOpen::Ready { reused: false, .. }));
+                            memory.clear();
+                        }
+                    }
+                    let expected: i32 = prompt.iter().sum();
+                    for (stage, (slots, memory)) in slots.iter_mut().zip(&mut memories).enumerate() {
+                        assert_eq!(slots.block(turn, key.attempt, start, prompt.len() as u32 - start), WorkOutcome::Compute);
+                        memory.extend(&prompt[start as usize..]);
+                        assert_eq!(memory.as_slice(), prompt);
+                        let missing_close = turn == 2 && stage + 1 == count && disruption == Some("lost close");
+                        if !missing_close {
+                            assert!(slots.close_generation(key, Some((position, ttl))));
+                            assert!(!slots.close_generation(key, Some((position, ttl))));
+                        }
+                    }
+                    assert_eq!(conversation.token(key.attempt, 0, expected as u32, now), TokenOutcome::Registrato { token_seq: 1 });
+                    assert_eq!(conversation.token(key.attempt, 0, 0, now), TokenOutcome::Duplicato);
+                    assert_eq!(conversation.transcript()[0].token, expected as u32);
+                    if turn == 2 {
+                        let tail = count - 1;
+                        if disruption == Some("restart") {
+                            assert_eq!(slots[tail].reset(), vec![0]);
+                            memories[tail].clear();
+                        } else if disruption == Some("expiry") {
+                            clocks[tail].avanza(ttl);
+                            assert_eq!(slots[tail].expire_parked(), vec![0]);
+                            memories[tail].clear();
+                        }
+                    }
+                    prior = Some(key);
+                    previous_position = position;
+                }
+            }
+        }
     }
 
     /// Include staggered admission in a run with delivery faults. Also check

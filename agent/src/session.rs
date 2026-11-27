@@ -157,6 +157,8 @@ fn features(cfg: &NodeConfig) -> Vec<i32> {
     let mut features = vec![AgentFeature::Contribution as i32];
     if cfg.stages.is_some() {
         features.push(AgentFeature::Stages as i32);
+        // The stage binary shipped with the agent applies the assigned engine profile.
+        features.push(AgentFeature::StageEngineProfile as i32);
     }
     if cfg.stage_engine.is_some() {
         features.push(AgentFeature::EngineSwitch as i32);
@@ -178,8 +180,8 @@ pub enum SessionEnd {
     /// The coordinator rejects the identity, so the agent must enroll again.
     Unauthenticated,
     Banned,
-    /// The coordinator requires a higher agent release. Reconnecting cannot satisfy the requirement.
-    TroppoVecchio(String),
+    /// Reconnecting cannot change the installed release or the wire protocol.
+    IncompatibleRelease(IncompatibleRelease),
     Lost(anyhow::Error),
 }
 
@@ -258,16 +260,19 @@ struct LeaseDone {
 pub async fn run(conn: quinn::Connection, cfg: &NodeConfig, engine: Arc<Engine>, shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) -> SessionEnd {
     match run_inner(&conn, cfg, engine, shared, &mut shutdown).await {
         Ok(end) => end,
-        Err(e) if e.downcast_ref::<VersioneTroppoVecchia>().is_some() => {
-            SessionEnd::TroppoVecchio(e.downcast_ref::<VersioneTroppoVecchia>().map(|v| v.to_string()).unwrap_or_default())
-        }
-        Err(e) => match conn.close_reason().as_ref().and_then(transport::app_close_code) {
-            Some(transport::CLOSE_UNAUTHENTICATED) => SessionEnd::Unauthenticated,
-            Some(transport::CLOSE_BANNED) => SessionEnd::Banned,
-            Some(transport::CLOSE_REPLACED) => {
-                SessionEnd::Lost(anyhow::anyhow!("session replaced; another agent may be using this identity"))
+        Err(e) => match e.downcast::<IncompatibleRelease>() {
+            Ok(rejection) => {
+                conn.close(0u32.into(), b"");
+                SessionEnd::IncompatibleRelease(rejection)
             }
-            _ => SessionEnd::Lost(e),
+            Err(e) => match conn.close_reason().as_ref().and_then(transport::app_close_code) {
+                Some(transport::CLOSE_UNAUTHENTICATED) => SessionEnd::Unauthenticated,
+                Some(transport::CLOSE_BANNED) => SessionEnd::Banned,
+                Some(transport::CLOSE_REPLACED) => {
+                    SessionEnd::Lost(anyhow::anyhow!("session replaced; another agent may be using this identity"))
+                }
+                _ => SessionEnd::Lost(e),
+            },
         },
     }
 }
@@ -357,7 +362,12 @@ async fn run_inner(
     };
     let welcome = match welcome {
         Some(coordinator_message::Body::Welcome(w)) => w,
-        Some(coordinator_message::Body::Error(e)) => bail!("coordinator rejected the session: {} ({:?})", e.message, e.code()),
+        Some(coordinator_message::Body::Error(e)) => {
+            if let Some(rejection) = IncompatibleRelease::from_protocol(&e) {
+                return Err(rejection.into());
+            }
+            bail!("coordinator rejected the session: {} ({:?})", e.message, e.code());
+        }
         _ => bail!("expected Welcome"),
     };
     let hb_every = welcome
@@ -365,18 +375,14 @@ async fn run_inner(
         .and_then(|d| Duration::try_from(d).ok())
         .filter(|d| !d.is_zero())
         .unwrap_or(Duration::from_secs(10));
-    // Exit on an unsupported minimum release because reconnecting would repeat the rejection.
-    if !versione_sufficiente(env!("CARGO_PKG_VERSION"), &welcome.min_agent_version) {
-        return Err(anyhow::Error::new(VersioneTroppoVecchia { minima: welcome.min_agent_version.clone() }));
+    if welcome.min_agent_version != env!("CARGO_PKG_VERSION") {
+        return Err(IncompatibleRelease(format!("the coordinator requires agent version {}", welcome.min_agent_version)).into());
     }
-    // Gate control message bodies on the negotiated protocol minor. A peer
-    // that does not recognize these bodies can close the connection.
-    let minor2 = welcome.protocol_version.as_ref().is_some_and(|v| v.major == PROTOCOL_VERSION.major && v.minor >= 2);
-    info!(session = %welcome.session_id, tier = ?welcome.tier(), protocollo_minor2 = minor2, "sessione aperta");
+    if welcome.protocol_version != Some(PROTOCOL_VERSION) {
+        return Err(IncompatibleRelease("the coordinator uses an unsupported protocol version".into()).into());
+    }
+    info!(session = %welcome.session_id, tier = ?welcome.tier(), "sessione aperta");
     cfg.live.set_connected(true);
-    if !minor2 {
-        info!("coordinator accepts preferences only in Hello; free placement is unavailable");
-    }
     let local_time = network::unix_seconds() as i64;
     let clock_offset = crate::stages::clock_offset_from_welcome(welcome.server_time.as_ref(), local_time);
     let bridge = welcome.peer_probes.then(|| cfg.stages.as_ref().and_then(|s| s.bridge())).flatten();
@@ -446,14 +452,14 @@ async fn run_inner(
             let chain_active = cfg.stages.as_ref().is_some_and(|s| s.has_chain());
             let idle = lease.is_empty() && !chain_active;
             if let Some(change) = change {
-                if minor2 && model_departure.is_none() && output.is_none() {
+                if model_departure.is_none() && output.is_none() {
                     let deadline = change.deadline().unwrap();
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     let grazia_s = remaining.as_secs().min(u64::from(GRAZIA_USCITA_S)) as u32;
                     out.send(node_message::Body::Leaving(Leaving { grazia_s })).await?;
                     model_departure = Some(deadline);
                 }
-                if output.is_none() && idle && (leave_ok || !minor2) && cfg.live.changes.claim(&change).await {
+                if output.is_none() && idle && leave_ok && cfg.live.changes.claim(&change).await {
                     break Ok(SessionEnd::SwitchModel(change));
                 }
             } else if let Some(deadline) = model_departure {
@@ -692,19 +698,15 @@ async fn run_inner(
                     }
                 }
                 _ = pref_rx.changed() => {
-                    if minor2 {
-                        let p = cfg.contribution.to_proto(&modelli_di(&ultimo_inventario));
-                        info!(modo = ?p.mode(), revision = p.revision, "contribution preference changed");
-                        out.send(node_message::Body::Contribution(p)).await?;
-                    } else {
-                        debug!("coordinator accepts preferences only in Hello; skipping live update");
-                    }
+                    let p = cfg.contribution.to_proto(&modelli_di(&ultimo_inventario));
+                    info!(modo = ?p.mode(), revision = p.revision, "contribution preference changed");
+                    out.send(node_message::Body::Contribution(p)).await?;
                 }
                 r = uscita_rx.changed(), if !uscita_chiusa && output.is_none() => {
                     match r {
                         Err(_) => uscita_chiusa = true,
                         Ok(()) if !*uscita_rx.borrow() => {}
-                        Ok(()) if minor2 => {
+                        Ok(()) => {
                             let role = cfg.stages.as_ref().and_then(|s| s.active_role());
                             let has_chain = cfg.stages.as_ref().is_some_and(|s| s.has_chain());
                             let notice = departure_notice(role, has_chain, lease.attive());
@@ -717,10 +719,6 @@ async fn run_inner(
                             if model_departure.is_none() {
                                 out.send(node_message::Body::Leaving(Leaving { grazia_s: GRAZIA_USCITA_S })).await?;
                             }
-                        }
-                        Ok(()) => {
-                            // If the peer cannot acknowledge departure, take the immediate shutdown path.
-                            break Ok(SessionEnd::Shutdown);
                         }
                     }
                 }
@@ -814,7 +812,7 @@ async fn run_inner(
     cfg.live.set_chain(None);
 
     let confirm_departure = async {
-        if !minor2 || !matches!(result, Ok(SessionEnd::SwitchModel(_))) || leave_ok {
+        if !matches!(result, Ok(SessionEnd::SwitchModel(_))) || leave_ok {
             return CLOSE_IO_TIMEOUT;
         }
         let start = Instant::now();
@@ -974,32 +972,25 @@ pub fn rispondi_direttiva(cfg: &NodeConfig, shared: &Shared, d: ModelDirective) 
     }
 }
 
-/// Compare release components numerically. An absent or malformed minimum does not block startup.
-pub fn versione_sufficiente(attuale: &str, minima: &str) -> bool {
-    fn parse(v: &str) -> Option<[u64; 3]> {
-        let core = v.split('-').next()?;
-        let mut it = core.split('.').map(|p| p.parse::<u64>().ok());
-        Some([it.next()??, it.next()??, it.next()??])
-    }
-    match (parse(attuale), parse(minima)) {
-        (Some(a), Some(m)) => a >= m,
-        _ => true,
-    }
-}
-
-/// Treat the minimum release refusal as fatal so the agent does not reconnect indefinitely.
+/// Reconnecting cannot change the release or wire protocol in use.
 #[derive(Debug)]
-pub struct VersioneTroppoVecchia {
-    pub minima: String,
-}
+pub struct IncompatibleRelease(String);
 
-impl std::fmt::Display for VersioneTroppoVecchia {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "coordinator requires agent version {} or later (running {})", self.minima, env!("CARGO_PKG_VERSION"))
+impl IncompatibleRelease {
+    pub fn from_protocol(error: &publicompute_proto::common::Error) -> Option<Self> {
+        use publicompute_proto::common::ErrorCode;
+        matches!(error.code(), ErrorCode::AgentTooOld | ErrorCode::UnsupportedProtocol)
+            .then(|| Self(error.message.clone()))
     }
 }
 
-impl std::error::Error for VersioneTroppoVecchia {}
+impl std::fmt::Display for IncompatibleRelease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for IncompatibleRelease {}
 
 /// Report busy engines as IDLE because the coordinator already tracks lease
 /// occupancy. Availability reflects the engine's ability to serve.
@@ -1415,7 +1406,8 @@ fn completion_result(request_id: &str, g: crate::engine::Generation, logic_param
             text: g.text,
             token_ids: g.token_ids,
             finish_reason: g.finish_reason as i32,
-            usage: Some(Usage { prompt_tokens: g.prompt_tokens, completion_tokens: n }),
+            usage: Some(Usage { prompt_tokens: g.prompt_tokens, completion_tokens: n, cached_prompt_tokens: g.cached_prompt_tokens }),
+            slot_report: g.slot_report,
             logic: Some(LogicCommitment {
                 format_version: logic_params.format_version,
                 data: commitment,
@@ -1453,12 +1445,19 @@ async fn run_chat(
     let top_k = logic_params.top_k;
     let chat_id = chat.chat_id;
     let trace_id = chat_id.clone();
-    let gen = tokio::spawn(async move { e2.chat_lease(&req, &trace_id, top_k, &lp2, Some(dtx), Some(cancel_rx)).await });
+    let gen = tokio::spawn(async move {
+        let context = crate::engine::ChatContext { id: &trace_id, owner: &chat.affinity_owner, member_seat: chat.member_seat, member_key: &chat.member_key };
+        e2.chat_lease(&req, context, top_k, &lp2, Some(dtx), Some(cancel_rx)).await
+    });
     let (n, gen_time) = {
         let write_reply = async {
             let mut first = true;
             while let Some(queued) = drx.recv().await {
                 let delta = queued.item;
+                if let Some(slot) = delta.slot_taken {
+                    send.write(&WorkStreamNodeMessage { body: Some(work_stream_node_message::Body::SlotTaken(slot)) }).await?;
+                    continue;
+                }
                 send.write(&WorkStreamNodeMessage {
                     body: Some(work_stream_node_message::Body::TokenDelta(TokenDelta {
                         request_id: request_id.clone(), index: delta.index, text: delta.text, token_ids: delta.token_ids,
@@ -1643,7 +1642,7 @@ mod tests {
         use crate::contribution::{PreferenceMode, ModelSelection, Preference};
         let d = std::env::temp_dir().join(format!("publicompute-sess-{}-{name}-{}", std::process::id(), rand::random::<u32>()));
         std::fs::create_dir_all(&d).unwrap();
-        Contribution::open(&d, Preference { modo: PreferenceMode::Usage, model: Some(ModelSelection { id: "".into(), quant: "".into() }), revision: 0 }).unwrap()
+        Contribution::open(&d, Preference { modo: PreferenceMode::Usage, model: Some(ModelSelection { id: "".into(), quant: "".into(), weights_sha256: None }), revision: 0 }).unwrap()
     }
 
     async fn node(probe_ms: u64) -> (Fake, NodeConfig) {
@@ -1939,6 +1938,9 @@ mod tests {
             payout: None,
             task: Some(work_offer::Task::Chat(ChatTask {
                 chat_id: "test-chat".into(),
+                affinity_owner: Vec::new(),
+                member_seat: false,
+                member_key: Vec::new(),
                 request: Some(InferenceRequest {
                     request_id: request_id.into(),
                     messages: vec![ChatMessage { role: publicompute_proto::node::ChatRole::User as i32, content: text.into() }],
@@ -1956,6 +1958,7 @@ mod tests {
         let open: WnMsg = r.read().await.unwrap().unwrap();
         assert!(matches!(open.body, Some(wn::Body::Open(ref o)) if o.lease_id == "L-chat"), "{open:?}");
         let mut deltas = Vec::new();
+        let mut taken = None;
         let risultato = loop {
             let m: WnMsg = r.read().await.unwrap().expect("stream closed");
             match m.body {
@@ -1965,10 +1968,19 @@ mod tests {
                         framed::write(&mut send, &WcMsg { body: Some(wc::Body::CancelRequest(CancelRequest { request_id: request_id.clone() })) }).await.unwrap();
                     }
                 }
+                Some(wn::Body::SlotTaken(slot)) => {
+                    assert!(deltas.is_empty(), "admission must precede tokens");
+                    taken = Some(slot);
+                }
                 Some(wn::Body::RequestResult(res)) => break res,
                 altro => panic!("unexpected message: {altro:?}"),
             }
         };
+        if let Some(request_result::Outcome::Completion(c)) = &risultato.outcome {
+            assert_eq!(taken, c.slot_report.as_ref().map(|r| publicompute_proto::common::SlotTaken {
+                slot: r.slot, generation: r.generation,
+            }));
+        }
         framed::write(&mut send, &WcMsg { body: Some(wc::Body::ResultAck(ResultAck { request_id: request_id.clone(), accepted: true, reason: String::new() })) }).await.unwrap();
         let done: WnMsg = r.read().await.unwrap().expect("LeaseComplete");
         assert!(matches!(done.body, Some(wn::Body::LeaseComplete(_))), "{done:?}");
@@ -1986,10 +1998,14 @@ mod tests {
     #[tokio::test]
     async fn chain_head_chat_streams_deltas_and_result() {
         let (cfg, engine, stages) = nodo_testa("chat-lease", vec![]).await;
-        assert_eq!(features(&cfg), vec![AgentFeature::Contribution as i32, AgentFeature::Stages as i32]);
+        assert_eq!(features(&cfg), vec![AgentFeature::Contribution as i32, AgentFeature::Stages as i32, AgentFeature::StageEngineProfile as i32]);
         let (client, server) = loopback().await;
         let coord = tokio::spawn(coordinatore(server, "r1".into(), None));
-        let offerta = offerta_chat(&cfg, "r1", "ciao", 50);
+        let mut offerta = offerta_chat(&cfg, "r1", "cached-ciao", 50);
+        let Some(work_offer::Task::Chat(chat)) = &mut offerta.task else { panic!("expected chat offer") };
+        chat.affinity_owner = vec![0x1f; 16];
+        chat.member_seat = true;
+        chat.member_key = vec![0x3f; 16];
         let (tokens, _) = lancia_lease(client, &cfg, engine, offerta).await.unwrap();
         assert_eq!(tokens, 5);
         let (deltas, res) = coord.await.unwrap();
@@ -2002,7 +2018,10 @@ mod tests {
         assert_eq!(c.text, "Ciao \u{e8} un test");
         assert_eq!(c.token_ids, vec![101, 102, 103, 104, 2]);
         assert_eq!(c.finish_reason, FinishReason::Stop as i32);
-        assert_eq!(c.usage.unwrap().completion_tokens, 5);
+        let usage = c.usage.unwrap();
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.cached_prompt_tokens, 4);
+        assert_eq!(c.slot_report, Some(publicompute_proto::common::SlotReport { slot: 0, generation: 1, parked: true }));
         assert_eq!(c.prompt_tokens_sha256.len(), 32);
         assert_eq!(c.logic.unwrap().format_version, logic::LOGIC_FORMAT);
         assert!(c.timing.unwrap().prefill.is_some());
@@ -2033,6 +2052,19 @@ mod tests {
         assert!(deltas.is_empty());
         let Some(request_result::Outcome::Failure(f)) = res.outcome else { panic!("{res:?}") };
         assert_eq!(f.code, RequestFailureCode::ContextTooLong as i32);
+        stages.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn head_capacity_rejection_survives_the_work_stream() {
+        let (cfg, engine, stages) = nodo_testa("chat-protected-slots", vec![]).await;
+        let (client, server) = loopback().await;
+        let coord = tokio::spawn(coordinatore(server, "r4".into(), None));
+        lancia_lease(client, &cfg, engine, offerta_chat(&cfg, "r4", "capacity-unavailable", 50)).await.unwrap();
+        let (deltas, result) = coord.await.unwrap();
+        assert!(deltas.is_empty());
+        let Some(request_result::Outcome::Failure(failure)) = result.outcome else { panic!("{result:?}") };
+        assert_eq!(failure.code, RequestFailureCode::CapacityUnavailable as i32);
         stages.stop_all().await;
     }
 
@@ -2483,9 +2515,9 @@ mod tests {
         let rb = req("rb", "blocca questa");
         let (e1, e2) = (engine.clone(), engine.clone());
         let (pa2, pb2) = (pa.clone(), pb.clone());
-        let a = tokio::spawn(async move { let Engine::Stages(e) = &*e1 else { unreachable!() }; e.chat_lease(&ra, "", &pa2, None, None).await });
+        let a = tokio::spawn(async move { let Engine::Stages(e) = &*e1 else { unreachable!() }; e.chat_lease(&ra, Default::default(), &pa2, None, None).await });
         let (ctx, crx) = oneshot::channel();
-        let b = tokio::spawn(async move { let Engine::Stages(e) = &*e2 else { unreachable!() }; e.chat_lease(&rb, "", &pb2, None, Some(crx)).await });
+        let b = tokio::spawn(async move { let Engine::Stages(e) = &*e2 else { unreachable!() }; e.chat_lease(&rb, Default::default(), &pb2, None, Some(crx)).await });
         let _ = e;
         let hb = |l: &Leases| {
             let h = heartbeat_msg(l, &cfg, &Shared::default());
@@ -2527,7 +2559,7 @@ mod tests {
         cfg.model = modello_prova();
         let d = std::env::temp_dir().join(format!("publicompute-sess-{}-{name}-{}", std::process::id(), rand::random::<u32>()));
         std::fs::create_dir_all(&d).unwrap();
-        let pref = Preference { modo: PreferenceMode::Usage, model: Some(ModelSelection { id: "qwen-prova".into(), quant: "Q4_K_M".into() }), revision: 0 };
+        let pref = Preference { modo: PreferenceMode::Usage, model: Some(ModelSelection { id: "qwen-prova".into(), quant: "Q4_K_M".into(), weights_sha256: None }), revision: 0 };
         cfg.contribution = Contribution::open(&d, pref).unwrap();
         (f, cfg)
     }
@@ -2536,7 +2568,7 @@ mod tests {
         Welcome {
             session_id: "s_prova".into(),
             heartbeat_interval: prost_types::Duration::try_from(Duration::from_millis(u64::from(heartbeat_ms))).ok(),
-            min_agent_version: min_agent.into(),
+            min_agent_version: if min_agent.is_empty() { env!("CARGO_PKG_VERSION") } else { min_agent }.into(),
             protocol_version: minor.map(|m| ProtocolVersion { major: 0, minor: m }),
             ..Default::default()
         }
@@ -2559,6 +2591,10 @@ mod tests {
         }
 
         async fn start_with_window(cfg: NodeConfig, welcome: Welcome, window: Option<u32>) -> (Finta, Arc<Shared>) {
+            Self::start_reply(cfg, coordinator_message::Body::Welcome(welcome), window).await
+        }
+
+        async fn start_reply(cfg: NodeConfig, reply: coordinator_message::Body, window: Option<u32>) -> (Finta, Arc<Shared>) {
             let (client, server) = loopback_with_window(window).await;
             let engine = cfg.sup.engine.clone();
             let (stop_tx, stop_rx) = watch::channel(false);
@@ -2570,7 +2606,7 @@ mod tests {
             let primo: NodeMessage = r.read().await.unwrap().expect("Hello");
             let Some(node_message::Body::Hello(hello)) = primo.body else { panic!("expected Hello, got {primo:?}") };
             let mut f = Finta { send, r, hello, stop_tx, task, _server: server, seq: 0 };
-            f.manda(coordinator_message::Body::Welcome(welcome)).await;
+            f.manda(reply).await;
             (f, shared)
         }
 
@@ -2625,7 +2661,7 @@ mod tests {
         for _ in 0..2 {
             let (_fake, mut cfg) = node(1000).await;
             cfg.live = live.clone();
-            let (mut peer, _) = Finta::start(cfg, welcome(None, "", 25)).await;
+            let (mut peer, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 25)).await;
             assert!(peer.hello.hardware.as_ref().unwrap().network.is_none());
             let up = peer.attendi(2000, |body| match body {
                 node_message::Body::Heartbeat(h) => h.network.as_ref().map(|n| n.upload_bits_per_sec),
@@ -2740,8 +2776,8 @@ mod tests {
         let sup = cfg.sup.clone();
         let pid = sup.child_pid_for_test().await;
         let stages = cfg.stages.clone().unwrap();
-        let (mut peer, _) = Finta::start(cfg, welcome(Some(2), "", 100)).await;
-        assert_eq!(peer.hello.features, vec![AgentFeature::Contribution as i32, AgentFeature::Stages as i32, AgentFeature::EngineSwitch as i32]);
+        let (mut peer, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 100)).await;
+        assert_eq!(peer.hello.features, vec![AgentFeature::Contribution as i32, AgentFeature::Stages as i32, AgentFeature::StageEngineProfile as i32, AgentFeature::EngineSwitch as i32]);
 
         let mut a = assignment("ad", 1, 1, 2, 0);
         peer.accept_chat(offer.clone()).await;
@@ -2836,7 +2872,7 @@ mod tests {
         let (cfg, _, _) = dual_node("dual-stage-failure", &[("FAKE_STAGE_EXIT_AFTER_MS", "500")], &[]).await;
         let sup = cfg.sup.clone();
         let pid = sup.child_pid_for_test().await;
-        let (mut peer, _) = Finta::start(cfg, welcome(Some(2), "", 100)).await;
+        let (mut peer, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 100)).await;
         peer.manda(coordinator_message::Body::StageAssign(assignment("ad", 1, 1, 2, 0))).await;
         peer.stage(State::Ready).await;
         peer.stage(State::Failed).await;
@@ -2853,7 +2889,7 @@ mod tests {
         use crate::gpu::{Device, ReadFailure};
         let (cfg, _, port) = dual_node("dual-gpu-loss", &[("FAKE_STAGE_START_DELAY_MS", "2000")], &[]).await;
         let (gpu, sup) = (cfg.gpu.clone(), cfg.sup.clone());
-        let (mut peer, _) = Finta::start(cfg, welcome(Some(2), "", 100)).await;
+        let (mut peer, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 100)).await;
         peer.manda(coordinator_message::Body::StageAssign(assignment("ad", 1, 1, 2, 0))).await;
         peer.stage(State::Loading).await;
         gpu.set_device_for_test(Device::Lost(ReadFailure::NoDevice));
@@ -2875,7 +2911,7 @@ mod tests {
         let (cfg, dir, _) = dual_node("dual-eof", &[], &["--fake-ignore-term"]).await;
         let sup = cfg.sup.clone();
         let pid = sup.child_pid_for_test().await;
-        let (mut peer, _) = Finta::start(cfg, welcome(Some(2), "", 100)).await;
+        let (mut peer, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 100)).await;
         peer.manda(coordinator_message::Body::StageAssign(assignment("ad", 1, 1, 2, 0))).await;
         let mut state = sup.subscribe();
         tokio::time::timeout(Duration::from_secs(5), state.wait_for(|s| *s == EngineState::Parked)).await.unwrap().unwrap();
@@ -2912,7 +2948,7 @@ mod tests {
         let (cfg, _, port) = dual_node("dual-busy-port", &[], &[]).await;
         let sup = cfg.sup.clone();
         let same_model = cfg.model_path.as_ref().unwrap().to_str().unwrap().to_owned();
-        let (mut peer, _) = Finta::start(cfg, welcome(Some(2), "", 100)).await;
+        let (mut peer, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 100)).await;
         peer.manda(coordinator_message::Body::StageAssign(assignment("ad", 1, 1, 2, 0))).await;
         peer.stage(State::Ready).await;
         let foreign = fake_llama::spawn(port, FakeState::new(&same_model)).await.unwrap();
@@ -2931,13 +2967,13 @@ mod tests {
     async fn hello_carries_preference() {
         let (_f, cfg) = nodo_con_modello("hello").await;
         let rev = cfg.contribution.preference().revision;
-        let (fin, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        let (fin, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 60_000)).await;
         let p: &ContributionPreference = fin.hello.contribution.as_ref().expect("preferenza nell'Hello");
         assert_eq!(p.mode(), ContributionMode::Use);
         assert_eq!(p.model.as_ref().unwrap(), &modello_prova(), "model with the inventory fingerprint");
         assert_eq!(p.revision, rev);
         assert_eq!(fin.hello.features, vec![AgentFeature::Contribution as i32]);
-        assert_eq!(fin.hello.protocol_version.as_ref().unwrap().minor, 2);
+        assert_eq!(fin.hello.protocol_version.as_ref().unwrap().minor, PROTOCOL_VERSION.minor);
         let _ = fin.stop_tx.send(true);
     }
 
@@ -2945,7 +2981,7 @@ mod tests {
     async fn preference_change_is_sent() {
         let (_f, cfg) = nodo_con_modello("cambio").await;
         let contribution = cfg.contribution.clone();
-        let (mut fin, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        let (mut fin, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 60_000)).await;
         let rev0 = fin.hello.contribution.as_ref().unwrap().revision;
         tokio::time::sleep(Duration::from_millis(50)).await;
         contribution.imposta(crate::contribution::PreferenceMode::Free, None).unwrap();
@@ -2971,7 +3007,7 @@ mod tests {
         cfg.model = ModelRef::default();
         cfg.model_path = None;
         cfg.contribution.imposta(PreferenceMode::Free, None).unwrap();
-        let (peer, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        let (peer, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 60_000)).await;
         assert!(peer.hello.models.as_ref().unwrap().models.is_empty());
         assert_eq!(peer.hello.contribution.as_ref().unwrap().mode(), ContributionMode::Free);
         peer.stop_tx.send(true).unwrap();
@@ -2986,7 +3022,7 @@ mod tests {
         let (sent, ready) = oneshot::channel();
         cfg.live.changes.request(&cfg.live, &store, download, Some(ready)).unwrap();
         let live = cfg.live.clone();
-        let (peer, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        let (peer, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 60_000)).await;
         let models = &peer.hello.models.as_ref().unwrap().models;
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].model.as_ref(), Some(&download.reference()));
@@ -3010,7 +3046,7 @@ mod tests {
         cfg.live.changes.request(&cfg.live, &store, download, Some(ready)).unwrap();
         let active = cfg.model.clone();
         let live = cfg.live.clone();
-        let (peer, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        let (peer, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 60_000)).await;
         let models = &peer.hello.models.as_ref().unwrap().models;
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].model.as_ref(), Some(&active));
@@ -3038,7 +3074,7 @@ mod tests {
         let live = cfg.live.clone();
         let pref = cfg.contribution.clone();
         cfg.model_store = Some(store.clone());
-        let (mut peer, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        let (mut peer, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 60_000)).await;
         peer.accept_chat(first).await;
         live.changes.request(&live, &store, model, None).unwrap();
         tokio::time::timeout(Duration::from_secs(3), live.changes.wait_switch()).await.unwrap();
@@ -3049,7 +3085,7 @@ mod tests {
             _ => None,
         }).await.unwrap();
         assert_eq!(rejected.detail, "agent is changing models");
-        assert!(store.active(|_| true).unwrap().is_none());
+        assert!(store.active(|_, _| true).unwrap().is_none());
         assert!(!peer.task.is_finished());
         if force {
             live.changes.expire_switch();
@@ -3063,7 +3099,7 @@ mod tests {
         }
         let SessionEnd::SwitchModel(change) = peer.done().await else { panic!("expected to leave for the model switch") };
         assert!(live.changes.commit(change, store.clone(), &pref).await);
-        assert_eq!(store.active(|_| true).unwrap().unwrap().0.id, model.id);
+        assert_eq!(store.active(|_, _| true).unwrap().unwrap().0.id, model.id);
     }
 
     #[cfg(unix)]
@@ -3081,7 +3117,7 @@ mod tests {
         let model = find("qwen3.6-35b-a3b", None).unwrap();
         cached_weights(&store, model);
         let live = cfg.live.clone();
-        let (mut peer, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        let (mut peer, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 60_000)).await;
         peer.manda(coordinator_message::Body::MeasurementPing(Default::default())).await;
         peer.attendi(3000, |msg| matches!(msg, node_message::Body::MeasurementPong(_)).then_some(())).await.unwrap();
         live.changes.request(&live, &store, model, None).unwrap();
@@ -3107,7 +3143,7 @@ mod tests {
         let model = find("qwen3.6-35b-a3b", None).unwrap();
         cached_weights(&store, model);
         let live = cfg.live.clone();
-        let (mut peer, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        let (mut peer, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 60_000)).await;
         peer.manda(coordinator_message::Body::StageAssign(assignment("ad", 1, 1, 2, 0))).await;
         peer.stage(State::Ready).await;
         live.changes.request(&live, &store, model, None).unwrap();
@@ -3136,7 +3172,7 @@ mod tests {
         let model = find("qwen3.6-35b-a3b", None).unwrap();
         cached_weights(&store, model);
         let live = cfg.live.clone();
-        let (mut peer, _) = Finta::start_with_window(cfg, welcome(Some(2), "", 60_000), Some(1024)).await;
+        let (mut peer, _) = Finta::start_with_window(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 60_000), Some(1024)).await;
         peer.accept_chat(first).await;
         live.changes.request(&live, &store, model, None).unwrap();
         peer.acknowledge_leaving(1).await;
@@ -3160,21 +3196,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_preference_update_with_old_coordinator() {
-        let (_f, cfg) = nodo_con_modello("vecchio").await;
-        let contribution = cfg.contribution.clone();
-        // Without negotiated support for preference updates, send the preference only in the handshake.
-        let (mut fin, _) = Finta::start(cfg, welcome(None, "", 60_000)).await;
-        assert!(fin.hello.contribution.is_some());
-        contribution.imposta(crate::contribution::PreferenceMode::Free, None).unwrap();
-        let visto = fin
-            .attendi(700, |b| match b {
-                node_message::Body::Contribution(_) | node_message::Body::ModelDirectiveStatus(_) | node_message::Body::Leaving(_) => Some(()),
-                _ => None,
-            })
-            .await;
-        assert!(visto.is_none(), "no preference update for a coordinator without support");
-        let _ = fin.stop_tx.send(true);
+    async fn rejects_welcome_without_current_protocol() {
+        let (_f, cfg) = nodo_con_modello("protocol").await;
+        let (fin, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        assert!(matches!(fin.done().await, SessionEnd::IncompatibleRelease(error) if error.0.contains("unsupported protocol version")));
+    }
+
+    #[tokio::test]
+    async fn shows_update_message_from_coordinator() {
+        use publicompute_proto::common::{Error, ErrorCode};
+
+        let (_f, cfg) = nodo_con_modello("reject-release").await;
+        let message = "the coordinator requires agent version 0.1.7";
+        let error = Error { code: ErrorCode::AgentTooOld as i32, message: message.into(), ..Default::default() };
+        let (fin, _) = Finta::start_reply(cfg, coordinator_message::Body::Error(error), None).await;
+        assert!(matches!(fin.done().await, SessionEnd::IncompatibleRelease(error) if error.0 == message));
     }
 
     #[tokio::test]
@@ -3182,7 +3218,7 @@ mod tests {
         let (_f, cfg) = nodo_con_modello("stato").await;
         let contribution = cfg.contribution.clone();
         let rev = contribution.preference().revision;
-        let (mut fin, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        let (mut fin, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 60_000)).await;
         fin.manda(coordinator_message::Body::ContributionStatus(ContributionStatus { free_seat: true, in_chain: true, revision: rev, ..Default::default() })).await;
         let t0 = Instant::now();
         while contribution.state().is_none() {
@@ -3197,7 +3233,7 @@ mod tests {
     async fn session_keeps_received_summary() {
         let (_f, cfg) = nodo_con_modello("riepilogo").await;
         let contribution = cfg.contribution.clone();
-        let (mut fin, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        let (mut fin, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 60_000)).await;
         fin.manda(coordinator_message::Body::ContributionSummary(ContributionSummary { days: 30, balance_mc: 777, ..Default::default() })).await;
         let t0 = Instant::now();
         while contribution.summary().is_none() {
@@ -3213,7 +3249,7 @@ mod tests {
         let (_f, mut cfg) = nodo_con_modello("uscita").await;
         let (uscita_tx, uscita_rx) = watch::channel(false);
         cfg.output = uscita_rx;
-        let (mut fin, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        let (mut fin, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 60_000)).await;
         uscita_tx.send(true).unwrap();
         let l = fin
             .attendi(2000, |b| match b {
@@ -3238,7 +3274,7 @@ mod tests {
         let (_f, mut cfg) = nodo_con_modello("secondo").await;
         let (uscita_tx, uscita_rx) = watch::channel(false);
         cfg.output = uscita_rx;
-        let (mut fin, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        let (mut fin, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 60_000)).await;
         uscita_tx.send(true).unwrap();
         fin.attendi(2000, |b| matches!(b, node_message::Body::Leaving(_)).then_some(())).await.expect("Leaving");
         // A second shutdown signal ends the wait for acknowledgment.
@@ -3251,36 +3287,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_with_old_coordinator() {
-        let (_f, mut cfg) = nodo_con_modello("uscita-vecchio").await;
-        let (uscita_tx, uscita_rx) = watch::channel(false);
-        cfg.output = uscita_rx;
-        let (mut fin, _) = Finta::start(cfg, welcome(None, "", 60_000)).await;
-        uscita_tx.send(true).unwrap();
-        let mut visto_leaving = false;
-        let saluto = fin
-            .attendi(2000, |b| {
-                visto_leaving |= matches!(b, node_message::Body::Leaving(_));
-                matches!(b, node_message::Body::Goodbye(_)).then_some(())
-            })
-            .await;
-        assert!(saluto.is_some() && !visto_leaving, "without departure support, send Goodbye on the first signal");
-        assert!(matches!(fin.done().await, SessionEnd::Shutdown));
-    }
-
-    #[tokio::test]
     async fn minimum_version_stops_agent() {
         let (_f, cfg) = nodo_con_modello("minima").await;
-        let (fin, _) = Finta::start(cfg, welcome(Some(2), "99.0.0", 60_000)).await;
+        let (fin, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "99.0.0", 60_000)).await;
         match fin.done().await {
-            SessionEnd::TroppoVecchio(msg) => assert!(msg.contains("99.0.0") && msg.contains("requires agent version"), "{msg}"),
+            SessionEnd::IncompatibleRelease(error) => assert_eq!(error.0, "the coordinator requires agent version 99.0.0"),
             altro => panic!("expected an agent version error, got {altro:?}"),
         }
-        assert!(versione_sufficiente("0.1.0", ""));
-        assert!(versione_sufficiente("0.1.0", "0.1.0"));
-        assert!(versione_sufficiente("0.2.0", "0.1.9"));
-        assert!(!versione_sufficiente("0.1.0", "0.1.1"));
-        assert!(!versione_sufficiente("0.9.9", "1.0.0"));
     }
 
     #[test]
@@ -3313,7 +3326,7 @@ mod tests {
         let st = rispondi_direttiva(&cfg, &shared, d);
         assert_eq!(st.state(), StatoDirettiva::Serving);
         assert_eq!(st.epoch, 1);
-        let (mut fin, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        let (mut fin, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 60_000)).await;
         fin.manda(coordinator_message::Body::ModelDirective(ModelDirective { model: Some(modello_prova()), epoch: 7, ..Default::default() })).await;
         let st = fin
             .attendi(2000, |b| match b {
@@ -3362,7 +3375,7 @@ mod tests {
         std::fs::write(&file, vec![0u8; 12_345]).unwrap();
         cfg.model_path = Some(file.clone());
         assert_eq!(inventory(&cfg, &cfg.sup.engine).models[0].size_bytes, 12_345);
-        let (mut fin, _) = Finta::start(cfg, welcome(Some(2), "", 100)).await;
+        let (mut fin, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 100)).await;
         let m = &fin.hello.models.as_ref().unwrap().models[0];
         assert_eq!((m.size_bytes, m.loaded), (12_345, true), "dimensione vera nell'Hello");
         // Polling resends the inventory only when its file size changes.
@@ -3489,7 +3502,7 @@ mod tests {
         let (cfg, _, stages) = nodo_testa("paused-stage-assign", vec![]).await;
         stages.stop_all().await;
         cfg.live.set_paused(true);
-        let (mut coordinator, _) = Finta::start(cfg, welcome(Some(2), "", 60_000)).await;
+        let (mut coordinator, _) = Finta::start(cfg, welcome(Some(PROTOCOL_VERSION.minor), "", 60_000)).await;
         coordinator.manda(coordinator_message::Body::StageAssign(assignment("paused-chain", 2, 1, 2, 0))).await;
         let status = coordinator.attendi(2000, |body| match body {
             node_message::Body::StageStatus(status) => Some(status.clone()),

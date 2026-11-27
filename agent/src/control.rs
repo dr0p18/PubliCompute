@@ -290,7 +290,7 @@ pub(crate) mod pause_file {
 enum Request {
     Status,
     Follow,
-    Preference { mode: String, model: Option<String>, quant: Option<String> },
+    Preference { mode: String, model: Option<String>, quant: Option<String>, weights_sha256: Option<String> },
     Pause { active: bool },
     Models,
 }
@@ -300,6 +300,7 @@ struct PreferenceView {
     mode: &'static str,
     model: Option<String>,
     quant: Option<String>,
+    weights_sha256: Option<String>,
     revision: u64,
 }
 
@@ -340,11 +341,13 @@ struct SummaryView {
 struct Status {
     version: &'static str,
     connected: bool,
+    update_required: Option<String>,
     paused: bool,
     preference: PreferenceView,
     engine: &'static str,
     weights_model: Option<String>,
     weights_quant: Option<String>,
+    weights_sha256: Option<String>,
     loaded_model: Option<String>,
     loaded_quant: Option<String>,
     download: Option<crate::model_change::DownloadView>,
@@ -363,6 +366,7 @@ struct Status {
 struct LocalModel {
     id: String,
     quant: String,
+    weights_sha256: Option<String>,
     state: &'static str,
     loaded: bool,
     bytes: u64,
@@ -381,6 +385,7 @@ pub struct Control {
     store: Option<Arc<crate::models::Store>>,
     stage_only: bool,
     stages: OnceLock<Arc<crate::stages::Stages>>,
+    update_required: OnceLock<String>,
 }
 
 struct ModelState {
@@ -450,6 +455,7 @@ impl Control {
         Self {
             contribution, gpu, live, engine, last_change: Mutex::new(None), store: None,
             stage_only: false, stages: OnceLock::new(),
+            update_required: OnceLock::new(),
             model: Mutex::new(ModelState {
                 reference: model, path: model_path, error: None, verifying: false, needs_repair: false,
             }),
@@ -463,6 +469,15 @@ impl Control {
 
     pub fn attach_stages(&self, stages: Arc<crate::stages::Stages>) {
         let _ = self.stages.set(stages);
+    }
+
+    // Keep the reason available to local clients because reconnecting cannot fix a release mismatch.
+    pub fn require_update(&self, reason: String) {
+        tracing::warn!("update required: {reason} — run the installer again");
+        let _ = self.update_required.set(reason);
+        // A blocked agent never serves, so a weights download already under way is wasted bandwidth.
+        self.live.changes.cancel();
+        self.live.notify();
     }
 
     pub fn with_models(mut self, store: Option<Arc<crate::models::Store>>, error: Option<String>) -> Arc<Self> {
@@ -495,7 +510,7 @@ impl Control {
         let preference = self.contribution.preference();
         let Some(model) = preference.model.as_ref()
             .filter(|_| preference.modo == PreferenceMode::Usage)
-            .and_then(|m| crate::models::find(&m.id, Some(&m.quant))) else { return };
+            .and_then(ModelSelection::manifest_entry) else { return };
         let download = self.store.as_ref().context("the model store is unavailable")
             .and_then(|store| self.live.changes.request(&self.live, store, model, None));
         if let Err(err) = download {
@@ -507,6 +522,7 @@ impl Control {
         let engine = *self.engine.borrow();
         let active = self.model.lock().unwrap();
         let model = &active.reference;
+        let selected = ModelSelection::from(model);
         let loaded = self.model_loaded(&active, engine, !self.gpu.unavailable());
         let mut models = Vec::new();
         if !model.model_id.is_empty() {
@@ -518,12 +534,14 @@ impl Control {
             } else {
                 active.engine_name(engine)
             };
-            models.push(LocalModel { id: model.model_id.clone(), quant: model.quantization.clone(), state, loaded, bytes });
+            models.push(LocalModel { id: selected.id.clone(), quant: selected.quant.clone(),
+                weights_sha256: selected.weights_sha256.clone(), state, loaded, bytes });
         }
         if self.store.is_some() {
             models.extend(crate::models::MANIFEST.iter()
-                .filter(|m| m.id != model.model_id || m.quant != model.quantization)
-                .map(|m| LocalModel { id: m.id.clone(), quant: m.quant.clone(), state: "available", loaded: false, bytes: m.bytes }));
+                .filter(|m| m.id != selected.id || m.quant != selected.quant || Some(m.sha256.as_str()) != selected.weights_sha256.as_deref())
+                .map(|m| LocalModel { id: m.id.clone(), quant: m.quant.clone(), weights_sha256: Some(m.sha256.clone()),
+                    state: "available", loaded: false, bytes: m.bytes }));
         }
         models
     }
@@ -547,21 +565,25 @@ impl Control {
             temperature_celsius: l.temperature,
         });
         let gpu_loss = self.gpu.loss();
-        let loaded = self.model_loaded(&model, engine, !self.gpu.unavailable());
+        let update_required = self.update_required.get();
+        let loaded = update_required.is_none() && self.model_loaded(&model, engine, !self.gpu.unavailable());
         let weights_ready = model.weights_ready();
         Status {
             version: env!("CARGO_PKG_VERSION"),
-            connected: self.live.connected.load(Ordering::Relaxed),
+            connected: update_required.is_none() && self.live.connected.load(Ordering::Relaxed),
+            update_required: update_required.cloned(),
             paused: self.live.is_paused(),
             preference: PreferenceView {
                 mode: mode_name(p.modo),
                 model: p.model.as_ref().map(|m| m.id.clone()),
                 quant: p.model.as_ref().map(|m| m.quant.clone()),
+                weights_sha256: p.model.as_ref().and_then(|m| m.weights_sha256.clone()),
                 revision: p.revision,
             },
-            engine: model.engine_name(engine),
+            engine: if update_required.is_some() { "blocked" } else { model.engine_name(engine) },
             weights_model: weights_ready.then(|| model.reference.model_id.clone()),
             weights_quant: weights_ready.then(|| model.reference.quantization.clone()),
+            weights_sha256: weights_ready.then(|| hex::encode(&model.reference.weights_sha256)).filter(|h| !h.is_empty()),
             loaded_model: loaded.then(|| model.reference.model_id.clone()),
             loaded_quant: loaded.then(|| model.reference.quantization.clone()),
             download: self.live.changes.view(),
@@ -577,7 +599,7 @@ impl Control {
         }
     }
 
-    async fn set_preference(&self, mode: &str, model: Option<String>, quant: Option<String>, reply: Option<tokio::sync::oneshot::Receiver<()>>) -> Result<Value, Refusal> {
+    async fn set_preference(&self, mode: &str, model: Option<String>, quant: Option<String>, weights_sha256: Option<String>, reply: Option<tokio::sync::oneshot::Receiver<()>>) -> Result<Value, Refusal> {
         let bad = |t: &str| Refusal("bad_request", t.to_string());
         let internal = |e: anyhow::Error| Refusal("model_change_failed", format!("{e:#}"));
         let _commands = self.live.changes.commands.lock().await;
@@ -586,12 +608,17 @@ impl Control {
             "free" => (PreferenceMode::Free, None),
             "use" => {
                 let id = model.ok_or_else(|| bad("mode use needs a model"))?;
-                let (active_id, active_quant, needs_repair) = {
+                let (active, needs_repair) = {
                     let active = self.model.lock().unwrap();
-                    (active.reference.model_id.clone(), active.reference.quantization.clone(), active.needs_repair)
+                    (ModelSelection::from(&active.reference), active.needs_repair)
                 };
-                if needs_repair || id != active_id || quant.as_ref().is_some_and(|q| *q != active_quant) {
-                    let Some((store, model)) = self.store.as_ref().zip(crate::models::find(&id, quant.as_deref())) else {
+                let requested = crate::models::select(&id, quant.as_deref(), weights_sha256.as_deref());
+                let sha = weights_sha256.as_deref().or_else(|| {
+                    self.store.as_ref().and(requested).map(|m| m.sha256.as_str())
+                });
+                let same_sha = sha.is_none_or(|h| active.weights_sha256.as_deref().is_some_and(|a| h.eq_ignore_ascii_case(a)));
+                if needs_repair || id != active.id || quant.as_ref().is_some_and(|q| *q != active.quant) || !same_sha {
+                    let Some((store, model)) = self.store.as_ref().zip(requested) else {
                         return Err(Refusal("not_installed", format!("model {id} is not installed on this machine")));
                     };
                     if self.live.is_paused() {
@@ -606,7 +633,7 @@ impl Control {
                             "text": format!("downloading {id} ({gib:.1} GiB remaining), see publicompute status")})
                     });
                 }
-                (PreferenceMode::Usage, Some(ModelSelection { id, quant: active_quant }))
+                (PreferenceMode::Usage, Some(active))
             }
             other => return Err(Refusal("bad_request", format!("unknown mode \"{other}\": use or free"))),
         };
@@ -627,6 +654,11 @@ impl Control {
     #[cfg(unix)]
     async fn handle(self: &Arc<Self>, req: Request, reply: Option<tokio::sync::oneshot::Receiver<()>>) -> Value {
         let refused = |r: Refusal| json!({"ok": false, "error": r.0, "text": r.1});
+        if matches!(req, Request::Pause { .. } | Request::Preference { .. }) {
+            if let Some(reason) = self.update_required.get() {
+                return refused(Refusal("update_required", format!("Update required: {reason} — run the installer again")));
+            }
+        }
         match req {
             Request::Status => json!({"ok": true, "status": self.status()}),
             Request::Models => json!({"ok": true, "models": self.models()}),
@@ -634,7 +666,9 @@ impl Control {
                 let control = self.clone();
                 self.live.save_pause(active, move || control.resume_saved_model()).await
             }
-            Request::Preference { mode, model, quant } => self.set_preference(&mode, model, quant, reply).await.unwrap_or_else(refused),
+            Request::Preference { mode, model, quant, weights_sha256 } => {
+                self.set_preference(&mode, model, quant, weights_sha256, reply).await.unwrap_or_else(refused)
+            }
             Request::Follow => unreachable!("follow is served by `follow`"),
         }
     }
@@ -916,7 +950,7 @@ mod tests {
     }
 
     pub(super) fn test_control(dir: &Path) -> (Arc<Control>, watch::Sender<EngineState>) {
-        let pref = Preference { modo: PreferenceMode::Usage, model: Some(ModelSelection { id: "qwen".into(), quant: "Q4_K_M".into() }), revision: 0 };
+        let pref = Preference { modo: PreferenceMode::Usage, model: Some(ModelSelection { id: "qwen".into(), quant: "Q4_K_M".into(), weights_sha256: None }), revision: 0 };
         let contribution = Contribution::open(dir, pref).unwrap();
         let (engine_tx, engine_rx) = watch::channel(EngineState::Ready);
         let model = ModelRef { model_id: "qwen".into(), quantization: "Q4_K_M".into(), weights_sha256: vec![] };
@@ -1165,12 +1199,12 @@ mod tests {
         let control = Control::new(test.contribution.clone(), test.gpu.clone(), test.live.clone(),
             test.engine.clone(), test.model.lock().unwrap().reference.clone(), None).with_models(Some(store), None);
         for command in [
-            Request::Preference { mode: "free".into(), model: None, quant: None },
+            Request::Preference { mode: "free".into(), model: None, quant: None, weights_sha256: None },
             Request::Pause { active: true },
         ] {
             let (sent, ready) = tokio::sync::oneshot::channel();
             let response = control.handle(Request::Preference {
-                mode: "use".into(), model: Some("qwen3.6-35b-a3b".into()), quant: None,
+                mode: "use".into(), model: Some("qwen3.6-35b-a3b".into()), quant: None, weights_sha256: None,
             }, Some(ready)).await;
             assert_eq!(response["state"], "downloading");
             assert_eq!(control.live.changes.inventory().unwrap().status(), publicompute_proto::node::ModelStatus::Downloading);
@@ -1259,10 +1293,11 @@ mod pause_tests {
         let dir = data_dir("paused-download");
         let store = Arc::new(crate::models::Store::new(&dir));
         store.prepare().unwrap();
-        let model = crate::models::find("qwen3.6-35b-a3b", None).unwrap();
+        let base = crate::models::find("qwen3.6-35b-a3b", None).unwrap();
+        let model = crate::models::MANIFEST.iter().find(|m| m.id == base.id && m.sha256 != base.sha256).unwrap();
         let preference = Preference {
             modo: PreferenceMode::Usage,
-            model: Some(ModelSelection { id: model.id.clone(), quant: model.quant.clone() }),
+            model: Some(model.into()),
             revision: 0,
         };
         let saved = Contribution::open(&dir, preference).unwrap().preference();
@@ -1287,8 +1322,37 @@ mod pause_tests {
         assert_eq!(control.handle(Request::Pause { active: false }, None).await["ok"], true);
         let download = live.changes.inventory().unwrap();
         assert_eq!(download.status(), publicompute_proto::node::ModelStatus::Downloading);
+        assert_eq!(download.model, Some(model.reference()));
         assert_eq!(download.downloaded_bytes, model.bytes - 1);
         assert_eq!(contribution.preference(), saved);
+        assert_eq!(control.handle(Request::Pause { active: true }, None).await["ok"], true);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn use_switches_weights_when_only_the_sha256_changes() {
+        let dir = data_dir("switch-variant");
+        let store = Arc::new(crate::models::Store::new(&dir));
+        store.prepare().unwrap();
+        let base = crate::models::find("qwen3.6-35b-a3b", None).unwrap();
+        let draft = crate::models::MANIFEST.iter().find(|m| m.id == base.id && m.sha256 != base.sha256).unwrap();
+        let contribution = Contribution::open(&dir, Preference {
+            modo: PreferenceMode::Usage, model: Some(base.into()), revision: 0,
+        }).unwrap();
+        fs::File::create(store.partial(draft)).unwrap().set_len(draft.bytes - 1).unwrap();
+        let live = Live::open(&dir).unwrap();
+        let (_engine, engine_rx) = watch::channel(EngineState::Parked);
+        let control = Control::new(contribution, Arc::new(Telemetria::default()), live.clone(), engine_rx,
+            base.reference(), Some(store.path(base))).with_models(Some(store.clone()), None);
+        let _worker = store.worker.lock().await;
+        let response = control.handle(Request::Preference {
+            mode: "use".into(), model: Some(draft.id.clone()), quant: Some(draft.quant.clone()),
+            weights_sha256: Some(draft.sha256.clone()),
+        }, None).await;
+        assert_eq!(response["state"], "downloading");
+        let download = live.changes.inventory().unwrap();
+        assert_eq!(download.model, Some(draft.reference()));
+        assert_eq!(download.downloaded_bytes, draft.bytes - 1);
         assert_eq!(control.handle(Request::Pause { active: true }, None).await["ok"], true);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1338,7 +1402,7 @@ mod pause_tests {
         let control = Control::new(contribution.clone(), Arc::new(Telemetria::default()), live.clone(), engine_rx, ModelRef::default(), None)
             .with_models(Some(store), None);
         let (sent, ready) = tokio::sync::oneshot::channel();
-        let reply = control.handle(Request::Preference { mode: "use".into(), model: Some(model.id.clone()), quant: None }, Some(ready)).await;
+        let reply = control.handle(Request::Preference { mode: "use".into(), model: Some(model.id.clone()), quant: None, weights_sha256: None }, Some(ready)).await;
         assert_eq!(reply["state"], "downloading");
         let download = live.changes.inventory();
 
@@ -1348,7 +1412,7 @@ mod pause_tests {
         assert_eq!(live.changes.inventory(), download);
 
         fs::create_dir(dir.join("contributo.json.tmp")).unwrap();
-        let farm = Request::Preference { mode: "free".into(), model: None, quant: None };
+        let farm = Request::Preference { mode: "free".into(), model: None, quant: None, weights_sha256: None };
         assert_eq!(control.handle(farm, None).await["error"], "model_change_failed");
         assert_eq!(contribution.preference().modo, PreferenceMode::Usage);
         assert_eq!(live.changes.inventory(), download);

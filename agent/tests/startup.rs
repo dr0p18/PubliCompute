@@ -126,8 +126,6 @@ fn starting_socket(group_access: bool) {
 
 #[tokio::test]
 async fn pause_survives_service_restart_and_is_advertised_before_work() {
-    use std::sync::Arc;
-
     use prost::Message;
     use publicompute_proto::{
         node::{
@@ -157,8 +155,7 @@ async fn pause_survives_service_restart_and_is_advertised_before_work() {
     )
     .unwrap();
     let ca = dir.join("ca.pem");
-    let fixture = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    fs::write(&ca, fixture.cert.pem()).unwrap();
+    let (endpoint, fixture) = startup_coordinator(&ca);
     fs::write(data.join("key.pem"), fixture.signing_key.serialize_pem()).unwrap();
     fs::write(
         data.join("identity.bin"),
@@ -170,21 +167,6 @@ async fn pause_survives_service_restart_and_is_advertised_before_work() {
         .encode_to_vec(),
     )
     .unwrap();
-    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(fixture.signing_key.serialize_der());
-    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_no_client_auth()
-    .with_single_cert(vec![fixture.cert.der().clone()], key.into())
-    .unwrap();
-    tls.alpn_protocols = vec![b"publicompute-node/0".to_vec()];
-    let server = quinn::ServerConfig::with_crypto(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
-    ));
-    let endpoint = quinn::Endpoint::server(server, "127.0.0.1:0".parse().unwrap()).unwrap();
-
     let check = timeout(Duration::from_secs(20), async {
         for (availability, command) in [
             (Availability::Idle, Some(true)),
@@ -225,6 +207,7 @@ async fn pause_survives_service_restart_and_is_advertised_before_work() {
                     seq: 1,
                     body: Some(coordinator_message::Body::Welcome(Welcome {
                         protocol_version: Some(PROTOCOL_VERSION),
+                        min_agent_version: env!("CARGO_PKG_VERSION").into(),
                         heartbeat_interval: Some(prost_types::Duration {
                             seconds: 0,
                             nanos: 100_000_000,
@@ -368,8 +351,9 @@ async fn a_model_switch_exits_75_and_startup_restores_or_falls_back() {
     fs::write(&ca, cert.cert.pem()).unwrap();
 
     let manifest: Vec<Value> = serde_json::from_str(include_str!("../models.json")).unwrap();
-    let chosen = &manifest[1];
+    let chosen = manifest.iter().find(|model| model["file"] == "qwen3.6-35b-a3b-mtp-UD-Q4_K_XL.gguf").unwrap();
     let id = chosen["id"].as_str().unwrap();
+    let sha = &chosen["sha256"];
     let weights = cache_sparse_weights(&models, chosen);
 
     let offline = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -385,14 +369,18 @@ async fn a_model_switch_exits_75_and_startup_restores_or_falls_back() {
     let mut agent = spawn();
     let status = startup_status(&socket, |s| s["engine"] != "verifying weights").await;
     assert!(status["model_error"].is_null());
-    let reply = startup_request(&socket, json!({"op":"preference", "mode":"use", "model":id})).await;
-    assert_eq!(reply["state"], "switching");
+    let reply = startup_request(&socket, json!({"op":"preference", "mode":"use", "model":id, "weights_sha256":sha})).await;
+    assert_eq!(reply["state"], "switching", "{reply}");
     assert_eq!(timeout(Duration::from_secs(5), agent.wait()).await.unwrap().unwrap().code(), Some(75));
-    assert_eq!(serde_json::from_slice::<Value>(&fs::read(&active).unwrap()).unwrap()["id"], id);
+    let recorded: Value = serde_json::from_slice(&fs::read(&active).unwrap()).unwrap();
+    assert_eq!(recorded["id"], id);
+    assert_eq!(&recorded["weights_sha256"], sha);
 
     let mut agent = spawn();
     let status = startup_status(&socket, |s| s["engine"] != "verifying weights").await;
     assert_eq!(status["preference"]["model"], id);
+    assert_eq!(&status["preference"]["weights_sha256"], sha);
+    assert_eq!(&status["weights_sha256"], sha);
     assert!(status["model_error"].is_null());
     assert_eq!(startup_request(&socket, json!({"op":"preference","mode":"free"})).await["ok"], true);
     agent.kill().await.unwrap();
@@ -529,6 +517,118 @@ async fn socket_serves_status_while_active_model_is_hashed_without_cache() {
 }
 
 #[tokio::test]
+async fn incompatible_stage_leaves_the_control_socket_open() {
+    let dir = std::env::temp_dir().join(format!("publicompute-stage-version-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let stage = dir.join("publicompute-stage");
+    fs::write(&stage, "#!/bin/sh\nprintf 'publicompute-stage 0.1.6\\n'\n").unwrap();
+    fs::set_permissions(&stage, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut agent = tokio::process::Command::new(env!("CARGO_BIN_EXE_publicompute-agent"))
+        .arg("--data-dir").arg(&dir)
+        .arg("--stage-bin").arg(&stage)
+        .arg("--ca").arg(dir.join("unused-ca.pem"))
+        .stdout(Stdio::null()).kill_on_drop(true).spawn().unwrap();
+    let reason = format!("{} must be publicompute-stage {}", stage.display(), env!("CARGO_PKG_VERSION"));
+    assert_blocked(&dir.join("agent.sock"), &reason).await;
+    stop_blocked_agent(&mut agent).await;
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn coordinator_release_rejections_leave_the_control_socket_open() {
+    use prost::Message;
+    use publicompute_proto::{
+        common::{Error, ErrorCode},
+        node::{coordinator_message, enroll_server_message, CoordinatorMessage, EnrollResult, EnrollServerMessage},
+        wire,
+    };
+    use tokio::time::timeout;
+
+    for enrolled in [false, true] {
+        let dir = std::env::temp_dir().join(format!("publicompute-release-rejection-{}-{enrolled}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let ca = dir.join("ca.pem");
+        let (endpoint, fixture) = startup_coordinator(&ca);
+        if enrolled {
+            fs::write(dir.join("key.pem"), fixture.signing_key.serialize_pem()).unwrap();
+            fs::write(dir.join("identity.bin"), EnrollResult {
+                node_id: "test-node".into(),
+                certificate_chain_der: vec![fixture.cert.der().to_vec()],
+                ..Default::default()
+            }.encode_to_vec()).unwrap();
+        }
+        let mut agent = tokio::process::Command::new(env!("CARGO_BIN_EXE_publicompute-agent"))
+            .arg("--coordinator").arg(endpoint.local_addr().unwrap().to_string())
+            .arg("--data-dir").arg(&dir).arg("--ca").arg(&ca)
+            .arg("--skip-nat-probe")
+            .stdout(Stdio::null()).kill_on_drop(true).spawn().unwrap();
+        let (code, reason) = if enrolled {
+            (ErrorCode::UnsupportedProtocol, "the coordinator does not support this agent protocol")
+        } else {
+            (ErrorCode::AgentTooOld, "the coordinator requires agent version 99.0.0")
+        };
+        timeout(Duration::from_secs(5), async {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            let (mut send, _recv) = connection.accept_bi().await.unwrap();
+            let error = Error { code: code as i32, message: reason.into(), ..Default::default() };
+            let mut reply = Vec::new();
+            if enrolled {
+                wire::encode_frame(&CoordinatorMessage {
+                    seq: 1, body: Some(coordinator_message::Body::Error(error)),
+                }, &mut reply).unwrap();
+            } else {
+                wire::encode_frame(&EnrollServerMessage {
+                    body: Some(enroll_server_message::Body::Error(error)),
+                }, &mut reply).unwrap();
+            }
+            send.write_all(&reply).await.unwrap();
+            send.finish().unwrap();
+            assert_blocked(&dir.join("agent.sock"), reason).await;
+        }).await.expect("expected the rejection on the local control socket");
+        assert!(timeout(Duration::from_millis(1200), endpoint.accept()).await.is_err(), "the blocked agent reconnected");
+        stop_blocked_agent(&mut agent).await;
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+fn startup_coordinator(ca: &std::path::Path) -> (quinn::Endpoint, rcgen::CertifiedKey<rcgen::KeyPair>) {
+    use std::sync::Arc;
+
+    let fixture = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    fs::write(ca, fixture.cert.pem()).unwrap();
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(fixture.signing_key.serialize_der());
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions().unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![fixture.cert.der().clone()], key.into()).unwrap();
+    tls.alpn_protocols = vec![b"publicompute-node/0".to_vec()];
+    let server = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
+    ));
+    let endpoint = quinn::Endpoint::server(server, "127.0.0.1:0".parse().unwrap()).unwrap();
+    (endpoint, fixture)
+}
+
+async fn assert_blocked(socket: &std::path::Path, reason: &str) {
+    use serde_json::json;
+
+    let status = startup_status(socket, |s| s["update_required"].is_string()).await;
+    assert_eq!(status["update_required"], reason);
+    assert_eq!(status["engine"], "blocked");
+    assert_eq!(status["connected"], false);
+    assert_eq!(startup_request(socket, json!({"op":"status"})).await["status"]["update_required"], reason);
+    assert_eq!(startup_request(socket, json!({"op":"pause","active":false})).await["error"], "update_required");
+}
+
+async fn stop_blocked_agent(agent: &mut tokio::process::Child) {
+    use rustix::process::{kill_process, Pid, Signal};
+    let pid = Pid::from_raw(agent.id().unwrap() as i32).unwrap();
+    kill_process(pid, Signal::TERM).unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(5), agent.wait()).await.unwrap().unwrap();
+    assert!(status.success(), "{status}");
+}
+
+#[tokio::test]
 async fn stage_service_starts_free_then_prepares_the_installer_choice() {
     let dir = std::env::temp_dir().join(format!("publicompute-stage-startup-{}", std::process::id()));
     let models = dir.join("models");
@@ -541,7 +641,7 @@ async fn stage_service_starts_free_then_prepares_the_installer_choice() {
         .arg("--data-dir").arg(&dir)
         .arg("--ca").arg(&ca)
         .args(["--coordinator", &offline.local_addr().unwrap().to_string(), "--skip-nat-probe"])
-        .args(["--engine", "stages", "--stage-bin", "/unused-stage"])
+        .args(["--engine", "stages", "--stage-bin", env!("CARGO_BIN_EXE_fake-stage")])
         .stdout(Stdio::null()).kill_on_drop(true).spawn().unwrap();
     let socket = dir.join("agent.sock");
     let mut agent = spawn();
