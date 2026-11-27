@@ -12,7 +12,7 @@ fn percorso() -> Option<String> {
 }
 
 fn load(p: &str, k: u32) -> Engine {
-    Engine::load(&EngineOptions { model: p.into(), layer_start: 0, layer_end: -1, ngl: 0, threads: std::env::var("PUBLICOMPUTE_TEST_THREADS").ok().and_then(|x| x.parse().ok()).unwrap_or(4), slots: 1, groups: 1, ctx_per_slot: 256, n_batch: npr().max(64) as u32, experts: false, max_draft_tokens: k, mtp: false }).unwrap()
+    Engine::load(&EngineOptions { model: p.into(), layer_start: 0, layer_end: -1, ngl: 0, threads: std::env::var("PUBLICOMPUTE_TEST_THREADS").ok().and_then(|x| x.parse().ok()).unwrap_or(4), slots: 1, groups: 1, ctx_per_slot: 256, n_batch: npr().max(64) as u32, experts: false, max_draft_tokens: k, mtp: false, cache: Default::default() }).unwrap()
 }
 
 /// Choose a prompt long enough to fill a compressed attention block.
@@ -144,7 +144,7 @@ fn context_memory_with_and_without_draft() {
     for k in [0u32, 4] {
         let before = rss();
         println!("MEM ---- k={k}");
-        let mut m = Engine::load(&EngineOptions { model: p.clone(), layer_start: 0, layer_end: -1, ngl: 0, threads: 4, slots: 4, groups: 1, ctx_per_slot: 256, n_batch: 64, experts: false, max_draft_tokens: k, mtp: false }).unwrap();
+        let mut m = Engine::load(&EngineOptions { model: p.clone(), layer_start: 0, layer_end: -1, ngl: 0, threads: 4, slots: 4, groups: 1, ctx_per_slot: 256, n_batch: 64, experts: false, max_draft_tokens: k, mtp: false, cache: Default::default() }).unwrap();
         prefill(&mut m);
         println!("MEM k={k}: RSS after load and prefill {} KiB (before {} KiB)", rss(), before);
     }

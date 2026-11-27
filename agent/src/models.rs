@@ -30,9 +30,18 @@ pub static MANIFEST: LazyLock<Vec<Model>> =
     LazyLock::new(|| serde_json::from_str(include_str!("../models.json")).expect("invalid embedded model manifest"));
 
 pub fn find(id: &str, quant: Option<&str>) -> Option<&'static Model> {
-    MANIFEST
-        .iter()
-        .find(|m| m.id == id && quant.is_none_or(|q| q == m.quant))
+    MANIFEST.iter().find(|m| m.id == id && quant.is_none_or(|q| q == m.quant))
+}
+
+pub fn find_by_sha256(id: &str, quant: Option<&str>, sha256: &str) -> Option<&'static Model> {
+    MANIFEST.iter().find(|m| m.id == id && quant.is_none_or(|q| q == m.quant) && m.sha256.eq_ignore_ascii_case(sha256))
+}
+
+pub fn select(id: &str, quant: Option<&str>, sha256: Option<&str>) -> Option<&'static Model> {
+    match sha256 {
+        Some(sha256) => find_by_sha256(id, quant, sha256),
+        None => find(id, quant),
+    }
 }
 
 impl Model {
@@ -47,8 +56,8 @@ impl Model {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ActiveModel {
-    pub id: String,
-    pub quant: String,
+    #[serde(flatten)]
+    pub model: crate::contribution::ModelSelection,
     // Apply a completed switch only if no later preference replaced it.
     #[serde(default)]
     pub use_revision: Option<u64>,
@@ -195,15 +204,15 @@ impl Store {
         }
     }
 
-    pub fn active(&self, accept: impl FnOnce(&ActiveModel) -> bool) -> Result<Option<(&'static Model, ActiveModel)>> {
+    pub fn active(&self, accept: impl FnOnce(&Model, &ActiveModel) -> bool) -> Result<Option<(&'static Model, ActiveModel)>> {
         let Some(active): Option<ActiveModel> = read_json(&self.data_dir.join("active-model.json"), false)? else {
             return Ok(None);
         };
-        let Some(model) = find(&active.id, Some(&active.quant)) else {
+        let Some(model) = active.model.manifest_entry() else {
             // Older releases can leave a selection for weights we no longer serve.
             return Ok(None);
         };
-        if !accept(&active) {
+        if !accept(model, &active) {
             return Ok(None);
         }
         self.verify(model, || true)?;
@@ -215,8 +224,7 @@ impl Store {
         write_json(
             &self.data_dir.join("active-model.json"),
             &ActiveModel {
-                id: model.id.clone(),
-                quant: model.quant.clone(),
+                model: model.into(),
                 use_revision,
             },
         )
@@ -232,7 +240,7 @@ impl Store {
     fn remember(&self, model: &Model, stamp: FileStamp) {
         let _cache = self.cache.lock().unwrap();
         let mut entries = self.verified();
-        entries.retain(|v| v.id != model.id || v.quant != model.quant);
+        entries.retain(|v| v.id != model.id || v.quant != model.quant || v.sha256 != model.sha256);
         entries.push(Verified {
             id: model.id.clone(),
             quant: model.quant.clone(),
@@ -491,16 +499,18 @@ pub mod tests {
     fn manifest_matches_catalog_and_downloads() {
         let catalog: Value = serde_json::from_str(include_str!("../../infra/hetzner/models.json")).unwrap();
         let catalog = catalog["models"].as_array().unwrap();
-        assert_eq!(MANIFEST.len(), 2);
-        assert_eq!(catalog.len(), MANIFEST.len());
+        assert_eq!(MANIFEST.len(), 3);
         for row in catalog {
             let model = find(row["id"].as_str().unwrap(), None).unwrap();
             assert_eq!(row["quantization"], model.quant);
             assert_eq!(row["weights_sha256"], model.sha256);
         }
+        let mut files = std::collections::HashSet::new();
         for model in MANIFEST.iter() {
             assert_eq!(model.reference().weights_sha256.len(), 32);
-            assert_eq!(model.file, format!("{}-{}.gguf", model.id, model.quant));
+            assert!(files.insert(&model.file));
+            assert!(model.file.starts_with(&format!("{}-", model.id)));
+            assert!(model.file.ends_with(&format!("-{}.gguf", model.quant)));
             let url = reqwest::Url::parse(&model.url).unwrap();
             assert!(allowed_url(&url));
             let (_, path) = url.path().split_once("/resolve/").unwrap();
@@ -556,16 +566,16 @@ pub mod tests {
         let store = fixture_store("active-model");
         let model = find("qwen3.6-35b-a3b", None).unwrap();
         let active = store.data_dir.join("active-model.json");
-        assert!(store.active(|_| true).unwrap().is_none());
+        assert!(store.active(|_, _| true).unwrap().is_none());
 
         fs::write(&active, b"{ broken").unwrap();
-        assert!(store.active(|_| true).is_err());
+        assert!(store.active(|_, _| true).is_err());
         fs::write(&active, br#"{"id":"unknown","quant":"q"}"#).unwrap();
-        assert!(store.active(|_| true).unwrap().is_none());
+        assert!(store.active(|_, _| true).unwrap().is_none());
 
         cached_weights(&store, model);
         store.save_active(model, Some(42)).unwrap();
-        let (restored, selection) = store.active(|_| true).unwrap().unwrap();
+        let (restored, selection) = store.active(|_, _| true).unwrap().unwrap();
         assert_eq!(restored.id, model.id);
         assert_eq!(selection.use_revision, Some(42));
         File::options()
@@ -574,8 +584,8 @@ pub mod tests {
             .unwrap()
             .set_len(40)
             .unwrap();
-        assert!(store.active(|_| false).unwrap().is_none());
-        assert!(store.active(|_| true).unwrap_err().to_string().contains("incorrect model size"));
+        assert!(store.active(|_, _| false).unwrap().is_none());
+        assert!(store.active(|_, _| true).unwrap_err().to_string().contains("incorrect model size"));
         fs::remove_dir_all(&store.data_dir).unwrap();
     }
 

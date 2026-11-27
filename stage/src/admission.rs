@@ -153,20 +153,35 @@ impl Admission {
     /// Return the conversation, group, and local slot assigned to the first
     /// eligible request. Leave the queues intact when admission is blocked.
     pub fn prossima(&mut self) -> Option<(usize, usize, u32)> {
+        self.prossima_con(|_, liberi, membri| {
+            let g = (0..liberi.len()).filter(|&g| !liberi[g].is_empty()).min_by_key(|&g| (membri[g], g))?;
+            Some((g, *liberi[g].front()?))
+        }).ok().flatten()
+    }
+
+    /// Select among free slots. If free slots exist but the selection
+    /// declines all of them, return that request so it can be rejected.
+    pub fn prossima_con(&mut self, choose: impl FnOnce(usize, &[VecDeque<u32>], &[usize]) -> Option<(usize, u32)>)
+        -> Result<Option<(usize, usize, u32)>, usize>
+    {
         let (c, batch) = match (self.tail.front(), self.coda_b.front()) {
             (Some(&c), _) => (c, false),
             (None, Some(&c)) => (c, true),
-            (None, None) => return None,
+            (None, None) => return Ok(None),
         };
-        if self.occupati >= self.slots {
-            return None;
+        if self.occupati >= self.slots || self.liberi.iter().all(VecDeque::is_empty) {
+            return Ok(None);
         }
         // Let a batch start on an empty stage even when the reserve would otherwise block it.
         if batch && self.occupati > 0 && self.slots - self.occupati <= self.riserva {
-            return None;
+            return Ok(None);
         }
-        let g = (0..self.liberi.len()).filter(|&g| !self.liberi[g].is_empty()).min_by_key(|&g| (self.membri[g], g))?;
-        let locale = self.liberi[g].pop_front()?;
+        let Some((g, locale)) = choose(c, &self.liberi, &self.membri) else {
+            self.cancel(c);
+            return Err(c);
+        };
+        let pos = self.liberi[g].iter().position(|&s| s == locale).expect("selected slot must be free");
+        self.liberi[g].remove(pos);
         if batch {
             self.coda_b.pop_front();
         } else {
@@ -175,7 +190,7 @@ impl Admission {
         self.st[c] = St::Ammessa { gruppo: g, locale };
         self.membri[g] += 1;
         self.occupati += 1;
-        Some((c, g, locale))
+        Ok(Some((c, g, locale)))
     }
 
     /// Return the slot to its group's free list. Repeated calls are harmless.

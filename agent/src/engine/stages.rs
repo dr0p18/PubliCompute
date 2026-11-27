@@ -25,7 +25,7 @@ use super::{
     progress::{Phase, Progress},
     prompt_tokens_sha256, request_error, FaultCause, Generation, Limits, TokenProbs,
 };
-use crate::stages::{Stages, OutgoingLink};
+use crate::stages::{HeadConnection, OutgoingLink, Stages};
 
 /// Map the request's temperature, seed and sampling cutoffs to the head service protocol.
 fn campionamento_testa(s: &SamplingParams) -> pb::Sampling {
@@ -36,12 +36,13 @@ fn campionamento_testa(s: &SamplingParams) -> pb::Sampling {
 const MAX_TOKEN_DEFAULT: u32 = 1024;
 
 /// A streamed fragment and the token range it covers.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Delta {
     /// Index of the first token covered by this fragment.
     pub index: u32,
     pub text: String,
     pub token_ids: Vec<u32>,
+    pub slot_taken: Option<publicompute_proto::common::SlotTaken>,
 }
 
 impl OutputSize for Delta {
@@ -54,6 +55,16 @@ pub type DeltaSender = OutputSender<Delta>;
 
 pub fn delta_channel() -> (DeltaSender, mpsc::Receiver<Queued<Delta>>, watch::Receiver<bool>) {
     output::channel(256, 4 << 20)
+}
+
+async fn send_delta(link: &HeadConnection, id: u64, sender: &DeltaSender, delta: Delta) -> Result<()> {
+    if let Err(error) = sender.send(delta) {
+        // The caller may have dropped the work stream, so release the head's slot.
+        link.dimentica(id);
+        link.cancel(id).await;
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 pub struct StadiEngine {
@@ -122,13 +133,13 @@ impl StadiEngine {
 
     /// Run a chat using the shared engine progress counter.
     pub async fn chat(&self, req: &InferenceRequest, deltas: Option<DeltaSender>, cancel: Option<oneshot::Receiver<()>>) -> Result<Generation> {
-        self.chat_lease(req, "", &self.progress, deltas, cancel).await
+        self.chat_lease(req, super::ChatContext::default(), &self.progress, deltas, cancel).await
     }
 
     /// Give this chat its own progress counter and optionally stream text as it
     /// arrives. Also update shared progress for supervision. Cancellation or
     /// loss of its sender sends a cancel message to the head and ends the lease.
-    pub async fn chat_lease(&self, req: &InferenceRequest, chat_id: &str, progress: &Progress, deltas: Option<DeltaSender>, mut cancel: Option<oneshot::Receiver<()>>) -> Result<Generation> {
+    pub async fn chat_lease(&self, req: &InferenceRequest, chat: super::ChatContext<'_>, progress: &Progress, deltas: Option<DeltaSender>, mut cancel: Option<oneshot::Receiver<()>>) -> Result<Generation> {
         let Some(link) = self.stages.head() else {
             return Err(request_error(RequestFailureCode::EngineError, "no chain head is ready on this node"));
         };
@@ -139,7 +150,7 @@ impl StadiEngine {
         let _attiva = Attiva::new(self);
         let s = req.sampling.clone().unwrap_or_default();
         let id = link.nuovo_id();
-        tracing::info!(chat = chat_id, request = %req.request_id, head_request = id, "sending request to head");
+        tracing::info!(chat = chat.id, request = %req.request_id, head_request = id, "sending request to head");
         let t0 = Instant::now();
         self.su_entrambi(progress, |p| p.set_phase(Phase::Prefill));
         self.su_entrambi(progress, Progress::tick);
@@ -153,7 +164,10 @@ impl StadiEngine {
                 sampling: Some(campionamento_testa(&s)),
                 stop: s.stop.clone(),
                 class: pb::Class::Interactive as i32,
-                chat_id: chat_id.to_owned(),
+                chat_id: chat.id.to_owned(),
+                owner_key: chat.owner.to_vec(),
+                member_seat: chat.member_seat,
+                member_key: chat.member_key.to_vec(),
             })
             .await
             .map_err(|e| fault(FaultCause::Connection, format!("request to the head: {e:#}")))?;
@@ -199,14 +213,15 @@ impl StadiEngine {
                         // Include tokens with no text in the next displayable fragment so token offsets stay aligned.
                         if !t.text.is_empty() || t.eog {
                             if let Some(d) = &deltas {
-                                if let Err(error) = d.send(Delta { index: primo_indice, text: t.text, token_ids: std::mem::take(&mut in_attesa) }) {
-                                    link.dimentica(id);
-                                    link.cancel(id).await;
-                                    return Err(error.into());
-                                }
+                                send_delta(&link, id, d, Delta { index: primo_indice, text: t.text, token_ids: std::mem::take(&mut in_attesa), ..Default::default() }).await?;
                             }
                             in_attesa.clear();
                             primo_indice = token_ids.len() as u32;
+                        }
+                    }
+                    Ok(Some(OutgoingLink::Admission(slot))) => {
+                        if let Some(d) = &deltas {
+                            send_delta(&link, id, d, Delta { slot_taken: Some(slot), ..Default::default() }).await?;
                         }
                     }
                     Ok(Some(OutgoingLink::Done(f))) => break f,
@@ -232,6 +247,7 @@ impl StadiEngine {
                 let code = match done.error.as_str() {
                     "context_length_exceeded" => RequestFailureCode::ContextTooLong,
                     "invalid_request" => RequestFailureCode::InvalidRequest,
+                    "capacity_unavailable" => RequestFailureCode::CapacityUnavailable,
                     _ => RequestFailureCode::EngineError,
                 };
                 return Err(request_error(code, "head rejected the request"));
@@ -245,16 +261,22 @@ impl StadiEngine {
         text.push_str(&done.remaining_text);
         if let Some(d) = &deltas {
             if !done.remaining_text.is_empty() || !in_attesa.is_empty() {
-                d.send(Delta { index: primo_indice, text: done.remaining_text.clone(), token_ids: std::mem::take(&mut in_attesa) })?;
+                send_delta(&link, id, d, Delta { index: primo_indice, text: done.remaining_text.clone(), token_ids: std::mem::take(&mut in_attesa), ..Default::default() }).await?;
             }
         }
         let prompt: Vec<u32> = done.prompt_token.iter().map(|&t| t as u32).collect();
         let t_primo = primo_token.unwrap_or_else(Instant::now);
+        let usage = done.usage.unwrap_or(pb::Usage { prompt_tokens: prompt.len() as u32, ..Default::default() });
+        if usage.cached_prompt_tokens > usage.prompt_tokens {
+            return Err(request_error(RequestFailureCode::EngineError, "invalid head prompt cache usage"));
+        }
         Ok(Generation {
             text,
             token_ids,
             finish_reason,
-            prompt_tokens: done.usage.map_or(prompt.len() as u32, |u| u.prompt_tokens),
+            prompt_tokens: usage.prompt_tokens,
+            cached_prompt_tokens: usage.cached_prompt_tokens,
+            slot_report: done.slot_report,
             prompt_tokens_sha256: prompt_tokens_sha256(&prompt),
             probs,
             verification_incomplete: false,

@@ -31,7 +31,6 @@ message NodeMessage {
     ModelInventory model_inventory = 18;
     Goodbye goodbye = 19;
     StageStatus stage_status = 20;
-    // Send these three message types only when Welcome advertises protocol minor 2 or higher.
     ContributionPreference contribution = 21;
     ModelDirectiveStatus model_directive_status = 22;
     Leaving leaving = 23;
@@ -94,12 +93,12 @@ message Welcome {
   google.protobuf.Duration heartbeat_interval = 3;
   // Used to estimate the offset between coordinator and node clocks.
   google.protobuf.Timestamp server_time = 4;
-  // When set, halt work until the agent meets the required release.
+  // The coordinator requires this agent release.
   string min_agent_version = 5;
   // Ed25519 key for verifying signed chain capabilities. Empty means the
   // coordinator does not advertise a signing key.
   bytes capability_pub = 6;
-  // If absent, the node withholds message bodies that require minor version 2.
+  // The coordinator uses this exact protocol version.
   publicompute.common.v1.ProtocolVersion protocol_version = 7;
   // Allows the agent to send the peer probe replies it advertised in Hello.
   bool peer_probes = 8;
@@ -279,6 +278,9 @@ enum AgentFeature {
   AGENT_FEATURE_STAGES = 6;
   AGENT_FEATURE_NETWORK_MEASUREMENT = 7;
   AGENT_FEATURE_PEER_ECHO = 8;
+  // The agent and its stage binary apply StageAssign.engine_profile. A node without it only receives the profile
+  // f16/f16/auto/none/0, which is what such a node already does.
+  AGENT_FEATURE_STAGE_ENGINE_PROFILE = 9;
 }
 
 enum ContributionMode {

@@ -65,7 +65,12 @@ fn begin_message(csr_der: &[u8], hw: HardwareProfile, fingerprint: Vec<u8>, owne
 async fn next(r: &mut FrameReader) -> Result<enroll_server_message::Body> {
     let m: EnrollServerMessage = r.read().await?.context("coordinator closed the stream")?;
     match m.body {
-        Some(enroll_server_message::Body::Error(e)) => bail!("enrollment rejected: {} ({:?})", e.message, e.code()),
+        Some(enroll_server_message::Body::Error(e)) => {
+            if let Some(rejection) = crate::session::IncompatibleRelease::from_protocol(&e) {
+                return Err(rejection.into());
+            }
+            bail!("enrollment rejected: {} ({:?})", e.message, e.code())
+        }
         Some(b) => Ok(b),
         None => bail!("empty message"),
     }

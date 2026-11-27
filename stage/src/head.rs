@@ -26,13 +26,17 @@ use crate::sampling::{campiona_tagli, controlla_seme_tagli, logprob, seme_conver
 use crate::conversation::{Action, Config, Conversation, TokenOutcome, Status};
 use crate::experts::{self, RecEsperti};
 use crate::engine::{Engine, Row};
-use crate::safeguards::{conferma_catena_vecchia, Protezioni};
+use crate::safeguards::Protezioni;
 use crate::network::{self, encode_state, msg, Writer};
 use crate::service::{Event as EvServ, Utf8Fragments, Service};
 use crate::output::{self, RecordConv};
+use crate::parking::{self, AdmissionRequest, OpenReply, Parked};
+use crate::slot::SlotKey;
+use zeroize::{Zeroize, Zeroizing};
 use publicompute_proto::service as pbs;
 use publicompute_proto::stage::{self as pb, message::Body};
-use std::collections::VecDeque;
+use ring::rand::{SecureRandom, SystemRandom};
+use std::collections::{HashMap, VecDeque};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
@@ -116,6 +120,8 @@ pub struct HeadOptions {
     /// admission instead of prompts read from a file.
     pub service: Option<String>,
     pub service_pipe: bool,
+    pub park_ttl_s: u32,
+    pub park_grace_s: u32,
     /// Maximum speculative rows per conversation and step. Zero disables drafts.
     /// Set the same limit on every stage so recurrent snapshots cover any rewind.
     pub max_draft_tokens: u32,
@@ -177,6 +183,7 @@ enum Fail {
     Guasto(String),
     /// Single-conversation fault (index in `convs`): recover only that conversation.
     GuastoConv(usize, String),
+    Replay { conversation: usize, save_failed: bool },
     Fatale(String),
 }
 
@@ -229,6 +236,8 @@ struct Conv {
     conv_id: u64,
     gruppo: usize,
     slot: u32,
+    generation: u64,
+    cache: TurnCache,
     prompt: Vec<i32>,
     /// Conversation state machine (state, attempt, authoritative transcript).
     c: Conversation,
@@ -274,6 +283,42 @@ struct Conv {
     filtro: StopFilter,
     /// Draft depth policy, next computed position, and counters.
     bz: BozzaConv,
+}
+
+#[derive(Default)]
+struct TurnCache {
+    owner: Zeroizing<Vec<u8>>,
+    member: bool,
+    member_key: Zeroizing<Vec<u8>>,
+    save_at: Option<u32>,
+    checkpoint: Option<Zeroizing<Vec<u8>>>,
+    reuse: Option<Parked>,
+    opening: Option<(OpenReply, Instant)>,
+    cached: u32,
+}
+
+impl Conv {
+    fn admission_request(&self) -> AdmissionRequest<'_> {
+        AdmissionRequest {
+            owner: if self.c.sospesa_volontaria() { &[] } else { &self.cache.owner },
+            member: self.cache.member,
+            prompt: &self.prompt,
+            save_at: self.cache.save_at,
+        }
+    }
+}
+
+impl TurnCache {
+    fn discard(&mut self) {
+        self.checkpoint = None;
+        self.reuse = None;
+        self.opening = None;
+    }
+
+    fn invalidate(&mut self) {
+        self.discard();
+        self.cached = 0;
+    }
 }
 
 /// Scan complete UTF-8 for stop strings. Emit the text before the first
@@ -387,14 +432,21 @@ fn token_prefill_locale(gruppo: u32, conv_id: u64, tentativo: u32, passo_primo: 
         group_id: gruppo,
         group_round: 0,
         prefill: true,
-        rows: vec![pb::TokenRow { conversation_id: conv_id, attempt_id: tentativo, conversation_step: passo_primo, token: token as i32, logprob, draft: Vec::new() }],
+        rows: vec![pb::TokenRow { conversation_id: conv_id, attempt_id: tentativo, conversation_step: passo_primo, token: token as i32, logprob, draft: Vec::new(), slot_generation: 0 }],
         stage: 0,
+        chain_epoch: 0,
     }
 }
 
 /// Conversations still without `done` at end of run (rebuilding, suspended or unfinished): "name (state, n tokens)".
 fn non_concluse(convs: &[Conv]) -> Vec<String> {
     convs.iter().filter(|c| c.done.is_none()).map(|c| format!("{} ({:?}, {} tokens)", c.prompt_id, c.c.state(), c.token.len())).collect()
+}
+
+fn first_token_for(token: &pb::Token, key: SlotKey) -> bool {
+    token.prefill && token.rows.first().is_some_and(|r| {
+        r.conversation_id == key.conversation && r.attempt_id == key.attempt && r.slot_generation == key.generation
+    })
 }
 
 /// Reserve the low 32 bits for rounds and the high 32 for recovery episodes
@@ -428,11 +480,12 @@ fn classify_confirmation(convs: &[Conv], c: &pb::Confirmation) -> ConfirmationCl
         return ConfirmationClass::Ignora;
     }
     match convs.iter().position(|x| x.conv_id == c.conversation_id) {
-        None => ConfirmationClass::Chain,
+        None if c.conversation_id == 0 => ConfirmationClass::Chain,
+        None => ConfirmationClass::Ignora,
         Some(i) => {
             let cv = &convs[i];
             // Ignore failures from in-flight work retired by voluntary suspension.
-            if cv.done.is_some() || cv.c.state().terminale() || cv.c.sospesa_volontaria() || c.attempt_id != cv.c.tentativo() {
+            if cv.done.is_some() || cv.c.state().terminale() || cv.c.sospesa_volontaria() || c.attempt_id != cv.c.tentativo() || c.slot != cv.slot || c.slot_generation != cv.generation {
                 ConfirmationClass::Ignora
             } else {
                 ConfirmationClass::Conv(i)
@@ -594,12 +647,20 @@ fn spingi_limitato(v: &mut Vec<f64>, x: f64, tetto: usize) {
 }
 
 impl Conv {
+    fn slot_key(&self) -> SlotKey {
+        SlotKey { seq: self.slot, generation: self.generation, conversation: self.conv_id, attempt: self.c.tentativo() }
+    }
+
     /// Release heap allocations after the final service response. Request entries
     /// remain indexable until idle compaction. File-based outputs still need their data.
     fn clear_weights(&mut self) {
         if self.ext_id == 0 {
             return;
         }
+        self.cache = TurnCache::default();
+        self.prompt.zeroize();
+        self.da_inviare.zeroize();
+        self.token.zeroize();
         self.prompt = Vec::new();
         self.da_inviare = Vec::new();
         self.token = Vec::new();
@@ -679,17 +740,37 @@ struct Head<'a> {
     posti_tot: u32,
     /// Aggregate draft counters survive request compaction.
     bozza_tot: ContatoriBozza,
+    park_enabled: bool,
+    parked: HashMap<u32, Parked>,
+    slot_generation: u64,
+    chain_epoch: u64,
 }
 
 impl<'a> Head<'a> {
     #[allow(clippy::too_many_arguments)]
-    fn new(m: &'a mut Engine, o: &'a HeadOptions, network: Option<&'a HeadLinks>, convs: Vec<Conv>, valle: Downstream, amm: Admission, slots: u32) -> Self {
+    fn new(m: &'a mut Engine, o: &'a HeadOptions, network: Option<&'a HeadLinks>, convs: Vec<Conv>, valle: Downstream, amm: Admission, slots: u32) -> Result<Self, String> {
         let prossimo_conv = convs.len() as u64 + 1;
-        Head { m, o, network, convs, valle, pronti: Vec::new(), t0: Instant::now(), esp: Vec::new(), top: Vec::new(), ctl_seme: Vec::new(), episodio: 0, tempi_stadi: Default::default(), rotta: false, registrati: 0, round: Vec::new(), in_volo: VecDeque::new(), membri_volo: Vec::new(), gen_avviata: false, amm, passi: 0, corrente: None, attesa_primo: VecDeque::new(), giro_amm: 0, ultimo_cons: None, lavoro_amm: false, int_con: Vec::new(), int_senza: Vec::new(), mis: Default::default(), prot: Protezioni::default(), serv: None, serv_vive: Vec::new(), serv_stato: None, prossimo_conv, posti_tot: slots, bozza_tot: ContatoriBozza::default() }
+        let park_enabled = o.park_ttl_s > 0 && m.supports_parking();
+        // A replacement head may reconnect to intermediates that still have
+        // generation frames from the old process in their outgoing queues.
+        let mut seed = [0; 8];
+        SystemRandom::new().fill(&mut seed).map_err(|_| "could not initialize the chain epoch")?;
+        let chain_epoch = (u64::from_le_bytes(seed) >> 1).max(1);
+        let head = Head { m, o, network, convs, valle, pronti: Vec::new(), t0: Instant::now(), esp: Vec::new(), top: Vec::new(), ctl_seme: Vec::new(), episodio: 0, tempi_stadi: Default::default(), rotta: false, registrati: 0, round: Vec::new(), in_volo: VecDeque::new(), membri_volo: Vec::new(), gen_avviata: false, amm, passi: 0, corrente: None, attesa_primo: VecDeque::new(), giro_amm: 0, ultimo_cons: None, lavoro_amm: false, int_con: Vec::new(), int_senza: Vec::new(), mis: Default::default(), prot: Protezioni::default(), serv: None, serv_vive: Vec::new(), serv_stato: None, prossimo_conv, posti_tot: slots, bozza_tot: ContatoriBozza::default(), park_enabled, parked: HashMap::new(), slot_generation: 0, chain_epoch };
+        head.announce_epoch()?;
+        Ok(head)
     }
 }
 
 impl Head<'_> {
+    fn announce_epoch(&self) -> Result<(), String> {
+        if let Downstream::Rete(v) = &self.valle {
+            let reset = msg(Body::Reset(pb::Reset { chain_epoch: self.chain_epoch }));
+            v.col.prefill.send_with_wait(&reset, Writer::queue_timeout())?;
+        }
+        Ok(())
+    }
+
     fn ms(&self, t: Instant) -> f64 {
         t.duration_since(self.t0).as_secs_f64() * 1000.0
     }
@@ -741,11 +822,14 @@ impl Head<'_> {
             match a {
                 Action::Open { tentativo, start_position } => self.convs[c].da_aprire = Some((tentativo, start_position)),
                 Action::Close { tentativo } => {
+                    let key = self.convs[c].slot_key();
+                    let keep_parked = self.parked.get(&key.seq).is_some_and(|p| p.key == key);
                     if let Downstream::Rete(v) = &self.valle {
                         if !self.rotta {
                             // Close shares the prefill stream so Open cannot overtake it.
                             let close = msg(Body::Close(pb::Close {
-                                conversation_id: self.convs[c].conv_id, attempt_id: tentativo,
+                                conversation_id: key.conversation, attempt_id: tentativo, slot: key.seq,
+                                slot_generation: key.generation, keep_parked,
                             }));
                             if let Err(e) = v.col.prefill.send_with_wait(&close, Duration::from_millis(100)) {
                                 self.rotta = true;
@@ -766,31 +850,70 @@ impl Head<'_> {
         }
     }
 
-    /// Send `Open` for the attempt chosen by the state machine. The caller then prefills the confirmed prefix.
+    /// Reserve a new generation. A warm open must be confirmed before any
+    /// part of its suffix enters the chain.
     fn open(&mut self, c: usize) -> R {
-        let Some((tentativo, pos)) = self.convs[c].da_aprire.take() else { return Ok(()) };
+        let Some((tentativo, start)) = self.convs[c].da_aprire.take() else { return Ok(()) };
+        debug_assert_eq!(start, 0);
+        self.slot_generation = self.slot_generation.checked_add(1).ok_or("slot generation exhausted")?;
         let cv = &mut self.convs[c];
-        // Prompt + recorded tokens (prompt alone on first open).
+        cv.generation = self.slot_generation;
+        let key = cv.slot_key();
+        // The coordinator can account for grace as soon as the physical slot is taken.
+        if self.park_enabled && cv.ext_id != 0 {
+            if let Some(service) = &self.serv {
+                service.manda(pbs::FromHead { body: Some(pbs::from_head::Body::Admission(pbs::Admission {
+                    id: cv.ext_id,
+                    slot_taken: Some(publicompute_proto::common::SlotTaken { slot: key.seq, generation: key.generation }),
+                })) });
+            }
+        }
+        cv.da_inviare.zeroize();
         cv.da_inviare = cv.prompt.iter().chain(cv.token.iter()).copied().collect();
         debug_assert_eq!(cv.da_inviare.len() as u32, cv.c.prefisso_len());
         cv.passo_primo = cv.c.expected_step();
-        cv.inviati = pos as usize;
-        // The slot is cleared below, so there is nothing to rewind. Any in-flight draft is lost.
         cv.bz.calcolata = 0;
         cv.bz.in_volo = 0;
         cv.bz.mtp = None;
-        let (conv_id, gruppo, slot) = (cv.conv_id, cv.gruppo, cv.slot);
-        self.m.svuota_posto(slot);
+        let mut pos = 0;
+        let mut prev = None;
+        if let Some(retained) = cv.cache.reuse.take() {
+            pos = retained.tokens.len() as u32;
+            if let Err(e) = self.m.restore_checkpoint(key.seq, pos, &retained.checkpoint) {
+                eprintln!("[head] restoring slot {} failed: {e}", key.seq);
+                return Err(Fail::Replay { conversation: c, save_failed: false });
+            }
+            if cv.cache.save_at == Some(pos) {
+                cv.cache.checkpoint = Some(retained.checkpoint);
+            }
+            prev = Some(retained.key);
+            match &self.valle {
+                Downstream::Rete(v) => {
+                    let reply = OpenReply { key, position: pos, epoch: v.col.epoch, chain_epoch: self.chain_epoch };
+                    cv.cache.opening = Some((reply, Instant::now() + Duration::from_secs(self.o.t_lavoro_s)));
+                }
+                Downstream::Locale => cv.cache.cached = pos,
+            }
+        } else {
+            cv.cache.invalidate();
+            self.m.svuota_posto(key.seq);
+        }
+        cv.inviati = pos as usize;
         let ap = pb::Open {
-            conversation_id: conv_id,
+            conversation_id: key.conversation,
             attempt_id: tentativo,
-            group_id: gruppo as u32,
-            slot,
+            group_id: cv.gruppo as u32,
+            slot: key.seq,
             context_limit: self.o.ctx_per_slot,
             start_position: pos,
-            // Conversation (temperature, seed) comes from options in tests and the request in service mode.
-            sampling: Some(pb::Sampling { temperature: self.convs[c].seme_ctl.0, root_seed: self.convs[c].seme_ctl.1, top_p: self.convs[c].tagli.top_p, top_k: self.convs[c].tagli.top_k }),
+            sampling: Some(pb::Sampling { temperature: cv.seme_ctl.0, root_seed: cv.seme_ctl.1, top_p: cv.tagli.top_p, top_k: cv.tagli.top_k }),
             state_format: self.o.state_format as i32,
+            reuse_slot: prev.is_some(),
+            expected_prev_conv_id: prev.map_or(0, |p| p.conversation),
+            expected_prev_attempt_id: prev.map_or(0, |p| p.attempt),
+            expected_prev_slot_generation: prev.map_or(0, |p| p.generation),
+            restore_checkpoint: prev.is_some(),
+            slot_generation: key.generation,
         };
         self.manda(false, msg(Body::Open(ap)), |head| head.convs[c].done.is_none())
     }
@@ -801,12 +924,27 @@ impl Head<'_> {
             let cv = &self.convs[c];
             (cv.conv_id, cv.gruppo, cv.slot, cv.inviati, cv.da_inviare.len(), cv.c.tentativo(), cv.passo_primo)
         };
-        let n = self.o.block.min(tot - off);
+        let cache = &self.convs[c].cache;
+        let n = parking::block_len(off, tot, self.o.block, cache.save_at);
         let last = off + n == tot;
+        let save_checkpoint = cache.save_at == Some((off + n) as u32);
+        let generation = self.convs[c].generation;
         let rows: Vec<Row> = (0..n)
             .map(|i| Row { token: self.convs[c].da_inviare[off + i], pos: (off + i) as i32, seq: slot as i32, logits: last && i + 1 == n })
             .collect();
         let state = self.m.run(&rows, None)?;
+        if save_checkpoint {
+            match self.m.save_checkpoint(slot) {
+                Ok(data) => {
+                    eprintln!("[head] checkpoint slot={slot} position={} bytes={}", off + n, data.len());
+                    self.convs[c].cache.checkpoint = Some(data);
+                }
+                Err(e) => {
+                    eprintln!("[head] saving checkpoint for slot {slot} failed: {e}");
+                    return Err(Fail::Replay { conversation: c, save_failed: true });
+                }
+            }
+        }
         let state = if self.o.prova_stato_int8 { state.map(|s| degrada_int8(&s, self.m.n_embd)) } else { state };
         // Send input token IDs alongside the residuals when the tail fills a draft context.
         let token_blocco: Vec<i32> = if self.o.draft_source == DraftSource::Mtp { self.convs[c].da_inviare[off..off + n].to_vec() } else { Vec::new() };
@@ -836,6 +974,9 @@ impl Head<'_> {
                     first_token_step: passo_primo,
                     token: token_blocco,
                     draft_count: k_blocco,
+                    save_checkpoint,
+                    slot,
+                    slot_generation: generation,
                 })),
                 |head| head.convs[c].done.is_none(),
             ),
@@ -846,7 +987,10 @@ impl Head<'_> {
                     if self.o.top.is_some() && self.serv.is_none() {
                         self.top.push(crate::sampling::RecTop { c: conv_id, s: passo_primo, t: crate::sampling::top_k(l, crate::stage::TOP_K) });
                     }
-                    self.pronti.push((token_prefill_locale(gruppo as u32, conv_id, tentativo, passo_primo, t, lp), Instant::now()));
+                    let mut token = token_prefill_locale(gruppo as u32, conv_id, tentativo, passo_primo, t, lp);
+                    token.rows[0].slot_generation = generation;
+                    token.chain_epoch = self.chain_epoch;
+                    self.pronti.push((token, Instant::now()));
                 }
                 Ok(())
             }
@@ -957,7 +1101,7 @@ impl Head<'_> {
             cv.bz.calcolata = pos as u32 + 1 + draft.len() as u32;
             let cv = &self.convs[c];
             rows.push(Row { token: *cv.token.last().unwrap(), pos, seq: cv.slot as i32, logits: true });
-            rp.push(pb::StepRow { conversation_id: cv.conv_id, attempt_id: cv.c.tentativo(), conversation_step: cv.token.len() as u32, position: pos as u32, draft_token: 0, draft_count: k_chiesta });
+            rp.push(pb::StepRow { conversation_id: cv.conv_id, attempt_id: cv.c.tentativo(), conversation_step: cv.token.len() as u32, position: pos as u32, draft_token: 0, draft_count: k_chiesta, slot: cv.slot, slot_generation: cv.generation });
             for (i, &d) in draft.iter().enumerate() {
                 rows.push(Row { token: d, pos: pos + 1 + i as i32, seq: cv.slot as i32, logits: true });
                 rp.push(pb::StepRow {
@@ -967,6 +1111,8 @@ impl Head<'_> {
                     position: (pos + 1 + i as i32) as u32,
                     draft_token: d,
                     draft_count: 0,
+                    slot: cv.slot,
+                    slot_generation: cv.generation,
                 });
             }
         }
@@ -985,6 +1131,7 @@ impl Head<'_> {
                 msg(Body::Step(pb::Step {
                     group_id: g as u32,
                     group_round: round,
+                    chain_epoch: self.chain_epoch,
                     rows: rp,
                     n_embd: self.m.n_embd as u32,
                     format: self.o.state_format as i32,
@@ -1008,9 +1155,9 @@ impl Head<'_> {
                 let out: Vec<pb::TokenRow> = rp
                     .iter()
                     .zip(scelte)
-                    .map(|(r, (t, lp))| pb::TokenRow { conversation_id: r.conversation_id, attempt_id: r.attempt_id, conversation_step: r.conversation_step, token: t as i32, logprob: lp, draft: Vec::new() })
+                    .map(|(r, (t, lp))| pb::TokenRow { conversation_id: r.conversation_id, attempt_id: r.attempt_id, conversation_step: r.conversation_step, token: t as i32, logprob: lp, draft: Vec::new(), slot_generation: r.slot_generation })
                     .collect();
-                self.pronti.push((pb::Token { group_id: g as u32, group_round: round, prefill: false, rows: out, stage: 0 }, Instant::now()));
+                self.pronti.push((pb::Token { group_id: g as u32, group_round: round, prefill: false, rows: out, stage: 0, chain_epoch: self.chain_epoch }, Instant::now()));
                 Ok(())
             }
             _ => Err("expected network state from the head or logits from the reference; check layer_end".into()),
@@ -1078,6 +1225,7 @@ impl Head<'_> {
             if obsolete(self) {
                 return Ok(None);
             }
+            self.check_open_deadlines()?;
             if let Some(i) = self.pronti.iter().position(|(t, _)| pred(t)) {
                 return Ok(Some(self.pronti.remove(i)));
             }
@@ -1090,30 +1238,13 @@ impl Head<'_> {
             let r = v.rx.recv_timeout(resto.min(intervallo));
             crate::timings::aggiungi(crate::timings::Fase::Attesa, t_att.elapsed());
             match r {
-                Ok(HeadEvent::Token(t, q)) => {
+                Ok(HeadEvent::Token(t, q)) if t.chain_epoch == self.chain_epoch => {
                     self.pronti.push((t, q));
                     self.pulisci_pronti();
                 }
+                Ok(HeadEvent::Token(_, _)) => {}
                 Ok(HeadEvent::Confirmation(c)) if c.kind == pb::AckKind::Timings as i32 => self.record_timings(&c),
-                Ok(HeadEvent::Confirmation(c)) => {
-                    let m = format!("error confirmation from stage {} for conversation {}: {}", c.stage, c.conversation_id, c.error);
-                    // A chain-wide Confirmation from a superseded link describes a fault already handled by the recovery
-                    // that reconnected the chain, so it must not start another recovery.
-                    let corrente = if let Downstream::Rete(v) = &self.valle { v.col.epoch } else { 0 };
-                    if c.conversation_id == 0 && conferma_catena_vecchia(c.epoch, u64::from(corrente)) {
-                        self.prot.conferma_vecchia(c.stage);
-                        eprintln!("[head] ignoring a chain error from stale epoch {} < {corrente}: {m}", c.epoch);
-                        continue;
-                    }
-                    match classify_confirmation(&self.convs, &c) {
-                        ConfirmationClass::Ignora => {}
-                        ConfirmationClass::Conv(i) => return Err(Fail::GuastoConv(i, m)),
-                        ConfirmationClass::Chain => {
-                            self.rotta = true;
-                            return Err(Fail::Guasto(m));
-                        }
-                    }
-                }
+                Ok(HeadEvent::Confirmation(c)) => self.confirmation(c)?,
                 Ok(HeadEvent::Guasto(f, e)) => {
                     if self.current_fault(f) {
                         self.rotta = true;
@@ -1130,6 +1261,74 @@ impl Head<'_> {
         }
     }
 
+    fn confirmation(&mut self, c: pb::Confirmation) -> R {
+        let epoch = if let Downstream::Rete(v) = &self.valle { v.col.epoch } else { 0 };
+        if c.epoch != epoch || c.chain_epoch != self.chain_epoch {
+            self.prot.conferma_vecchia(c.stage);
+            return Ok(());
+        }
+        if matches!(c.kind(), pb::AckKind::Open | pb::AckKind::CacheMiss) {
+            let Some(i) = self.convs.iter().position(|cv| cv.done.is_none() && cv.conv_id == c.conversation_id) else {
+                return Ok(());
+            };
+            let cv = &mut self.convs[i];
+            if let Some((reply, _)) = cv.cache.opening {
+                match reply.status(&c) {
+                    Some(pb::AckKind::Open) => {
+                        cv.cache.cached = reply.position;
+                        cv.cache.opening = None;
+                    }
+                    Some(pb::AckKind::CacheMiss) => return Err(Fail::Replay { conversation: i, save_failed: false }),
+                    _ => {}
+                }
+            } else if c.kind() == pb::AckKind::CacheMiss && !c.ok && cv.cache.save_at == Some(c.start_position)
+                && cv.cache.checkpoint.is_some() && matches!(cv.c.state(), Status::Opening | Status::Rebuilding)
+                && (OpenReply { key: cv.slot_key(), epoch, chain_epoch: self.chain_epoch, position: c.start_position }).matches(&c)
+            {
+                return Err(Fail::Replay { conversation: i, save_failed: true });
+            }
+            return Ok(());
+        }
+        let m = format!("error confirmation from stage {} for conversation {}: {}", c.stage, c.conversation_id, c.error);
+        match classify_confirmation(&self.convs, &c) {
+            ConfirmationClass::Ignora => Ok(()),
+            ConfirmationClass::Conv(i) => Err(Fail::GuastoConv(i, m)),
+            ConfirmationClass::Chain => {
+                self.rotta = true;
+                Err(Fail::Guasto(m))
+            }
+        }
+    }
+
+    fn check_open_deadlines(&mut self) -> R {
+        let now = Instant::now();
+        if self.serv_vive.iter().filter_map(|&c| self.convs[c].cache.opening).any(|(_, deadline)| now >= deadline) {
+            self.rotta = true;
+            return Err(Fail::Guasto("tail did not acknowledge cache restore before the work deadline".into()));
+        }
+        Ok(())
+    }
+
+    fn park(&mut self, c: usize, now: Duration) -> bool {
+        let cv = &mut self.convs[c];
+        if let (Some(p), Some(checkpoint)) = (cv.cache.save_at, cv.cache.checkpoint.take()) {
+            if self.rotta || cv.cache.owner.is_empty() {
+                return false;
+            }
+            self.parked.insert(cv.slot, Parked {
+                key: cv.slot_key(),
+                owner: std::mem::take(&mut cv.cache.owner),
+                member: cv.cache.member,
+                member_key: if cv.cache.member { std::mem::take(&mut cv.cache.member_key) } else { Zeroizing::default() },
+                tokens: Zeroizing::new(cv.prompt[..p as usize].to_vec()),
+                checkpoint,
+                since: now,
+            });
+            return true;
+        }
+        false
+    }
+
     /// Commit a token only for the active attempt and expected step (`Conversation::token`).
     fn registra(&mut self, r: &pb::TokenRow, at: Instant, da_stadio: u32) -> R {
         // Count a token with no matching conversation by its source stage and drop it.
@@ -1144,8 +1343,8 @@ impl Head<'_> {
         let t_ms = self.ms(at);
         let adesso = at.saturating_duration_since(self.t0);
         let cv = &mut self.convs[c];
-        if cv.done.is_some() {
-            return Ok(()); // Conversation already closed: drop
+        if cv.done.is_some() || cv.generation != r.slot_generation || cv.cache.opening.is_some() {
+            return Ok(());
         }
         match cv.c.token(r.attempt_id, r.conversation_step, r.token as u32, adesso) {
             TokenOutcome::Registrato { token_seq } => debug_assert_eq!(token_seq, cv.token.len() as u64 + 1),
@@ -1203,8 +1402,11 @@ impl Head<'_> {
             let mut az = cv.c.finish_response(adesso).map_err(|e| format!("end of response rejected: {e:?}"))?;
             az.extend(cv.c.close_by_user(adesso).map_err(|e| format!("close rejected: {e:?}"))?);
             let slot = cv.slot;
+            let parked = self.park(c, self.adesso());
             self.applica(c, az);
-            self.m.svuota_posto(slot);
+            if !parked {
+                self.m.svuota_posto(slot);
+            }
             self.amm.libera(c);
         }
         Ok(())
@@ -1258,9 +1460,9 @@ impl Head<'_> {
             if !matches!(self.convs[c].c.state(), Status::Opening | Status::Rebuilding) || self.in_ammissione(c) {
                 continue; // Already recorded (back after recovering another conversation).
             }
-            let (id, tent) = (self.convs[c].conv_id, self.convs[c].c.tentativo());
+            let key = self.convs[c].slot_key();
             let Some((t, q)) = self.attendi(
-                |t| t.prefill && t.rows.first().is_some_and(|r| r.conversation_id == id && r.attempt_id == tent),
+                |t| first_token_for(t, key),
                 |head| head.convs[c].done.is_some(),
                 "the first token",
             )? else { continue };
@@ -1407,9 +1609,21 @@ impl Head<'_> {
         let t = self.ms(Instant::now());
         let adesso = self.adesso();
         let cfg = self.cfg();
+        let member_key = self.convs[c].cache.member_key.as_slice();
+        if !member_key.is_empty() {
+            // An older turn that is still running cannot restore grace after this admission.
+            let (older, rest) = self.convs.split_at_mut(c);
+            let (current, newer) = rest.split_first_mut().unwrap();
+            for other in older.iter_mut().chain(newer) {
+                if other.ammessa && other.done.is_none() && other.cache.member_key == current.cache.member_key {
+                    other.cache.member_key = Zeroizing::default();
+                }
+            }
+        }
         let cv = &mut self.convs[c];
         cv.gruppo = g;
         cv.slot = crate::engine::slot(g as u32, locale);
+        cv.cache.reuse = parking::take(&mut self.parked, cv.slot, &cv.cache.member_key, cv.admission_request());
         cv.ammessa = true;
         if cv.c.sospesa_volontaria() {
             // Resume a suspended batch with the same conversation, a new attempt and prefill of prompt and output so
@@ -1431,6 +1645,7 @@ impl Head<'_> {
     /// Return whether any work was done (arrival, first token, open or block).
     fn admission(&mut self, fermo: bool) -> R<bool> {
         self.giro_amm += 1;
+        self.check_open_deadlines()?;
         let mut fatto = false;
         if self.serv.is_some() {
             // Service mode: new requests, cancellations and closures between group Token messages.
@@ -1452,9 +1667,9 @@ impl Head<'_> {
                 fatto = true;
                 break;
             }
-            let (id, tent) = (self.convs[c].conv_id, self.convs[c].c.tentativo());
+            let key = self.convs[c].slot_key();
             let Some((tk, q)) = self.attendi(
-                |t| t.prefill && t.rows.first().is_some_and(|r| r.conversation_id == id && r.attempt_id == tent),
+                |t| first_token_for(t, key),
                 |head| head.convs[c].done.is_some(),
                 "the first token of an admitted conversation",
             )? else { fatto = true; continue };
@@ -1499,17 +1714,34 @@ impl Head<'_> {
         }
         // 3. If no admission is in progress, open the first queued conversation.
         if self.corrente.is_none() {
-            if let Some((c, g, locale)) = self.amm.prossima() {
-                self.admit(c, g, locale, true);
-                self.open(c)?;
-                if self.convs[c].done.is_none() {
-                    self.corrente = Some(c);
+            match self.next_admission() {
+                Ok(Some((c, g, locale))) => {
+                    self.admit(c, g, locale, true);
+                    self.open(c)?;
+                    if self.convs[c].done.is_none() {
+                        self.corrente = Some(c);
+                    }
+                    fatto = true;
                 }
-                fatto = true;
+                Ok(None) => {}
+                Err(c) => {
+                    self.convs[c].done = Some("capacity_unavailable");
+                    fatto = true;
+                }
             }
         }
         // 4. At most one block for the current admission.
         if let Some(c) = self.corrente {
+            if self.convs[c].cache.opening.is_some() {
+                if self.in_volo.is_empty() {
+                    self.attendi(
+                        |_| false,
+                        |head| head.convs[c].cache.opening.is_none() || head.convs[c].done.is_some(),
+                        "the tail to confirm cache restore",
+                    )?;
+                }
+                return Ok(true);
+            }
             self.block(c)?;
             self.lavoro_amm = true;
             fatto = true;
@@ -1519,6 +1751,18 @@ impl Head<'_> {
             }
         }
         Ok(fatto)
+    }
+
+    fn next_admission(&mut self) -> Result<Option<(usize, usize, u32)>, usize> {
+        if self.parked.is_empty() {
+            return Ok(self.amm.prossima());
+        }
+        let now = self.adesso();
+        let grace = Duration::from_secs(self.o.park_grace_s.into());
+        self.amm.prossima_con(|c, free, occupancy| {
+            let request = self.convs[c].admission_request();
+            parking::choose(&self.parked, free, occupancy, request, now, grace)
+        })
     }
 
     /// Close a batch attempt, release its slot, and requeue the conversation
@@ -1541,6 +1785,7 @@ impl Head<'_> {
         cv.da_inviare.clear();
         cv.inviati = 0;
         cv.sospensioni += 1;
+        cv.cache.invalidate();
         let slot = cv.slot;
         if self.corrente == Some(c) {
             self.corrente = None;
@@ -1589,6 +1834,7 @@ impl Head<'_> {
 
     /// Reconnect all three streams to the first stage (for a restarted tail), dropping the old links.
     fn ricollega(&mut self) -> Result<(), String> {
+        self.clear_parked();
         let r = self.network.ok_or("no links to reconnect")?;
         let timeout = Duration::from_secs(self.o.attesa_s);
         let Downstream::Rete(v) = &self.valle else { return Err("no links to reconnect".into()) };
@@ -1625,6 +1871,8 @@ impl Head<'_> {
         // Drop the old writers without waiting. Their threads exit on their own.
         v.col = new?;
         v.tok_min = v.tok_serial.load(Ordering::SeqCst);
+        self.chain_epoch = self.chain_epoch.checked_add(1).ok_or("chain epoch exhausted")?;
+        self.announce_epoch()?;
         self.rotta = false;
         Ok(())
     }
@@ -1633,6 +1881,10 @@ impl Head<'_> {
     /// give each conversation a new attempt within its own recovery limits.
     fn recovery(&mut self, reason: &str) {
         self.poll_service();
+        self.clear_parked();
+        if matches!(self.valle, Downstream::Rete(_)) {
+            self.rotta = true;
+        }
         let adesso = self.adesso();
         self.episodio += 1;
         self.gen_avviata = false;
@@ -1640,6 +1892,7 @@ impl Head<'_> {
         self.membri_volo.clear();
         for cv in self.convs.iter_mut() {
             cv.orfana = false;
+            cv.cache.invalidate();
         }
         // Recover ongoing admissions like other admitted conversations.
         self.corrente = None;
@@ -1693,6 +1946,29 @@ impl Head<'_> {
         }
     }
 
+    fn clear_parked(&mut self) {
+        for (seq, _) in self.parked.drain() {
+            self.m.svuota_posto(seq);
+        }
+    }
+
+    fn retry_cold(&mut self, c: usize, save_failed: bool) -> R {
+        let now = self.adesso();
+        let actions = self.convs[c].c.retry_prefill(now).map_err(|e| format!("cannot replay prefill: {e:?}"))?;
+        let cv = &mut self.convs[c];
+        cv.cache.invalidate();
+        if save_failed {
+            cv.cache.save_at = None;
+        }
+        self.m.svuota_posto(cv.slot);
+        if self.corrente == Some(c) {
+            self.corrente = None;
+        }
+        self.attesa_primo.retain(|&(idx, _)| idx != c);
+        self.applica(c, actions);
+        Ok(())
+    }
+
     /// Retire only the faulty conversation. Close its attempt at all stages,
     /// clear its local slot, and open a new attempt to replay its prefix.
     /// Remove queued tokens from that attempt while other groups stay in flight.
@@ -1709,6 +1985,7 @@ impl Head<'_> {
         }
         self.convs[c].da_aprire = None;
         self.convs[c].orfana = false;
+        self.convs[c].cache.invalidate();
         // Remove it from any admission queues so recovery can replay prefill without interleaving.
         if self.corrente == Some(c) {
             self.corrente = None;
@@ -1730,7 +2007,7 @@ impl Head<'_> {
     /// Admit the initial queue immediately in round-robin mode. FIFO mode
     /// leaves requests for the admission loop to open between steps.
     fn admit_initial(&mut self) {
-        if self.o.prefill_order == PrefillOrder::Fifo {
+        if self.o.prefill_order == PrefillOrder::Fifo || self.park_enabled && self.serv.is_some() {
             return;
         }
         while let Some((c, g, locale)) = self.amm.prossima() {
@@ -1829,6 +2106,7 @@ impl Head<'_> {
                     }
                 }
                 Err(Fail::GuastoConv(c, m)) => self.recover_conversation(c, &m),
+                Err(Fail::Replay { conversation, save_failed }) => self.retry_cold(conversation, save_failed)?,
                 Err(f) => return Err(f),
             }
         }
@@ -1870,6 +2148,15 @@ impl Head<'_> {
         if self.serv.is_none() {
             return;
         }
+        let now = self.adesso();
+        let ttl = Duration::from_secs(self.o.park_ttl_s.into());
+        self.parked.retain(|&seq, p| {
+            let live = now.saturating_sub(p.since) < ttl;
+            if !live {
+                self.m.svuota_posto(seq);
+            }
+            live
+        });
         while let Some(ev) = self.serv.as_ref().and_then(|s| s.prova_evento()) {
             self.service_event(ev);
         }
@@ -1939,27 +2226,32 @@ impl Head<'_> {
     }
 
     /// A `Request` queues a conversation for admission at threshold 0 (arrival next round).
-    fn service_add(&mut self, r: pbs::Request) {
+    fn service_add(&mut self, mut r: pbs::Request) {
         if r.id == 0 || self.serv_vive.iter().any(|&c| self.convs[c].ext_id == r.id) {
             return self.reject_request(&r, "invalid_request", None);
         }
         let ceiling = if r.max_tokens == 0 { self.o.max_tokens } else { r.max_tokens };
         let context = self.o.ctx_per_slot as usize;
-        let (tokens, dropped) = if !r.prompt_token.is_empty() {
-            (r.prompt_token.clone(), 0)
+        let retain = self.park_enabled && !r.owner_key.is_empty();
+        let ((tokens, checkpoint), dropped) = if !r.prompt_token.is_empty() {
+            ((std::mem::take(&mut r.prompt_token), None), 0)
         } else if !r.messages.is_empty() {
             if r.messages.iter().all(|m| m.text.trim().is_empty()) {
                 return self.reject_request(&r, "invalid_request", None);
             }
+            crate::service::strip_assistant_reasoning(&mut r.messages, self.m.chat_uses_think_tags());
             let mut count = None;
             let result = crate::service::fit_chat_context(&r.messages, context, ceiling, |messages| {
                 let (tokens, _, _) = self.m.prepara_conversazione(messages)?;
                 let len = tokens.len();
                 count = Some(len);
-                Ok((tokens, len))
+                Ok(((tokens, retain.then(|| messages.to_vec())), len))
             });
             match result {
-                Ok(fitted) => fitted,
+                Ok(((tokens, messages), dropped)) => {
+                    let checkpoint = messages.and_then(|m| self.m.user_checkpoint(&m, &tokens));
+                    ((tokens, checkpoint), dropped)
+                }
                 Err(e) if e == crate::service::LAST_MESSAGE_TOO_LONG => {
                     return self.reject_request(&r, "context_length_exceeded", count);
                 }
@@ -1968,8 +2260,13 @@ impl Head<'_> {
         } else if r.text.trim().is_empty() {
             return self.reject_request(&r, "invalid_request", None);
         } else {
-            match self.m.prepara_prompt(&r.text) {
-                Ok((tokens, _, _)) => (tokens, 0),
+            let message = pbs::Message { role: "user".into(), text: std::mem::take(&mut r.text) };
+            let messages = [&message];
+            match self.m.prepara_conversazione(&messages) {
+                Ok((tokens, _, _)) => {
+                    let checkpoint = if retain { self.m.user_checkpoint(&messages, &tokens) } else { None };
+                    ((tokens, checkpoint), 0)
+                }
                 Err(_) => return self.reject_request(&r, "invalid_request", None),
             }
         };
@@ -1994,6 +2291,14 @@ impl Head<'_> {
             conv_id,
             gruppo: 0,
             slot: 0,
+            generation: 0,
+            cache: TurnCache {
+                owner: Zeroizing::new(r.owner_key),
+                member: r.member_seat,
+                member_key: Zeroizing::new(r.member_key),
+                save_at: checkpoint,
+                ..Default::default()
+            },
             c: Conversation::new(conv_id, tokens.len() as u32, self.cfg(), adesso).0,
             da_aprire: None,
             da_inviare: Vec::new(),
@@ -2039,6 +2344,7 @@ impl Head<'_> {
         }
         let cv = &mut self.convs[c];
         cv.done = Some("cancelled");
+        cv.cache.discard();
         cv.da_aprire = None;
         cv.orfana = false;
         if self.corrente == Some(c) {
@@ -2071,14 +2377,20 @@ impl Head<'_> {
         let stalled = cv.done == Some("output_stalled");
         let done = pbs::Done {
             id: cv.ext_id,
-            reason: cv.done.unwrap_or("failed").to_string(),
-            usage: Some(pbs::Usage { prompt_tokens: cv.prompt.len() as u32, generated_tokens: cv.token.len() as u32 }),
+            reason: if cv.done == Some("capacity_unavailable") { "error" } else { cv.done.unwrap_or("failed") }.into(),
+            usage: Some(pbs::Usage {
+                prompt_tokens: cv.prompt.len() as u32, generated_tokens: cv.token.len() as u32, cached_prompt_tokens: cv.cache.cached,
+            }),
             timings: Some(pbs::Timings {
                 wait_ms: cv.t_ammissione_ms.map_or(0.0, |a| (a - arrivo).max(0.0)),
                 ttft_ms: cv.tempi_ms.first().map_or(0.0, |t| (t - arrivo).max(0.0)),
                 total_ms: (now - arrivo).max(0.0),
             }),
-            error: if stalled { "head service output queue is full".into() } else { String::new() },
+            error: match cv.done {
+                Some("output_stalled") => "head service output queue is full".into(),
+                Some("capacity_unavailable") => "capacity_unavailable".into(),
+                _ => String::new(),
+            },
             // On `stop`, the buffered text was the start of the stop string, so drop it.
             remaining_text: if stalled || cv.done == Some("stop") {
                 cv.utf8.clear();
@@ -2091,6 +2403,10 @@ impl Head<'_> {
                 t
             },
             prompt_token: cv.prompt.clone(),
+            slot_report: (self.park_enabled && cv.generation != 0).then_some(publicompute_proto::common::SlotReport {
+                slot: cv.slot, generation: cv.generation,
+                parked: self.parked.get(&cv.slot).is_some_and(|p| p.key == cv.slot_key()),
+            }),
         };
         eprintln!("[head] chat finished chat={} head_request={} prompt_tokens={} completion_tokens={} total_ms={:.1} reason={}",
             cv.chat_id, cv.ext_id, cv.prompt.len(), cv.token.len(), (now - arrivo).max(0.0), done.reason);
@@ -2182,11 +2498,17 @@ fn run_service(mut engine: Engine, o: &HeadOptions, network: Option<&HeadLinks>,
     } else {
         eprintln!("[head] chain ready with {slots} slots and {g} groups; service over inherited pipes");
     }
-    let mut t = Head::new(&mut engine, o, Some(network), Vec::new(), valle, amm, slots);
+    let mut t = Head::new(&mut engine, o, Some(network), Vec::new(), valle, amm, slots)?;
     t.serv = Some(service);
     let esito = t.corsa_servizio().map_err(|f| match f {
         Fail::Guasto(m) | Fail::GuastoConv(_, m) | Fail::Fatale(m) => m,
+        Fail::Replay { .. } => "prefill replay was not handled".into(),
     });
+    t.clear_parked();
+    for cv in &mut t.convs {
+        cv.clear_weights();
+    }
+    let pipe_closed = t.serv.as_ref().is_some_and(Service::pipe_closed);
     if let Some(s) = &t.serv {
         s.manda(pbs::FromHead { body: Some(pbs::from_head::Body::Status(pbs::Status { free_slots: 0, pending: 0 })) });
     }
@@ -2195,7 +2517,7 @@ fn run_service(mut engine: Engine, o: &HeadOptions, network: Option<&HeadLinks>,
         v.col.gen.abort();
         let _ = v.col.control.shutdown(std::net::Shutdown::Both);
     }
-    esito
+    if pipe_closed { Ok(()) } else { esito }
 }
 
 pub fn run(mut engine: Engine, mut options: HeadOptions, network: Option<&HeadLinks>, slots: u32) -> Result<(), String> {
@@ -2319,6 +2641,8 @@ pub fn run(mut engine: Engine, mut options: HeadOptions, network: Option<&HeadLi
             // Assign group and slot on admission (`Ammissione::prossima`).
             gruppo: 0,
             slot: 0,
+            generation: 0,
+            cache: TurnCache::default(),
             c: Conversation::new((i + 1) as u64, tok.len() as u32, Config::default(), Duration::ZERO).0,
             da_aprire: None,
             da_inviare: Vec::new(),
@@ -2382,10 +2706,11 @@ pub fn run(mut engine: Engine, mut options: HeadOptions, network: Option<&HeadLi
         };
         eprintln!("[head] chain ready with {} conversations and {} groups", convs.len(), o.groups.max(1).min(convs.len()));
         let t0 = Instant::now();
-        let mut t = Head::new(&mut engine, o, network, convs, valle, amm, slots);
+        let mut t = Head::new(&mut engine, o, network, convs, valle, amm, slots)?;
         t.t0 = t0;
         let esito = t.corsa().map_err(|f| match f {
             Fail::Guasto(m) | Fail::GuastoConv(_, m) | Fail::Fatale(m) => m,
+        Fail::Replay { .. } => "prefill replay was not handled".into(),
         });
         let durata = t0.elapsed().as_secs_f64();
         misure_amm = if o.arrivi.is_some() { Some(t.misure_ammissione()) } else { None };
@@ -2600,6 +2925,8 @@ mod test {
             conv_id: id,
             gruppo: 0,
             slot: id as u32 - 1,
+            generation: id,
+            cache: TurnCache::default(),
             prompt: vec![1; 10],
             c,
             da_aprire: Some((tentativo, start_position)),
@@ -2630,8 +2957,31 @@ mod test {
         }
     }
 
+    #[test]
+    fn suspended_batch_prefers_a_virgin_slot_over_its_own_parked_slot() {
+        let mut cv = conv(1);
+        cv.class = Class::Batch;
+        cv.cache.owner = Zeroizing::new(vec![1]);
+        let parked = HashMap::from([(0, Parked {
+            key: SlotKey { seq: 0, generation: 1, conversation: 2, attempt: 1 },
+            owner: cv.cache.owner.clone(),
+            member: false,
+            member_key: Zeroizing::default(),
+            tokens: Zeroizing::new(cv.prompt[..3].to_vec()),
+            checkpoint: Zeroizing::new(vec![1]),
+            since: Duration::ZERO,
+        })]);
+        let free = [VecDeque::from([0, 1])];
+        let choose = |cv: &Conv| {
+            parking::choose(&parked, &free, &[0], cv.admission_request(), Duration::ZERO, Duration::ZERO)
+        };
+        assert_eq!(choose(&cv), Some((0, 0)));
+        cv.c.suspend(Duration::ZERO).unwrap();
+        assert_eq!(choose(&cv), Some((0, 1)));
+    }
+
     fn error(conv_id: u64, att: u32) -> pb::Confirmation {
-        pb::Confirmation { kind: pb::AckKind::Error as i32, conversation_id: conv_id, attempt_id: att, ok: false, error: "x".into(), ..Default::default() }
+        pb::Confirmation { kind: pb::AckKind::Error as i32, conversation_id: conv_id, attempt_id: att, slot: (conv_id as u32).saturating_sub(1), slot_generation: conv_id, ok: false, error: "x".into(), ..Default::default() }
     }
 
     #[test]
@@ -2642,10 +2992,10 @@ mod test {
     }
 
     #[test]
-    fn error_without_valid_conversation_is_a_chain_fault() {
+    fn only_chain_errors_are_fatal_without_a_conversation() {
         let convs = vec![conv(1), conv(2)];
         assert_eq!(classify_confirmation(&convs, &error(0, 1)), ConfirmationClass::Chain);
-        assert_eq!(classify_confirmation(&convs, &error(99, 1)), ConfirmationClass::Chain);
+        assert_eq!(classify_confirmation(&convs, &error(99, 1)), ConfirmationClass::Ignora);
     }
 
     #[test]

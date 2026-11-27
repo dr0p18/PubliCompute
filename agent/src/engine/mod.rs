@@ -128,6 +128,8 @@ pub struct Generation {
     pub token_ids: Vec<u32>,
     pub finish_reason: FinishReason,
     pub prompt_tokens: u32,
+    pub cached_prompt_tokens: u32,
+    pub slot_report: Option<publicompute_proto::common::SlotReport>,
     /// SHA-256 of the prompt token IDs concatenated as little-endian 32-bit integers.
     pub prompt_tokens_sha256: [u8; 32],
     /// One entry per generated token.
@@ -135,6 +137,14 @@ pub struct Generation {
     pub verification_incomplete: bool,
     pub prefill: Duration,
     pub generation: Duration,
+}
+
+#[derive(Default)]
+pub struct ChatContext<'a> {
+    pub id: &'a str,
+    pub owner: &'a [u8],
+    pub member_seat: bool,
+    pub member_key: &'a [u8],
 }
 
 pub enum Engine {
@@ -219,7 +229,7 @@ impl Engine {
     pub async fn chat_lease(
         &self,
         req: &InferenceRequest,
-        chat_id: &str,
+        chat: ChatContext<'_>,
         top_k: u32,
         progress: &progress::Progress,
         deltas: Option<stages::DeltaSender>,
@@ -228,7 +238,7 @@ impl Engine {
         match self {
             Engine::Mock(e) => e.chat_lease(req, top_k, progress, deltas, cancel).await,
             Engine::Llama(e) => e.chat_lease(req, top_k, progress, deltas, cancel).await,
-            Engine::Stages(e) => e.chat_lease(req, chat_id, progress, deltas, cancel).await,
+            Engine::Stages(e) => e.chat_lease(req, chat, progress, deltas, cancel).await,
         }
     }
 

@@ -33,6 +33,22 @@ message StageAssign {
   string head_token_node_id = 18;  // Peer ID of the head for the tail's token stream.
   string relay_url = 19;           // Relay used to reach the stage peers.
   repeated string peer_iroh_ids = 20;   // Only these peer IDs may connect through the forwarder.
+  // Engine settings every stage of the chain must apply. If this field is absent, the agent uses
+  // f16/f16/auto/none/0. A renewal at the same epoch carries the same profile.
+  StageEngineProfile engine_profile = 21;
+  // Zero disables parking. Both settings are fixed for the assignment epoch.
+  uint32 park_ttl_s = 22;
+  uint32 park_grace_s = 23;
+}
+
+// KV cache types, flash attention and speculative drafting for one chain, as declared by the model catalogue.
+// Every field is mandatory, zero values included, so a missing field is never read as a default.
+message StageEngineProfile {
+  string cache_type_k = 1;           // "f16", "q8_0" or "q4_0".
+  string cache_type_v = 2;           // "f16", "q8_0" or "q4_0". Quantized V requires flash attention.
+  string flash_attn = 3;             // "auto", "on" or "off".
+  string draft_source = 4;           // "none" or "mtp".
+  optional uint32 draft_max_tokens = 5;  // 0 with "none", 1 with "mtp".
 }
 
 message StageRelease {

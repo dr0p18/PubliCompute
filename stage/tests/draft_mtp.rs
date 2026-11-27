@@ -59,7 +59,7 @@ fn con_mtp() -> Vec<Mini> {
 
 fn options(p: &str, layer_start: i32, layer_end: i32, mtp: bool) -> EngineOptions {
     let threads = std::env::var("PUBLICOMPUTE_TEST_THREADS").ok().and_then(|x| x.parse().ok()).unwrap_or(4);
-    EngineOptions { model: p.into(), layer_start, layer_end, ngl: 0, threads, slots: 1, groups: 1, ctx_per_slot: 256, n_batch: 64, experts: false, max_draft_tokens: 1, mtp }
+    EngineOptions { model: p.into(), layer_start, layer_end, ngl: 0, threads, slots: 1, groups: 1, ctx_per_slot: 256, n_batch: 64, experts: false, max_draft_tokens: 1, mtp, cache: Default::default() }
 }
 
 const N: usize = 20;

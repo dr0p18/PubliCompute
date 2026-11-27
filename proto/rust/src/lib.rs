@@ -34,4 +34,4 @@ pub use publicompute::stage::service::v1 as service;
 pub use publicompute::stage::v1 as stage;
 
 /// Version advertised when opening a control session.
-pub const PROTOCOL_VERSION: common::ProtocolVersion = common::ProtocolVersion { major: 0, minor: 2 };
+pub const PROTOCOL_VERSION: common::ProtocolVersion = common::ProtocolVersion { major: 0, minor: 3 };

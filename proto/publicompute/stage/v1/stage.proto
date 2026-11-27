@@ -1,5 +1,5 @@
 // Stage links use one TCP connection per stream. Prefill carries Open and PrefillBlock,
-// generation carries Step and Close, and control carries Confirmation toward the
+// generation carries Step, and control carries Confirmation toward the
 // head. The tail uses a separate token stream back to the head. Every connection
 // starts with Hello and HelloAck. Messages use varint framing with a 16 MiB limit.
 syntax = "proto3";
@@ -76,6 +76,13 @@ message Open {
   // float32. An intermediate stage replaces this field with the encoding it
   // will use on its outgoing link.
   StateFormat state_format = 8;
+  bool reuse_slot = 9;
+  uint64 expected_prev_conv_id = 10;
+  uint32 expected_prev_attempt_id = 11;
+  bool restore_checkpoint = 12;
+  // Nonzero and increasing for successive reservations of the same slot.
+  uint64 slot_generation = 13;
+  uint64 expected_prev_slot_generation = 14;
 }
 
 // Carries rows for one conversation during prefill.
@@ -102,6 +109,10 @@ message PrefillBlock {
   // On the final block, requested draft length after the first sampled token.
   // Zero requests one. The tail applies its configured maximum.
   uint32 draft_count = 13;
+  // Save recurrent state immediately after this block, before the suffix.
+  bool save_checkpoint = 14;
+  uint32 slot = 15;
+  uint64 slot_generation = 16;
 }
 
 message StepRow {
@@ -116,6 +127,8 @@ message StepRow {
   // On the mandatory row, request this many draft tokens after the accepted
   // prefix. Zero requests one. The tail applies its configured maximum.
   uint32 draft_count = 6;
+  uint32 slot = 7;
+  uint64 slot_generation = 8;
 }
 
 // All rows in a group step travel in one frame per link.
@@ -130,6 +143,8 @@ message Step {
   bytes state = 6;
   // Set only for rows encoded as STATE_FORMAT_INT8_STREAM_LE.
   uint32 stream_count = 7;
+  // The head can reconnect while an intermediate still has old Step frames queued.
+  uint64 chain_epoch = 8;
 }
 
 message TokenRow {
@@ -144,6 +159,7 @@ message TokenRow {
   // draft from the last accepted row for the conversation. The list can end
   // early at a generation marker or the context limit.
   repeated int32 draft = 6;
+  uint64 slot_generation = 7;
 }
 
 message Token {
@@ -155,6 +171,7 @@ message Token {
   repeated TokenRow rows = 4;
   // Sending stage, counted from the head starting at 1. Zero is unspecified.
   uint32 stage = 5;
+  uint64 chain_epoch = 6;
 }
 
 enum AckKind {
@@ -164,6 +181,7 @@ enum AckKind {
   // Cumulative timing snapshot. The head keeps the latest report per stage.
   // Send with ok set and conversation_id zero.
   ACK_KIND_TIMINGS = 3;
+  ACK_KIND_CACHE_MISS = 4;
 }
 
 // Sent upstream along the control links until it reaches the head.
@@ -182,11 +200,24 @@ message Confirmation {
   // JSON timing data for ACK_KIND_TIMINGS. Keep the payload in sync with
   // the timing representation in stage/src/timings.rs.
   string timings_json = 8;
+  uint32 slot = 9;
+  uint64 slot_generation = 10;
+  uint32 start_position = 11;
+  // Kept across relays even though the link epoch changes at each hop.
+  uint64 chain_epoch = 12;
 }
 
 message Close {
   uint64 conversation_id = 1;
   uint32 attempt_id = 2;
+  bool keep_parked = 3;
+  uint32 slot = 4;
+  uint64 slot_generation = 5;
+}
+
+// Ordered with Close and Open on the prefill stream. Discard all retained state.
+message Reset {
+  uint64 chain_epoch = 1;
 }
 
 message Message {
@@ -199,5 +230,6 @@ message Message {
     Token token = 6;
     Confirmation confirmation = 7;
     Close close = 8;
+    Reset reset = 9;
   }
 }

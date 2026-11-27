@@ -20,7 +20,8 @@ use crate::sampling::{campiona_tagli, Tagli};
 use crate::experts::{self, RecEsperti};
 use crate::draft::{piano_mtp, MtpPlan};
 use crate::engine::{Engine, Row, MtpRow};
-use crate::slot::{OpenOutcome, WorkOutcome, SystemClock, Slots, Deadlines};
+use crate::slot::{Deadlines, GenerationOpen, SlotKey, Slots, SystemClock, WorkOutcome};
+use zeroize::Zeroizing;
 use crate::network::{self, encode_state, msg, validate_prefill_block, validate_step, IngressBudget, IngressPermit, Writer};
 use publicompute_proto::stage::{self as pb, message::Body};
 use std::collections::HashMap;
@@ -46,6 +47,8 @@ pub struct StageOptions {
     /// Head's `Token` address (tail only).
     pub testa_token: Option<String>,
     pub scadenze: Deadlines,
+    pub park_ttl_s: u32,
+    pub stop_on_stdin_eof: bool,
     pub slots: u32,
     pub ctx_per_slot: u32,
     pub attesa_s: u64,
@@ -124,20 +127,20 @@ const FORWARD_WAIT: Duration = Duration::from_millis(100);
 const MAX_DATA_EVENTS: usize = 1024;
 const MAX_DATA_READERS: usize = 8;
 
-type Attempts = Arc<Mutex<HashMap<(u64, u32), usize>>>;
+type Attempts = Arc<Mutex<HashMap<(u64, u32, u64), usize>>>;
 
 struct QueuedWork {
     attempts: Attempts,
-    keys: Vec<(u64, u32)>,
+    keys: Vec<(u64, u32, u64)>,
 }
 
 impl QueuedWork {
     fn new(attempts: &Attempts, message: &pb::Message) -> Self {
         let keys: Vec<_> = match message.body.as_ref() {
-            Some(Body::Open(open)) => vec![(open.conversation_id, open.attempt_id)],
-            Some(Body::Block(block)) => vec![(block.conversation_id, block.attempt_id)],
-            Some(Body::Close(close)) => vec![(close.conversation_id, close.attempt_id)],
-            Some(Body::Step(step)) => step.rows.iter().map(|row| (row.conversation_id, row.attempt_id)).collect(),
+            Some(Body::Open(open)) => vec![(open.conversation_id, open.attempt_id, open.slot_generation)],
+            Some(Body::Block(block)) => vec![(block.conversation_id, block.attempt_id, block.slot_generation)],
+            Some(Body::Close(close)) => vec![(close.conversation_id, close.attempt_id, close.slot_generation)],
+            Some(Body::Step(step)) => step.rows.iter().map(|row| (row.conversation_id, row.attempt_id, row.slot_generation)).collect(),
             _ => Vec::new(),
         };
         let mut pending = attempts.lock().unwrap();
@@ -294,7 +297,14 @@ struct MtpConv {
     prossima: u32,
     /// Keep the last main hidden state across prompt blocks. The first row
     /// of the next block needs it. The first block starts with a zero state.
-    pendente: Vec<f32>,
+    pendente: Zeroizing<Vec<f32>>,
+}
+
+struct Checkpoint {
+    position: u32,
+    recurrent: Zeroizing<Vec<u8>>,
+    /// The pending state is present only while the draft cache retains the saved prefix.
+    draft: Option<Zeroizing<Vec<f32>>>,
 }
 
 /// Binary draft log, with little-endian fields. The header is MTPL then
@@ -357,6 +367,10 @@ struct Stage {
     m: Engine,
     role: Role,
     slots: Slots<SystemClock>,
+    park_ttl: Duration,
+    checkpoints: HashMap<u32, Checkpoint>,
+    last_round: HashMap<u32, u64>,
+    chain_epoch: u64,
     ctx_per_slot: u32,
     campion: HashMap<u64, (f32, u64, Tagli)>,
     conferme: Option<Writer>,
@@ -459,28 +473,73 @@ fn accept_streams(
 }
 
 impl Stage {
-    /// Send a `Confirmation` to the predecessor on control. If the stream is absent or down, log the
-    /// error to stderr. The head still detects it via `T_lavoro`, and the log keeps the reason.
-    fn confirmation(&self, kind: pb::AckKind, conv: u64, att: u32, ok: bool, error: &str) {
-        let m = msg(Body::Confirmation(pb::Confirmation {
-            kind: kind as i32,
-            conversation_id: conv,
-            attempt_id: att,
-            ok,
-            error: error.to_string(),
-            stage: self.index,
-            epoch: self.epoca_ingresso,
-            ..Default::default()
-        }));
-        if let Err(e) = self.send_control(&m, FORWARD_WAIT) {
-            self.upstream.lock().unwrap().control_failed(self.link_ingresso);
-            eprintln!("[stage] could not send Confirmation for conversation {conv}, attempt {att} (ok={ok}, error=\"{error}\"): {e}");
+    fn new(m: Engine, o: &StageOptions, tx: EventTx) -> Self {
+        Self {
+            m,
+            role: o.role,
+            state_format: o.state_format,
+            slots: Slots::new(SystemClock::new(), o.scadenze),
+            park_ttl: Duration::from_secs(o.park_ttl_s.into()),
+            checkpoints: HashMap::new(),
+            last_round: HashMap::new(),
+            chain_epoch: 0,
+            ctx_per_slot: o.ctx_per_slot,
+            campion: HashMap::new(),
+            conferme: None,
+            upstream: Arc::new(Mutex::new(Upstream { downstream_epoch: 1, ..Default::default() })),
+            epoca_ingresso: 0,
+            link_ingresso: 0,
+            index: o.index,
+            next: None,
+            indirizzo_avanti: String::new(),
+            epoca_avanti: 1,
+            avanti_fallito: false,
+            ricollegando: false,
+            timeout: Duration::from_secs(o.attesa_s),
+            tx,
+            control_budget: IngressBudget::new(network::CONTROL_INGRESS_BYTES, 128),
+            token: None,
+            esp: Vec::new(),
+            registra_top: o.top.is_some(),
+            thread_campiona: o.thread_campiona,
+            top: Vec::new(),
+            prova_errore: o.prova_errore_conv,
+            prova_pilota: o.prova_pilota,
+            max_draft_tokens: o.max_draft_tokens,
+            mtp: HashMap::new(),
+            registro_mtp: None,
+            prova_viste: 0,
+            formato_ingresso: o.formato_ingresso,
+            formato_conv: HashMap::new(),
+            timings: StageTimings::default(),
+            tempi_sporchi: false,
+            tempi_inviati: Instant::now(),
         }
     }
 
+    /// Send a `Confirmation` to the predecessor on control. If the stream is absent or down, log the
+    /// error to stderr. The head still detects it via `T_lavoro`, and the log keeps the reason.
+    fn slot_confirmation(&self, kind: pb::AckKind, key: SlotKey, position: u32, error: &str) {
+        self.relay(pb::Confirmation {
+            kind: kind as i32,
+            conversation_id: key.conversation,
+            attempt_id: key.attempt,
+            ok: kind == pb::AckKind::Open,
+            error: error.to_string(),
+            stage: self.index,
+            slot: key.seq,
+            slot_generation: key.generation,
+            start_position: position,
+            chain_epoch: self.chain_epoch,
+            ..Default::default()
+        });
+    }
+
     fn error(&self, conv: u64, att: u32, text: String) {
-        eprintln!("[stage] conversation {conv}, attempt {att}: {text}");
-        self.confirmation(pb::AckKind::Error, conv, att, false, &text);
+        if let Some(key) = self.slots.live_key(conv, att) {
+            eprintln!("[stage] conversation {conv}, attempt {att}: {text}");
+            self.slot_confirmation(pb::AckKind::Error, key, 0, &text);
+        }
     }
 
     fn send_control(&self, m: &pb::Message, wait: Duration) -> Result<(), String> {
@@ -539,6 +598,7 @@ impl Stage {
             return;
         }
         self.ricollegando = true;
+        self.invalidate_all();
         self.upstream.lock().unwrap().downstream_lost(self.epoca_avanti);
         if let Some(old) = self.next.take() {
             let _ = old.ctl.shutdown(Shutdown::Both);
@@ -612,7 +672,7 @@ impl Stage {
     /// Empty reply for a round with no computation. The head still expects a reply for the round.
     fn giro_vuoto(&mut self, p: &pb::Step) {
         let r = if self.role == Role::Tail {
-            self.send_token(pb::Token { group_id: p.group_id, group_round: p.group_round, prefill: false, rows: vec![], stage: self.index })
+            self.send_token(pb::Token { group_id: p.group_id, group_round: p.group_round, prefill: false, rows: vec![], stage: self.index, chain_epoch: p.chain_epoch })
         } else {
             self.forward_generation(msg(Body::Step(pb::Step { rows: vec![], state: vec![], ..p.clone() })))
         };
@@ -621,81 +681,128 @@ impl Stage {
         }
     }
 
-    fn open(&mut self, a: pb::Open) -> Result<(), String> {
-        if !self.m.posto_valido(a.slot) {
-            self.error(a.conversation_id, a.attempt_id, format!("slot {:#x} is outside the configured range (slots per group {:?})", a.slot, self.m.per_ctx));
-            return Ok(());
+    fn clear_memory(&mut self, seq: u32) {
+        self.checkpoints.remove(&seq);
+        self.m.svuota_posto(seq);
+        self.m.mtp_svuota_posto(seq);
+    }
+
+    fn forget_conversation(&mut self, conversation: u64) {
+        self.mtp.remove(&conversation);
+        self.campion.remove(&conversation);
+        self.formato_conv.remove(&conversation);
+    }
+
+    fn invalidate_all(&mut self) {
+        for seq in self.slots.reset() {
+            self.clear_memory(seq);
         }
-        if a.context_limit > self.ctx_per_slot {
-            self.error(a.conversation_id, a.attempt_id, format!("context {} exceeds the slot limit of {}", a.context_limit, self.ctx_per_slot));
-            return Ok(());
+        self.mtp.clear();
+        self.campion.clear();
+        self.formato_conv.clear();
+        self.last_round.clear();
+        self.chain_epoch = 0;
+    }
+
+    fn reset(&mut self, reset: pb::Reset) -> Result<(), String> {
+        if reset.chain_epoch == 0 {
+            return Err("invalid chain epoch".into());
         }
-        if a.start_position != 0 {
-            self.error(a.conversation_id, a.attempt_id, "recovery requires a starting position of zero".into());
-            return Ok(());
+        if reset.chain_epoch != self.chain_epoch {
+            self.invalidate_all();
+            self.chain_epoch = reset.chain_epoch;
         }
+        self.forward_prefill(msg(Body::Reset(reset)))
+    }
+
+    fn cache_miss(&mut self, key: SlotKey, position: u32) {
+        self.slots.invalidate_open(key, position);
+        self.clear_memory(key.seq);
+        self.forget_conversation(key.conversation);
+        self.slot_confirmation(pb::AckKind::CacheMiss, key, position, "");
+    }
+
+    fn restore(&mut self, key: SlotKey, position: u32) -> Result<(), String> {
+        let checkpoint = self.checkpoints.get(&key.seq).filter(|c| c.position == position).ok_or("checkpoint unavailable")?;
+        self.m.restore_checkpoint(key.seq, position, &checkpoint.recurrent)?;
+        if self.m.ha_mtp() {
+            let draft = checkpoint.draft.as_ref().ok_or("draft checkpoint unavailable")?;
+            self.m.mtp_riavvolgi(key.seq, position)?;
+            self.mtp.insert(key.conversation, MtpConv { prossima: position, pendente: draft.clone() });
+        }
+        Ok(())
+    }
+
+    fn open(&mut self, mut a: pb::Open) -> Result<(), String> {
+        if self.chain_epoch == 0 {
+            return Err("Open requires a chain epoch".into());
+        }
+        let key = SlotKey { seq: a.slot, generation: a.slot_generation, conversation: a.conversation_id, attempt: a.attempt_id };
         let fmt = match network::declared_format(a.state_format) {
-            Ok(f) => f,
-            Err(e) => {
-                self.error(a.conversation_id, a.attempt_id, e);
+            Ok(fmt) if self.formato_ingresso.is_none_or(|expected| expected == fmt) => fmt,
+            _ => {
+                self.slot_confirmation(pb::AckKind::Error, key, 0, "unexpected input state format");
                 return Ok(());
             }
         };
-        if let Some(att) = self.formato_ingresso {
-            if fmt != att {
-                self.error(
-                    a.conversation_id,
-                    a.attempt_id,
-                    format!("Open declares state format {}, but the stage expects {}", fmt.as_str_name(), att.as_str_name()),
-                );
-                return Ok(());
+        if !self.m.posto_valido(a.slot) || a.group_id != a.slot >> 16 || a.context_limit > self.ctx_per_slot
+            || a.start_position >= a.context_limit || a.reuse_slot != (a.start_position > 0) || a.restore_checkpoint != a.reuse_slot
+        {
+            self.slot_confirmation(pb::AckKind::Error, key, 0, "invalid slot or context for Open");
+            return Ok(());
+        }
+        let previous = a.reuse_slot.then_some(SlotKey {
+            seq: a.slot,
+            generation: a.expected_prev_slot_generation,
+            conversation: a.expected_prev_conv_id,
+            attempt: a.expected_prev_attempt_id,
+        });
+        let opening = self.slots.open_generation(key, a.start_position, previous);
+        if let GenerationOpen::Ready { displaced, retired, .. } | GenerationOpen::Miss { displaced, retired } = opening {
+            if let Some(id) = displaced {
+                self.forget_conversation(id);
+            }
+            if let Some(old) = retired {
+                self.clear_memory(old.seq);
+                self.forget_conversation(old.conversation);
             }
         }
-        match self.slots.apri_con_sfratto(a.conversation_id, a.attempt_id, a.slot, a.start_position) {
-            esito @ (OpenOutcome::Riservato { .. } | OpenOutcome::Sfrattato { .. }) => {
-                let libera = match esito {
-                    OpenOutcome::Riservato { libera } => libera,
-                    OpenOutcome::Sfrattato { da, da_tentativo, libera } => {
-                        // Clear the old owner's memory before reserving the same sequence for its replacement.
-                        eprintln!(
-                            "[stage] evicted conversation {da}, attempt {da_tentativo}, from slot {:#x}; Close never arrived. Reusing the slot for conversation {}",
-                            a.slot, a.conversation_id
-                        );
-                        self.campion.remove(&da);
-                        self.formato_conv.remove(&da);
-                        self.mtp.remove(&da);
-                        libera
+        match opening {
+            GenerationOpen::Stale => return Ok(()),
+            GenerationOpen::DuplicateMiss { position } => {
+                self.slot_confirmation(pb::AckKind::CacheMiss, key, position, "");
+                return Ok(());
+            }
+            GenerationOpen::Miss { .. } => {
+                self.cache_miss(key, a.start_position);
+                return Ok(());
+            }
+            GenerationOpen::Duplicate => {}
+            GenerationOpen::Ready { reused, .. } => {
+                if reused {
+                    if let Err(e) = self.restore(key, a.start_position) {
+                        eprintln!("[stage] restoring slot {} failed: {e}", key.seq);
+                        self.cache_miss(key, a.start_position);
+                        return Ok(());
                     }
-                    _ => None,
-                };
-                if let Some(l) = libera {
-                    self.m.svuota_posto(l.seq);
-                    self.m.mtp_svuota_posto(l.seq);
+                } else {
+                    self.clear_memory(key.seq);
+                    if self.m.ha_mtp() {
+                        self.mtp.insert(key.conversation, MtpConv {
+                            prossima: 0, pendente: Zeroizing::new(vec![0.0; self.m.mtp_state_width]),
+                        });
+                    }
                 }
-                self.m.svuota_posto(a.slot);
-                // Draft and main context must both start empty for a new attempt.
-                self.mtp.remove(&a.conversation_id);
-                if self.m.ha_mtp() {
-                    self.m.mtp_svuota_posto(a.slot);
-                    self.mtp.insert(a.conversation_id, MtpConv { prossima: 0, pendente: vec![0.0; self.m.mtp_state_width] });
-                }
-                let c = a.sampling.unwrap_or_default();
-                self.campion.insert(a.conversation_id, sampling_from_open(&c));
-                self.formato_conv.insert(a.conversation_id, fmt);
-                // Forward `Open` with the format this stage will send to its successor.
-                let mut next = a;
-                next.state_format = self.state_format as i32;
-                if let Err(e) = self.forward_prefill(msg(Body::Open(next))) {
-                    self.error(a.conversation_id, a.attempt_id, format!("could not forward Open: {e}"));
-                    return Ok(());
-                }
-                self.confirmation(pb::AckKind::Open, a.conversation_id, a.attempt_id, true, "");
+                self.campion.insert(key.conversation, sampling_from_open(&a.sampling.unwrap_or_default()));
+                self.formato_conv.insert(key.conversation, fmt);
             }
-            OpenOutcome::Duplicato => self.confirmation(pb::AckKind::Open, a.conversation_id, a.attempt_id, true, ""),
-            OpenOutcome::Scartato => {}
-            OpenOutcome::Occupato { da } => {
-                self.error(a.conversation_id, a.attempt_id, format!("sequence {:#x} still belongs to conversation {da}", a.slot));
-            }
+        }
+        // Only the tail can certify that every preceding stage accepted Open.
+        if self.role == Role::Tail {
+            self.slot_confirmation(pb::AckKind::Open, key, a.start_position, "");
+        } else {
+            a.state_format = self.state_format as i32;
+            self.forward_prefill(msg(Body::Open(a)))?;
         }
         Ok(())
     }
@@ -703,7 +810,16 @@ impl Stage {
     /// A `PrefillBlock` error fails only its conversation (error `Confirmation`), so the stage stays up.
     fn block(&mut self, mut b: pb::PrefillBlock) -> Result<(), String> {
         let (conv, att) = (b.conversation_id, b.attempt_id);
+        let Some(key) = self.slots.live_key(conv, att).filter(|k| {
+            k.seq == b.slot && k.generation == b.slot_generation && k.seq >> 16 == b.group_id
+        }) else {
+            return Ok(());
+        };
         // Check shape before touching the slot so a malformed block cannot advance the expected position.
+        if b.save_checkpoint && (self.park_ttl.is_zero() || b.last || !self.m.supports_parking()) {
+            self.cache_miss(key, b.start_position.saturating_add(b.n_token));
+            return Ok(());
+        }
         let formato_ok = match self.formato_conv.get(&conv) {
             Some(&d) => network::check_state_format(d, b.format),
             None => Ok(()),
@@ -711,10 +827,7 @@ impl Stage {
         let state = match formato_ok.and_then(|_| validate_prefill_block(&b, self.m.n_embd, self.m.stream_count, self.m.n_batch, self.ctx_per_slot)) {
             Ok(s) => s,
             Err(e) => {
-                let vecchio = att <= self.slots.watermark(conv) || self.slots.slot(conv).is_some_and(|p| p.0 > att);
-                if !vecchio {
-                    self.error(conv, att, format!("malformed block: {e}"));
-                }
+                self.error(conv, att, format!("malformed block: {e}"));
                 return Ok(());
             }
         };
@@ -727,19 +840,31 @@ impl Stage {
             }
         }
         b.state = Vec::new();
-        if let Err(e) = self.blocco_calcola(b, state) {
+        if let Err(e) = self.blocco_calcola(key, b, state) {
             self.error(conv, att, e);
         }
         Ok(())
     }
 
-    fn blocco_calcola(&mut self, b: pb::PrefillBlock, state: Vec<f32>) -> Result<(), String> {
+    fn blocco_calcola(&mut self, key: SlotKey, b: pb::PrefillBlock, state: Vec<f32>) -> Result<(), String> {
         let n = b.n_token as usize;
-        let seq = self.slots.slot(b.conversation_id).map(|p| p.1).ok_or("slot disappeared")?;
+        let seq = key.seq;
         let tail = self.role == Role::Tail;
         let rows: Vec<Row> =
             (0..n).map(|i| Row { token: 0, pos: (b.start_position as usize + i) as i32, seq: seq as i32, logits: tail && b.last && i + 1 == n }).collect();
         let out = self.m.run(&rows, Some(&state))?;
+        if b.save_checkpoint {
+            // Save after the main and draft caches both reach the same boundary.
+            if tail {
+                self.mtp_blocco(&b, seq, None);
+            }
+            let position = b.start_position + b.n_token;
+            if let Err(e) = self.save_checkpoint(key, position) {
+                eprintln!("[stage] saving checkpoint for slot {seq} failed: {e}");
+                self.cache_miss(key, position);
+                return Ok(());
+            }
+        }
         match (self.role, out) {
             (Role::Middle, Some(s)) => {
                 let block = network::with_prefill_state(b, &s, self.m.n_embd, self.m.stream_count, self.state_format);
@@ -767,11 +892,12 @@ impl Stage {
                         group_id: b.group_id,
                         group_round: 0,
                         prefill: true,
-                        rows: vec![pb::TokenRow { conversation_id: b.conversation_id, attempt_id: b.attempt_id, conversation_step: b.first_token_step, token: t as i32, logprob: lp, draft }],
+                        rows: vec![pb::TokenRow { conversation_id: b.conversation_id, attempt_id: b.attempt_id, conversation_step: b.first_token_step, token: t as i32, logprob: lp, draft, slot_generation: key.generation }],
                         stage: self.index,
+                        chain_epoch: self.chain_epoch,
                     };
                     self.send_token(tok)?;
-                } else {
+                } else if !b.save_checkpoint {
                     self.mtp_blocco(&b, seq, None);
                 }
             }
@@ -780,15 +906,39 @@ impl Stage {
         Ok(())
     }
 
+    fn save_checkpoint(&mut self, key: SlotKey, position: u32) -> Result<(), String> {
+        let draft = if self.m.ha_mtp() {
+            let st = self.mtp.get(&key.conversation).filter(|s| s.prossima == position).ok_or("draft checkpoint unavailable")?;
+            Some(st.pendente.clone())
+        } else {
+            None
+        };
+        self.checkpoints.remove(&key.seq);
+        let recurrent = self.m.save_checkpoint(key.seq)?;
+        eprintln!("[stage] checkpoint slot={} position={position} bytes={}", key.seq,
+            recurrent.len() + draft.as_ref().map_or(0, |s| s.len() * std::mem::size_of::<f32>()));
+        self.checkpoints.insert(key.seq, Checkpoint { position, recurrent, draft });
+        Ok(())
+    }
+
     /// One `Step` with rows from different conversations. A rejected row or failed computation
     /// fails only the affected conversations. Always reply to the round, even if empty.
     fn step(&mut self, p: pb::Step) -> Result<(), String> {
+        // A duplicated round must never look like a speculative rewind.
+        if p.chain_epoch == 0 || p.chain_epoch != self.chain_epoch || (p.group_id as usize) >= self.m.groups()
+            || self.last_round.get(&p.group_id).is_some_and(|&r| r >= p.group_round)
+        {
+            return Ok(());
+        }
+        self.last_round.insert(p.group_id, p.group_round);
         let n_embd = self.m.n_embd;
         let state = match validate_step(&p, n_embd, self.m.stream_count, self.m.n_batch) {
             Ok(s) => s,
             Err(e) => {
                 for r in &p.rows {
-                    self.error(r.conversation_id, r.attempt_id, format!("passo malformato: {e}"));
+                    if self.slots.live_key(r.conversation_id, r.attempt_id).is_some_and(|k| k.seq == r.slot && k.generation == r.slot_generation) {
+                        self.error(r.conversation_id, r.attempt_id, format!("malformed step: {e}"));
+                    }
                 }
                 self.giro_vuoto(&p);
                 return Ok(());
@@ -798,6 +948,11 @@ impl Stage {
         // Draft rewinds: (row index, position to start clearing from memory).
         let mut riavvolgi: Vec<(usize, u32)> = Vec::new();
         for (i, r) in p.rows.iter().enumerate() {
+            if !self.slots.live_key(r.conversation_id, r.attempt_id).is_some_and(|k| {
+                k.seq == r.slot && k.generation == r.slot_generation && k.seq >> 16 == p.group_id
+            }) {
+                continue;
+            }
             if let Some((bersaglio, n)) = self.prova_errore {
                 if r.conversation_id == bersaglio {
                     self.prova_viste += 1;
@@ -884,6 +1039,7 @@ impl Stage {
                 let m = msg(Body::Step(pb::Step {
                     group_id: p.group_id,
                     group_round: p.group_round,
+                    chain_epoch: p.chain_epoch,
                     rows: kept.clone(),
                     n_embd: n_embd as u32,
                     format: self.state_format as i32,
@@ -899,7 +1055,7 @@ impl Stage {
             (Role::Tail, None) => {
                 let out_righe = self.sample_step(&kept);
                 let invio = self.send_token(pb::Token {
-                    group_id: p.group_id, group_round: p.group_round, prefill: false, rows: out_righe, stage: self.index,
+                    group_id: p.group_id, group_round: p.group_round, prefill: false, rows: out_righe, stage: self.index, chain_epoch: p.chain_epoch,
                 });
                 if let Err(e) = invio {
                     for r in &kept {
@@ -1017,7 +1173,7 @@ impl Stage {
                 let (t, lp) = per_riga[j]?;
                 let r = &kept[j];
                 let draft = bozze.iter().find(|(k, _)| *k == j).map(|(_, d)| d.clone()).unwrap_or_default();
-                Some(pb::TokenRow { conversation_id: r.conversation_id, attempt_id: r.attempt_id, conversation_step: r.conversation_step, token: t as i32, logprob: lp, draft })
+                Some(pb::TokenRow { conversation_id: r.conversation_id, attempt_id: r.attempt_id, conversation_step: r.conversation_step, token: t as i32, logprob: lp, draft, slot_generation: r.slot_generation })
             })
             .collect()
     }
@@ -1027,6 +1183,9 @@ impl Stage {
     fn mtp_spegni(&mut self, conv: u64, seq: u32, reason: &str) {
         if self.mtp.remove(&conv).is_some() {
             self.m.mtp_svuota_posto(seq);
+            if let Some(checkpoint) = self.checkpoints.get_mut(&seq) {
+                checkpoint.draft = None;
+            }
             eprintln!("[stage] disabled MTP drafting for conversation {conv}: {reason}");
         }
     }
@@ -1095,7 +1254,7 @@ impl Stage {
         // next verified step truncates them.
         let st = self.mtp.get_mut(&conv).ok_or("cache MTP sparita")?;
         st.prossima = done + trial;
-        st.pendente = stati[n * n_h..].to_vec();
+        st.pendente = Zeroizing::new(stati[n * n_h..].to_vec());
         Ok(draft)
     }
 
@@ -1188,7 +1347,7 @@ impl Stage {
                 self.mtp_spegni(conv, seq, "row has no token");
                 continue;
             };
-            // Drop draft state when no following position can be used.
+            // Stop drafting after the last sample while retaining the saved prefix.
             let pos0 = kept[j].position + 1;
             if self.m.e_eog(campionati[n - 1]) || pos0 + n as u32 > self.ctx_per_slot {
                 self.mtp.remove(&conv);
@@ -1268,20 +1427,22 @@ impl Stage {
     }
 
     fn close(&mut self, c: pb::Close) -> Result<(), String> {
-        let e = self.slots.close(c.conversation_id, c.attempt_id);
-        if let Some(l) = e.libera {
-            // `l.seq` was owned by this conversation, so clearing it cannot touch another one (see `Slots::proprietario`).
-            self.m.svuota_posto(l.seq);
-            self.m.mtp_svuota_posto(l.seq);
-            self.mtp.remove(&c.conversation_id);
-            self.campion.remove(&c.conversation_id);
-            self.formato_conv.remove(&c.conversation_id);
+        let key = SlotKey { seq: c.slot, generation: c.slot_generation, conversation: c.conversation_id, attempt: c.attempt_id };
+        let park = if c.keep_parked && !self.park_ttl.is_zero() {
+            self.checkpoints.get(&key.seq)
+                .filter(|checkpoint| !self.m.ha_mtp() || checkpoint.draft.is_some())
+                .map(|checkpoint| (checkpoint.position, self.park_ttl))
+        } else {
+            None
+        };
+        if self.slots.close_generation(key, park) {
+            self.forget_conversation(key.conversation);
+            if park.is_none() {
+                self.clear_memory(key.seq);
+            }
         }
-        // Same stream as `Open` (prefill), see `rete::su_generazione`.
-        if let Err(e) = self.forward_prefill(msg(Body::Close(c))) {
-            eprintln!("[stage] could not forward Close: {e}");
-        }
-        Ok(())
+        // Even if this stage already retired the slot, its successors need the Close.
+        self.forward_prefill(msg(Body::Close(c)))
     }
 
     fn evento(&mut self, m: pb::Message) -> Result<(), String> {
@@ -1290,6 +1451,7 @@ impl Stage {
             Some(Body::Block(b)) => self.block(b),
             Some(Body::Step(p)) => self.step(p),
             Some(Body::Close(c)) => self.close(c),
+            Some(Body::Reset(reset)) => self.reset(reset),
             _ => Ok(()),
         }
     }
@@ -1313,86 +1475,57 @@ pub fn run(m: Engine, o: &StageOptions) -> Result<(), String> {
         Role::Middle if m.tail || m.head => return Err("a middle stage must exclude the first and final layers".into()),
         _ => {}
     }
-    let timeout = Duration::from_secs(o.attesa_s);
+    let released = Arc::new(AtomicBool::new(false));
+    if o.stop_on_stdin_eof {
+        let released = released.clone();
+        let compute = std::thread::current();
+        std::thread::spawn(move || {
+            // The agent closes the lifetime pipe when it releases this stage.
+            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+            released.store(true, Ordering::Release);
+            compute.unpark();
+        });
+    }
     let listener = network::listen(&o.listen)?;
     let (tx, rx) = EventTx::channel();
     let (work_tx, work_rx) = EventTx::channel();
-    let upstream = Arc::new(Mutex::new(Upstream { downstream_epoch: 1, ..Default::default() }));
     let ingress_bytes = o.ingress_max_mib.checked_mul(1 << 20).filter(|&bytes| bytes > 0).ok_or("invalid --ingress-max-mib")?;
     let budget = IngressBudget::new(ingress_bytes, MAX_DATA_EVENTS);
-    let control_budget = IngressBudget::new(network::CONTROL_INGRESS_BYTES, 128);
     let attempts = Attempts::default();
+    let mut s = Stage::new(m, o, tx.clone());
+    let timeout = s.timeout;
 
-    let mut next = None;
-    let mut token = None;
-    let mut epoca_avanti = 1;
-    let address;
-    match o.role {
+    let address = match o.role {
         Role::Middle => {
-            address = o.next.as_ref().ok_or("middle stage requires --next")?;
-            let forward = connect_forward(address, timeout, &tx, &mut epoca_avanti, control_budget.clone(), upstream.clone())?;
-            upstream.lock().unwrap().ready = !forward.caduto.load(Ordering::SeqCst);
-            next = Some(forward);
+            let address = o.next.as_ref().ok_or("middle stage requires --next")?;
+            let forward = connect_forward(address, timeout, &tx, &mut s.epoca_avanti, s.control_budget.clone(), s.upstream.clone())?;
+            s.upstream.lock().unwrap().ready = !forward.caduto.load(Ordering::SeqCst);
+            s.next = Some(forward);
+            address
         }
         Role::Tail => {
-            address = o.testa_token.as_ref().ok_or("tail requires --head-token")?;
+            let address = o.testa_token.as_ref().ok_or("tail requires --head-token")?;
             // Advertise draft support during the token handshake so the head can reject
             // a tail that cannot provide the configured draft source.
-            let (_l, w) = network::connect_tokens(address, timeout, 1, m.ha_mtp())?;
-            token = Some(Writer::new(w, "token"));
-            upstream.lock().unwrap().ready = true;
+            let (_l, w) = network::connect_tokens(address, timeout, s.epoca_avanti, s.m.ha_mtp())?;
+            s.token = Some(Writer::new(w, "token"));
+            s.upstream.lock().unwrap().ready = true;
+            address
         }
-    }
-    if m.ha_mtp() && o.role != Role::Tail {
+    };
+    s.indirizzo_avanti = address.clone();
+    if s.m.ha_mtp() && o.role != Role::Tail {
         return Err("--mtp requires the tail".into());
     }
-    let registro_mtp = match (&o.registro_mtp, m.ha_mtp()) {
-        (Some(p), true) => Some(MtpTrace::open(p, m.n_vocab)?),
+    s.registro_mtp = match (&o.registro_mtp, s.m.ha_mtp()) {
+        (Some(p), true) => Some(MtpTrace::open(p, s.m.n_vocab)?),
         (Some(_), false) => return Err("--log-mtp requires the tail with --mtp".into()),
         (None, _) => None,
     };
-    let txa = tx.clone();
-    let reader_upstream = upstream.clone();
-    let ingress = WorkIngress { budget, attempts: attempts.clone(), n_batch: m.n_batch, wait: INGRESS_WAIT };
-    std::thread::spawn(move || accept_streams(listener, txa, work_tx, reader_upstream, ingress));
+    let reader_upstream = s.upstream.clone();
+    let ingress = WorkIngress { budget, attempts: attempts.clone(), n_batch: s.m.n_batch, wait: INGRESS_WAIT };
+    std::thread::spawn(move || accept_streams(listener, tx, work_tx, reader_upstream, ingress));
 
-    let mut s = Stage {
-        m,
-        role: o.role,
-        state_format: o.state_format,
-        slots: Slots::new(SystemClock::new(), o.scadenze),
-        ctx_per_slot: o.ctx_per_slot,
-        campion: HashMap::new(),
-        conferme: None,
-        upstream,
-        epoca_ingresso: 0,
-        link_ingresso: 0,
-        index: o.index,
-        next,
-        indirizzo_avanti: address.clone(),
-        epoca_avanti,
-        avanti_fallito: false,
-        ricollegando: false,
-        timeout,
-        tx,
-        control_budget,
-        token,
-        esp: Vec::new(),
-        registra_top: o.top.is_some(),
-        thread_campiona: o.thread_campiona,
-        top: Vec::new(),
-        prova_errore: o.prova_errore_conv,
-        prova_pilota: o.prova_pilota,
-        max_draft_tokens: o.max_draft_tokens,
-        mtp: HashMap::new(),
-        registro_mtp,
-        prova_viste: 0,
-        formato_ingresso: o.formato_ingresso,
-        formato_conv: HashMap::new(),
-        timings: StageTimings::default(),
-        tempi_sporchi: false,
-        tempi_inviati: Instant::now(),
-    };
     eprintln!("[stage] {:?} layer [{}, {}) ready on {}", o.role, s.m.layer_start, s.m.layer_end, o.listen);
     if s.m.ha_mtp() {
         eprintln!("[stage] MTP block loaded; drafting requires prompt token IDs from the head");
@@ -1405,6 +1538,9 @@ pub fn run(m: Engine, o: &StageOptions) -> Result<(), String> {
     // Wait since the last work message, including the wait for the next step.
     let mut attesa_acc = Duration::ZERO;
     let esito: Result<(), String> = loop {
+        if released.load(Ordering::Acquire) {
+            break Ok(());
+        }
         let t_att = Instant::now();
         let next_event = || rx.try_recv().or_else(|_| work_rx.try_recv()).ok();
         let r = next_event().or_else(|| {
@@ -1416,8 +1552,12 @@ pub fn run(m: Engine, o: &StageOptions) -> Result<(), String> {
         match r {
             Some(Event::Control(sc, link, epoch, _permit)) => {
                 if s.upstream.lock().unwrap().active(link) {
+                    let previous = s.link_ingresso;
                     s.link_ingresso = link;
                     s.epoca_ingresso = epoch;
+                    if previous != 0 && previous != link {
+                        s.invalidate_all();
+                    }
                     // Install the epoch before the writer can acknowledge it to the predecessor.
                     let ack = msg(Body::Ack(pb::HelloAck { ok: true, error: String::new() }));
                     if sc.send_with_wait(&ack, Duration::ZERO).is_ok() {
@@ -1459,7 +1599,9 @@ pub fn run(m: Engine, o: &StageOptions) -> Result<(), String> {
                         _ => 0,
                     };
                     if let Err(e) = s.evento(m) {
-                        break Err(e);
+                        // Forwarding retires the link and starts reconnecting so the
+                        // predecessor can recover without losing the stage process.
+                        eprintln!("[stage] work forwarding failed: {e}");
                     }
                     if rows > 0 {
                         s.timings.step(rows, attesa_acc, t0);
@@ -1500,20 +1642,24 @@ pub fn run(m: Engine, o: &StageOptions) -> Result<(), String> {
             continue;
         }
         last_expiry = Instant::now();
+        for seq in s.slots.expire_parked() {
+            s.clear_memory(seq);
+        }
         let expired = {
             let pending = attempts.lock().unwrap();
-            s.slots.expire_except(|id, attempt| pending.contains_key(&(id, attempt)))
+            s.slots.expire_except(|id, attempt, generation| pending.contains_key(&(id, attempt, generation)))
         };
         s.slots.pulisci();
         for sc in expired {
-            s.m.svuota_posto(sc.liberato.seq);
-            s.m.mtp_svuota_posto(sc.liberato.seq);
-            s.mtp.remove(&sc.conversation_id);
-            s.campion.remove(&sc.conversation_id);
-            s.formato_conv.remove(&sc.conversation_id);
-            s.error(sc.conversation_id, sc.liberato.tentativo, "slot expired".into());
+            let key = SlotKey {
+                seq: sc.liberato.seq, generation: sc.generation, conversation: sc.conversation_id, attempt: sc.liberato.tentativo,
+            };
+            s.clear_memory(key.seq);
+            s.forget_conversation(key.conversation);
+            s.slot_confirmation(pb::AckKind::Error, key, 0, "slot expired");
         }
     };
+    s.invalidate_all();
     if let Some(p) = &o.experts {
         match experts::write(p, &s.esp) {
             Ok(()) => eprintln!("[stage] wrote {} expert trace rows to {p} ({} batches with missing rows)", s.esp.len(), s.m.esperti_persi),
@@ -1562,6 +1708,122 @@ fn sampling_from_open(c: &pb::Sampling) -> (f32, u64, Tagli) {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn draft_checkpoint_survives_end_of_generation_and_context_limit() {
+        let Ok(model) = std::env::var("PUBLICOMPUTE_Q35_MTP_GGUF") else {
+            eprintln!("SKIP: set PUBLICOMPUTE_Q35_MTP_GGUF to a Qwen fixture with a draft block");
+            return;
+        };
+        let context = 64;
+        let format = pb::StateFormat::Fp32Le;
+        let engine = Engine::load(&crate::engine::EngineOptions {
+            model,
+            layer_start: 1,
+            layer_end: -1,
+            ngl: 0,
+            threads: 1,
+            slots: 1,
+            groups: 1,
+            ctx_per_slot: context,
+            n_batch: 8,
+            experts: false,
+            max_draft_tokens: 1,
+            mtp: true,
+            cache: Default::default(),
+        }).unwrap();
+        let tokens = 0..engine.n_vocab as i32;
+        let eog = tokens.clone().find(|&t| engine.e_eog(t)).unwrap();
+        let token = tokens.into_iter().find(|&t| !engine.e_eog(t)).unwrap();
+        let (tx, _rx) = EventTx::channel();
+        let mut stage = Stage::new(engine, &StageOptions {
+            role: Role::Tail,
+            listen: String::new(),
+            next: None,
+            testa_token: None,
+            scadenze: Deadlines::default(),
+            park_ttl_s: 900,
+            stop_on_stdin_eof: false,
+            slots: 1,
+            ctx_per_slot: context,
+            attesa_s: 1,
+            grazia_s: 1,
+            ingress_max_mib: 1,
+            experts: None,
+            top: None,
+            thread_campiona: 1,
+            prova_errore_conv: None,
+            prova_pilota: None,
+            max_draft_tokens: 1,
+            registro_mtp: None,
+            state_format: format,
+            index: 2,
+            formato_ingresso: Some(format),
+        }, tx);
+        stage.reset(pb::Reset { chain_epoch: 1 }).unwrap();
+
+        let open = |stage: &mut Stage, conversation: u64, start_position, previous| {
+            stage.open(pb::Open {
+                conversation_id: conversation,
+                attempt_id: 1,
+                slot_generation: conversation,
+                context_limit: context,
+                state_format: format as i32,
+                start_position,
+                reuse_slot: start_position > 0,
+                restore_checkpoint: start_position > 0,
+                expected_prev_slot_generation: previous,
+                expected_prev_conv_id: previous,
+                expected_prev_attempt_id: u32::from(previous > 0),
+                ..Default::default()
+            }).unwrap();
+        };
+        let checkpoint = |stage: &mut Stage, conversation, start_position| {
+            let block = pb::PrefillBlock {
+                conversation_id: conversation,
+                attempt_id: 1,
+                slot_generation: conversation,
+                start_position,
+                n_token: 1,
+                token: vec![token],
+                save_checkpoint: true,
+                ..Default::default()
+            };
+            let state = vec![0.25; stage.m.n_embd];
+            stage.block(network::with_prefill_state(block, &state, stage.m.n_embd, stage.m.stream_count, format)).unwrap();
+            assert_eq!(stage.mtp[&conversation].prossima, start_position + 1);
+            assert!(stage.checkpoints[&0].draft.is_some());
+        };
+        let close = |stage: &mut Stage, conversation| {
+            stage.close(pb::Close {
+                conversation_id: conversation,
+                attempt_id: 1,
+                slot_generation: conversation,
+                keep_parked: true,
+                ..Default::default()
+            }).unwrap();
+        };
+
+        open(&mut stage, 1, 0, 0);
+        for (conversation, position, sampled) in [(1, 1, eog), (2, context - 1, token)] {
+            let start = conversation as u32 - 1;
+            checkpoint(&mut stage, conversation, start);
+            let row = pb::StepRow { conversation_id: conversation, position, ..Default::default() };
+            assert!(stage.mtp_passo(&[row], &[(0, 1, 1)], &[Some((sampled as usize, 0.0))]).is_empty());
+            assert!(!stage.mtp.contains_key(&conversation));
+            close(&mut stage, conversation);
+            assert_eq!(stage.checkpoints[&0].position, start + 1);
+            open(&mut stage, conversation + 1, start + 1, conversation);
+            assert_eq!(stage.mtp[&(conversation + 1)].prossima, start + 1);
+        }
+
+        stage.mtp_spegni(3, 0, "test draft cache clear");
+        assert!(stage.checkpoints[&0].draft.is_none());
+        close(&mut stage, 3);
+        assert!(stage.checkpoints.is_empty());
+        open(&mut stage, 4, 2, 3);
+        assert_eq!(stage.slots.live_key(4, 1), None);
+    }
 
     /// The tail uses the cutoffs declared by Open. A top_k of one forces
     /// the top token even at a nonzero temperature.

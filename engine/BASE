@@ -1,3 +1,3 @@
 UPSTREAM=https://github.com/ggml-org/llama.cpp
 COMMIT=6f1e6543704bc5b080c7a98e7b6f707b31f6ed51
-TREE=c616bef19950d8d23f80e22c0f14baf0764557db
+TREE=97daa6c797e33494655ccd86a34c1bf61d0c6182

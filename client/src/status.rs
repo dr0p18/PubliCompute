@@ -64,6 +64,7 @@ pub struct Download {
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 pub struct Status {
     pub connected: bool,
+    pub update_required: Option<String>,
     pub paused: bool,
     #[serde(default)]
     pub preference: Preference,
@@ -76,6 +77,7 @@ pub struct Status {
     pub weights_model: Option<String>,
     #[serde(default)]
     pub weights_quant: Option<String>,
+    pub weights_sha256: Option<String>,
     pub download: Option<Download>,
     pub model_error: Option<String>,
     #[serde(default)]
@@ -90,6 +92,10 @@ pub struct Status {
 }
 
 impl Status {
+    pub fn update_message(&self) -> Option<String> {
+        self.update_required.as_ref().map(|reason| format!("Update required: {reason} — run the installer again"))
+    }
+
     pub fn download_line(&self) -> Option<String> {
         let d = self.download.as_ref()?;
         let gib = |bytes| bytes as f64 / (1u64 << 30) as f64;
@@ -147,6 +153,9 @@ pub fn status_text(status: &Status, now: u64) -> String {
 
 pub fn status_line(s: &Status) -> (String, Tone) {
     use Tone::*;
+    if let Some(message) = s.update_message() {
+        return (message, Warn);
+    }
     let loaded = s.loaded_model.clone().unwrap_or_else(|| "the model".into());
     let chosen = s.preference.model.clone().unwrap_or_else(|| loaded.clone());
     if s.gpu_lost {
@@ -198,7 +207,10 @@ pub fn status_line(s: &Status) -> (String, Tone) {
             None => ("Free card — waiting for work".into(), Plain),
         },
         "MODE_FREE" => (format!("Free card (automatic) — back to use at the next chat on {chosen}"), Plain),
-        "NOT_PLACED" => (format!("Serving {serving}. The card was not placed in a chain of {chosen}"), Plain),
+        "NOT_PLACED" => (
+            detail_or(&c.detail, format!("Serving {serving}. The card was not placed in a chain of {chosen}")),
+            Plain,
+        ),
         "UNVERIFIED" => ("Serving, checks in progress — free seat after the first checks".into(), Plain),
         "BELOW_QUALITY" => (format!("Serving below the speed threshold — no free seat on {chosen}"), Warn),
         "NO_ACCOUNT" => ("Card without a linked user — link your user on the site".into(), Warn),

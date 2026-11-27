@@ -25,6 +25,19 @@ enum EngineKind {
   ENGINE_KIND_DWARFSTAR = 2;
 }
 
+// Actual admission to a physical slot. Generations increase within the chain epoch.
+message SlotTaken {
+  uint32 slot = 1;
+  uint64 generation = 2;
+}
+
+// The head's terminal slot state. The generation fences reports arriving out of order.
+message SlotReport {
+  uint32 slot = 1;
+  uint64 generation = 2;
+  bool parked = 3;
+}
+
 // Identifies the exact weight file used for inference and verification. The
 // verifier needs the same weights to compare token probabilities.
 message ModelRef {

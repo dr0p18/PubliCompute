@@ -10,7 +10,7 @@ fn percorso() -> Option<String> {
 }
 
 fn load(p: &str, k: u32) -> Engine {
-    Engine::load(&EngineOptions { model: p.into(), layer_start: 0, layer_end: -1, ngl: 0, threads: std::env::var("PUBLICOMPUTE_TEST_THREADS").ok().and_then(|x| x.parse().ok()).unwrap_or(2), slots: 1, groups: 1, ctx_per_slot: 256, n_batch: 64, experts: false, max_draft_tokens: k, mtp: false }).unwrap()
+    Engine::load(&EngineOptions { model: p.into(), layer_start: 0, layer_end: -1, ngl: 0, threads: std::env::var("PUBLICOMPUTE_TEST_THREADS").ok().and_then(|x| x.parse().ok()).unwrap_or(2), slots: 1, groups: 1, ctx_per_slot: 256, n_batch: 64, experts: false, max_draft_tokens: k, mtp: false, cache: Default::default() }).unwrap()
 }
 
 fn prompt() -> Vec<i32> {

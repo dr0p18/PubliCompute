@@ -36,11 +36,16 @@ Common options:
   --ctx-per-slot N              Context per slot (default 1024).
   --groups N                    In-flight groups per stage (default 2).
   --n-batch N                   Maximum batch size in tokens (default 512).
+  --cache-type-k T              KV cache type for K: f16 (default), q8_0 or q4_0. Use the same on every stage.
+  --cache-type-v T              KV cache type for V: f16 (default), q8_0 or q4_0. Quantized V requires
+                                --flash-attn on.
+  --flash-attn M                auto (default), on or off. Must be on when --cache-type-v is quantized.
   --log-experts F               Write selected MoE experts for each generation step as JSONL.
   --log-top F                   Tail or reference: write the top 20 log probabilities per sampled token.
   --sampling-threads N          Sampling threads on the tail or reference (default 0, choose automatically).
   --log-llama                   Print engine logs to stderr.
   --timeout-s N                 Connection and reply timeout (default 300 s).
+  --park-ttl-s N                Keep a completed conversation's checkpoint for N seconds (default 0).
 
 Replay and comparison:
   --tokens FILE                 Replay a JSONL transcript. Match prompts by ID.
@@ -75,6 +80,7 @@ Head of a chain:
   --service-pipe                Accept requests on stdin and send frames on stdout.
   --next ADDR                   Next stage's listen address.
   --listen-token ADDR           Listen for the tail's token stream.
+  --park-grace-s N              Protect parked member slots from public eviction for N seconds (default 0).
   --test-state-int8             Test only: quantize each outgoing row to int8 and restore FP32.
 
 Head and middle stage:
@@ -118,6 +124,7 @@ Middle and tail stages:
   --listen ADDR                 Listen for the preceding stage.
   --next ADDR                   Middle stage: connect to the next stage.
   --head-token ADDR             Tail: connect to the head's --listen-token address.
+  --stop-on-stdin-eof           Release retained state and exit when the agent closes stdin.
   --reconnect-grace-s N         Allow this long for the preceding stage to reconnect (default 3 s).
   --reserve-timeout-s N         Reserved-slot timeout (default 30 s).
   --idle-timeout-s N            Idle-slot timeout (default 120 s).
@@ -137,7 +144,7 @@ fn parse(v: &[String]) -> Result<Args, String> {
     let mut i = 0;
     while i < v.len() {
         if let Some(k) = v[i].strip_prefix("--") {
-            if matches!(k, "identical-tokens" | "bit-identical" | "log-llama" | "all-positions" | "verifier-mode" | "test-state-int8" | "mtp" | "service-pipe") {
+            if matches!(k, "identical-tokens" | "bit-identical" | "log-llama" | "all-positions" | "verifier-mode" | "test-state-int8" | "mtp" | "service-pipe" | "stop-on-stdin-eof") {
                 m.insert(k.to_string(), String::new());
                 i += 1;
                 continue;
@@ -145,6 +152,7 @@ fn parse(v: &[String]) -> Result<Args, String> {
             if !matches!(
                 k,
                 "model" | "layer-start" | "layer-end" | "ngl" | "threads" | "slots" | "ctx-per-slot" | "groups" | "n-batch"
+                    | "cache-type-k" | "cache-type-v" | "flash-attn"
                     | "log-experts" | "log-top" | "sampling-threads" | "timeout-s" | "tokens" | "seed-tolerance"
                     | "prompt" | "n-prompt" | "skip" | "max-tokens" | "block" | "temperature" | "seed"
                     | "classes" | "interactive-reserve" | "arrivals" | "first-token-delay" | "prefill-order" | "output"
@@ -154,7 +162,7 @@ fn parse(v: &[String]) -> Result<Args, String> {
                     | "hello-timeout-s" | "write-timeout-s" | "read-timeout-s" | "queue-max-mib" | "ingress-max-mib"
                     | "tls-cert" | "tls-key" | "tls-ca" | "capability" | "capability-pub" | "clock-offset-s"
                     | "input-format" | "index" | "listen" | "head-token" | "reconnect-grace-s"
-                    | "reserve-timeout-s" | "idle-timeout-s" | "test-conv-error" | "test-pilot"
+                    | "reserve-timeout-s" | "idle-timeout-s" | "park-ttl-s" | "park-grace-s" | "test-conv-error" | "test-pilot"
                     | "tolerance" | "conversations" | "g-max" | "stages" | "shares" | "latency-ms" | "min-per-conv"
                     | "exclude-g" | "json"
             ) {
@@ -173,6 +181,8 @@ fn parse(v: &[String]) -> Result<Args, String> {
     if args.num("slots", 1_u32)? == 0 {
         return Err("--slots must be positive".into());
     }
+    // Check the cache options up front, before any model is read.
+    args.cache()?;
     Ok(args)
 }
 
@@ -180,6 +190,9 @@ fn parse(v: &[String]) -> Result<Args, String> {
 impl Args {
     fn text(&self, k: &str) -> Option<&str> {
         self.m.get(k).map(|s| s.as_str())
+    }
+    fn cache(&self) -> Result<publicompute_stage::kv_cache::CacheConfig, String> {
+        publicompute_stage::kv_cache::CacheConfig::parse(self.text("cache-type-k"), self.text("cache-type-v"), self.text("flash-attn"))
     }
     fn richiesto(&self, k: &str) -> Result<String, String> {
         self.m.get(k).cloned().ok_or_else(|| format!("missing --{k}"))
@@ -298,6 +311,7 @@ mod execution {
             experts: a.m.contains_key("log-experts"),
             max_draft_tokens: a.num("draft-max-tokens", 0)?,
             mtp,
+            cache: a.cache()?,
         })
     }
 
@@ -356,6 +370,8 @@ mod execution {
             prompt: if service.is_some() || service_pipe { a.text("prompt").unwrap_or_default().to_string() } else { a.richiesto("prompt")? },
             service,
             service_pipe,
+            park_ttl_s: a.num("park-ttl-s", 0)?,
+            park_grace_s: a.num("park-grace-s", 0)?,
             n_prompt,
             salta: a.num("skip", 0)?,
             max_tokens: a.num("max-tokens", 64)?,
@@ -410,6 +426,8 @@ mod execution {
             listen: a.richiesto("listen")?,
             next: a.text("next").map(String::from),
             testa_token: a.text("head-token").map(String::from),
+            park_ttl_s: a.num("park-ttl-s", 0)?,
+            stop_on_stdin_eof: a.m.contains_key("stop-on-stdin-eof"),
             scadenze: Deadlines {
                 riserva: Duration::from_secs(a.num("reserve-timeout-s", 30)?),
                 inattivo: Duration::from_secs(a.num("idle-timeout-s", 120)?),
@@ -464,6 +482,10 @@ fn main() -> ExitCode {
         print!("{USAGE}");
         return ExitCode::SUCCESS;
     }
+    if v.as_slice() == ["--version"] {
+        println!(concat!("publicompute-stage ", env!("CARGO_PKG_VERSION")));
+        return ExitCode::SUCCESS;
+    }
     let args = match parse(&v[1..]) {
         Ok(a) => a,
         Err(e) => {
@@ -495,5 +517,30 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Result<Args, String> {
+        parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn parse_accepts_cache_options() {
+        let a = args(&["--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--flash-attn", "on"]).unwrap();
+        let c = a.cache().unwrap();
+        assert_eq!((c.k.to_string(), c.v.to_string(), c.flash_attn.to_string()), ("q8_0".into(), "q8_0".into(), "on".into()));
+    }
+
+    #[test]
+    fn parse_rejects_quantized_v_without_flash_attention() {
+        let err = args(&["--cache-type-v", "q4_0", "--flash-attn", "off"]).err().unwrap();
+        assert!(err.contains("requires --flash-attn on"), "{err}");
+        let err_auto = args(&["--cache-type-v", "q4_0"]).err().unwrap();
+        assert!(err_auto.contains("requires --flash-attn on"), "{err_auto}");
+        assert!(args(&["--cache-type-k", "q9"]).is_err());
     }
 }

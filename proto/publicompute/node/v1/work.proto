@@ -146,6 +146,11 @@ message ChatTask {
   InferenceRequest request = 1;
   // Stable trace ID across lease attempts. The work stream still uses an opaque request_id.
   string chat_id = 2;
+  // Opaque owner tag scoped to this chain epoch. Only the head uses it.
+  bytes affinity_owner = 3;
+  bool member_seat = 4;
+  // Chain-scoped member tag for grace, independent of the chat account.
+  bytes member_key = 5;
 }
 
 message InferenceRequest {
@@ -204,6 +209,7 @@ message WorkStreamNodeMessage {
     VerifyResult verify_result = 4;
     // Marks the end of request delivery for this lease.
     LeaseComplete lease_complete = 5;
+    publicompute.common.v1.SlotTaken slot_taken = 6;
   }
 }
 
@@ -248,6 +254,7 @@ message Completion {
   // This lets verification detect a different tokenized prompt.
   bytes prompt_tokens_sha256 = 6;
   Timing timing = 7;
+  publicompute.common.v1.SlotReport slot_report = 8;
 }
 
 enum FinishReason {
@@ -260,6 +267,7 @@ enum FinishReason {
 message Usage {
   uint32 prompt_tokens = 1;
   uint32 completion_tokens = 2;
+  uint32 cached_prompt_tokens = 3;
 }
 
 message Timing {
@@ -288,6 +296,7 @@ enum RequestFailureCode {
   REQUEST_FAILURE_CODE_ENGINE_ERROR = 2;
   REQUEST_FAILURE_CODE_OUT_OF_MEMORY = 3;
   REQUEST_FAILURE_CODE_INVALID_REQUEST = 4;
+  REQUEST_FAILURE_CODE_CAPACITY_UNAVAILABLE = 5;
 }
 
 message VerifyResult {

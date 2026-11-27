@@ -6,6 +6,8 @@ syntax = "proto3";
 
 package publicompute.stage.service.v1;
 
+import "publicompute/common/v1/common.proto";
+
 option go_package = "publicompute/proto/gen/go/publicompute/stage/service/v1;servicev1";
 
 enum Class {
@@ -52,6 +54,11 @@ message Request {
   repeated string stop = 8;
   // Coordinator chat ID, used to correlate the head and agent logs.
   string chat_id = 9;
+  // Opaque owner tag scoped to this chain epoch. Empty disables parking.
+  bytes owner_key = 10;
+  bool member_seat = 11;
+  // Chain-scoped member tag for grace, independent of the chat account.
+  bytes member_key = 12;
 }
 
 message Cancel {
@@ -74,6 +81,7 @@ message OutputToken {
 message Usage {
   uint32 prompt_tokens = 1;
   uint32 generated_tokens = 2;
+  uint32 cached_prompt_tokens = 3;
 }
 
 message Timings {
@@ -86,17 +94,18 @@ message Timings {
 // Terminal response for the request ID.
 message Done {
   uint64 id = 1;
-  // "eog", "stop", "max_token", "annullata", "fallita", or "errore".
+  // "eog", "stop", "max_token", "cancelled", "failed", "error", or "output_stalled".
   string reason = 2;
   Usage usage = 3;
   Timings timings = 4;
-  // Code for pre-admission rejection, such as invalid_request or context_length_exceeded.
+  // Admission error, including capacity_unavailable when free slots are protected.
   string error = 5;
   // Final text buffered while checking stop strings or completing UTF-8 characters.
   // Any incomplete UTF-8 at the end is rendered with replacement characters.
   string remaining_text = 6;
   // Prompt tokens after templating. The agent hashes these for verification.
   repeated int32 prompt_token = 7;
+  publicompute.common.v1.SlotReport slot_report = 8;
 }
 
 // Report open requests and free slots on connect and whenever either count changes.
@@ -115,11 +124,17 @@ message FromAgent {
 
 message Ready {}
 
+message Admission {
+  uint64 id = 1;
+  publicompute.common.v1.SlotTaken slot_taken = 2;
+}
+
 message FromHead {
   oneof body {
     OutputToken token = 1;
     Done done = 2;
     Status status = 3;
     Ready ready = 4;
+    Admission admission = 5;
   }
 }

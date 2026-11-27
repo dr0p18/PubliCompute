@@ -1,0 +1,108 @@
+diff --git a/include/llama.h b/include/llama.h
+index f3e595da64bbaf0fc567d737eb848fa4395faf43..564a77720404473ee98c417918575105c32bc054 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -605,6 +605,19 @@ extern "C" {
+     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
+     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
+ 
++    struct llama_attention_cache_info {
++        enum ggml_type type_k;
++        enum ggml_type type_v;
++        bool flash_attn;
++        bool has_attention_cache;
++    };
++
++    // Read the resolved Flash Attention setting and the attention cache's tensor types.
++    // When keys and values share storage, both fields report the shared type.
++    // GGML_TYPE_COUNT indicates no attention cache or a type that varies across its tensors.
++    // A null context reports no attention cache and disabled Flash Attention.
++    LLAMA_API struct llama_attention_cache_info llama_get_attention_cache_info(const struct llama_context * ctx);
++
+     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
+     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 34abf9ca75a8c615cdc8e5e7de095b88b0d57abe..bd4073fd324743a442ccf97d2eba832344957348 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -6,7 +6,12 @@
+ #include "llama-impl.h"
+ #include "llama-batch.h"
+ #include "llama-io.h"
++#include "llama-kv-cache-dsa-iswa.h"
++#include "llama-kv-cache-dsv4.h"
++#include "llama-kv-cache-msa.h"
+ #include "llama-memory.h"
++#include "llama-memory-hybrid.h"
++#include "llama-memory-hybrid-iswa.h"
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ #include "llama-moe-cache.h"
+@@ -4552,6 +4557,40 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
+     return ctx->get_memory();
+ }
+ 
++static void llama_read_attention_cache_types(const llama_memory_i * memory, llama_attention_cache_info & info) {
++    if (const auto * cache = dynamic_cast<const llama_kv_cache *>(memory)) {
++        cache->add_attention_cache_types(info);
++    } else if (const auto * cache = dynamic_cast<const llama_kv_cache_iswa *>(memory)) {
++        llama_read_attention_cache_types(cache->get_base(), info);
++        llama_read_attention_cache_types(cache->get_swa(), info);
++    } else if (const auto * cache = dynamic_cast<const llama_memory_hybrid *>(memory)) {
++        llama_read_attention_cache_types(cache->get_mem_attn(), info);
++    } else if (const auto * cache = dynamic_cast<const llama_memory_hybrid_iswa *>(memory)) {
++        llama_read_attention_cache_types(cache->get_mem_attn(), info);
++    } else if (const auto * cache = dynamic_cast<const llama_kv_cache_msa *>(memory)) {
++        llama_read_attention_cache_types(cache->get_base(), info);
++    } else if (const auto * cache = dynamic_cast<const llama_kv_cache_dsa *>(memory)) {
++        llama_read_attention_cache_types(cache->get_mla(), info);
++    } else if (const auto * cache = dynamic_cast<const llama_kv_cache_dsa_iswa *>(memory)) {
++        llama_read_attention_cache_types(cache->get_dsa(), info);
++        llama_read_attention_cache_types(cache->get_swa(), info);
++    } else if (const auto * cache = dynamic_cast<const llama_kv_cache_dsv4 *>(memory)) {
++        llama_read_attention_cache_types(cache->get_raw(), info);
++        llama_read_attention_cache_types(cache->get_csa(), info);
++        llama_read_attention_cache_types(cache->get_hca(), info);
++    }
++}
++
++llama_attention_cache_info llama_get_attention_cache_info(const llama_context * ctx) {
++    if (!ctx) {
++        return { GGML_TYPE_COUNT, GGML_TYPE_COUNT, false, false };
++    }
++
++    llama_attention_cache_info info = { GGML_TYPE_COUNT, GGML_TYPE_COUNT, ctx->get_cparams().flash_attn, false };
++    llama_read_attention_cache_types(ctx->get_memory(), info);
++    return info;
++}
++
+ float * llama_get_embeddings_nextn(llama_context * ctx) {
+     ctx->synchronize();
+ 
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 9ed36c562a45c6cb623956a7be3bb199ca3545e4..71d5bb05521e232a5c829e6d71f91415baf3dbf1 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -164,6 +164,21 @@ public:
+     ggml_type type_k() const;
+     ggml_type type_v() const;
+ 
++    void add_attention_cache_types(llama_attention_cache_info & info) const {
++        for (const auto & layer : layers) {
++            const ggml_type k = layer.k->type;
++            const ggml_type v = layer.v ? layer.v->type : k;
++            if (info.has_attention_cache) {
++                info.type_k = info.type_k == k ? k : GGML_TYPE_COUNT;
++                info.type_v = info.type_v == v ? v : GGML_TYPE_COUNT;
++            } else {
++                info.type_k = k;
++                info.type_v = v;
++                info.has_attention_cache = true;
++            }
++        }
++    }
++
+     std::vector<uint32_t> get_layer_ids() const;
+     ggml_tensor * get_k_storage(int32_t il) const;
+ 

@@ -22,6 +22,11 @@ fn env_ms(k: &str) -> Duration {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!(concat!("publicompute-stage ", env!("CARGO_PKG_VERSION")));
+        return;
+    }
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let role = args.first().cloned().unwrap_or_default();
     let val = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
@@ -58,8 +63,11 @@ fn main() {
             });
             // Keep the readiness line in sync with the stage executable because the supervisor parses it.
             eprintln!("[stage] {} layer [{}, {}) ready on {addr}", if role == "tail" { "Tail" } else { "Middle" }, val("--layer-start").unwrap_or_default(), val("--layer-end").unwrap_or_default());
-            loop {
-                std::thread::sleep(Duration::from_secs(3600));
+            if args.iter().any(|arg| arg == "--stop-on-stdin-eof") {
+                std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink()).unwrap();
+                eprintln!("[fake-stage] received release EOF");
+            } else {
+                wait_for_exit();
             }
         }
         _ => {
@@ -145,8 +153,16 @@ fn request(r: pb::Request, ritardo: Duration, write: &Arc<Mutex<std::io::Stdout>
         let mut w = write.lock().unwrap();
         manda(&mut *w, m)
     };
-    if text.contains("rifiuta") {
-        send(pb::FromHead { body: Some(pb::from_head::Body::Done(pb::Done { id: r.id, reason: "error".into(), error: "context_length_exceeded".into(), ..Default::default() })) });
+    let cached = text == "cached-ciao" && r.owner_key == [0x1f; 16] && r.member_seat && r.member_key == [0x3f; 16];
+    if cached {
+        send(pb::FromHead { body: Some(pb::from_head::Body::Admission(pb::Admission {
+            id: r.id,
+            slot_taken: Some(publicompute_proto::common::SlotTaken { slot: 0, generation: 1 }),
+        })) });
+    }
+    if text.contains("rifiuta") || text == "capacity-unavailable" {
+        let error = if text == "capacity-unavailable" { "capacity_unavailable" } else { "context_length_exceeded" };
+        send(pb::FromHead { body: Some(pb::from_head::Body::Done(pb::Done { id: r.id, reason: "error".into(), error: error.into(), ..Default::default() })) });
         return;
     }
     if matches!(text.as_str(), "stall-chat-output" | "flood-chat-output") {
@@ -202,9 +218,10 @@ fn request(r: pb::Request, ritardo: Duration, write: &Arc<Mutex<std::io::Stdout>
         body: Some(pb::from_head::Body::Done(pb::Done {
             id: r.id,
             reason: reason.into(),
-            usage: Some(pb::Usage { prompt_tokens: prompt.len() as u32, generated_tokens: generati }),
+            usage: Some(pb::Usage { prompt_tokens: prompt.len() as u32, generated_tokens: generati, cached_prompt_tokens: if cached { 4 } else { 0 } }),
             timings: Some(pb::Timings { wait_ms: 1.0, ttft_ms: 5.0, total_ms: 10.0 }),
             prompt_token: prompt,
+            slot_report: cached.then_some(publicompute_proto::common::SlotReport { slot: 0, generation: 1, parked: true }),
             ..Default::default()
         })),
     });

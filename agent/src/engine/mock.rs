@@ -139,7 +139,7 @@ impl MockEngine {
             if let Some(d) = &deltas {
                 in_attesa.push(out[i]);
                 if let Ok(t) = std::str::from_utf8(&in_attesa) {
-                    d.send(Delta { index: primo as u32, text: t.to_string(), token_ids: (primo..=i).map(|k| u32::from(out[k])).collect() })?;
+                    d.send(Delta { index: primo as u32, text: t.to_string(), token_ids: (primo..=i).map(|k| u32::from(out[k])).collect(), ..Default::default() })?;
                     in_attesa.clear();
                     primo = i + 1;
                 }
@@ -158,6 +158,8 @@ impl MockEngine {
             token_ids: out.iter().map(|b| u32::from(*b)).collect(),
             finish_reason: finish,
             prompt_tokens: prompt.len() as u32,
+            cached_prompt_tokens: 0,
+            slot_report: None,
             prompt_tokens_sha256: prompt_tokens_sha256(&prompt),
             probs,
             verification_incomplete: false,

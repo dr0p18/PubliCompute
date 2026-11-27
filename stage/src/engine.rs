@@ -3,6 +3,7 @@
 //! vector per row. A non-tail stage returns residuals for all rows, and a
 //! tail exposes logits for the requested rows.
 
+use crate::kv_cache::{CacheConfig, CacheType, EffectiveCacheConfig, FlashAttn};
 use publicompute_llama_sys as sys;
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -38,6 +39,73 @@ pub struct EngineOptions {
     /// Load the tail's draft block and allocate a separate draft context for
     /// each group. The main context exposes hidden states for feeding it.
     pub mtp: bool,
+    /// Cache types and FlashAttention mode requested for every main context and draft context.
+    pub cache: CacheConfig,
+}
+
+fn ggml_type(t: CacheType) -> sys::ggml_type {
+    match t {
+        CacheType::F16 => sys::ggml_type_GGML_TYPE_F16,
+        CacheType::Q8_0 => sys::ggml_type_GGML_TYPE_Q8_0,
+        CacheType::Q4_0 => sys::ggml_type_GGML_TYPE_Q4_0,
+    }
+}
+
+fn flash_attn_type(f: FlashAttn) -> sys::llama_flash_attn_type {
+    match f {
+        FlashAttn::Auto => sys::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_AUTO,
+        FlashAttn::On => sys::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_ENABLED,
+        FlashAttn::Off => sys::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_DISABLED,
+    }
+}
+
+fn cache_type(native: sys::ggml_type) -> Result<CacheType, &'static str> {
+    match native {
+        sys::ggml_type_GGML_TYPE_F16 => Ok(CacheType::F16),
+        sys::ggml_type_GGML_TYPE_Q8_0 => Ok(CacheType::Q8_0),
+        sys::ggml_type_GGML_TYPE_Q4_0 => Ok(CacheType::Q4_0),
+        sys::ggml_type_GGML_TYPE_COUNT => Err("has inconsistent types across attention tensors"),
+        _ => Err("has an unsupported type"),
+    }
+}
+
+fn cache_type_name(native: sys::ggml_type) -> String {
+    match cache_type(native) {
+        Ok(cache) => cache.to_string(),
+        Err(_) if native == sys::ggml_type_GGML_TYPE_COUNT => "mixed".into(),
+        Err(_) => format!("unknown({native})"),
+    }
+}
+
+unsafe fn check_context_cache(
+    ctx: *const sys::llama_context,
+    requested: CacheConfig,
+    group: usize,
+    context: &str,
+    slots: u32,
+) -> Result<(), String> {
+    let label = format!("group {group} {context} context");
+    let info = sys::llama_get_attention_cache_info(ctx);
+    let requested_settings = requested.describe_requested();
+    let types = if info.has_attention_cache {
+        let cache_error = |field, error| {
+            let flash_attn = if info.flash_attn { "on" } else { "off" };
+            format!(
+                "{label}: slots={slots} {requested_settings} attention_cache=present \
+                 cache_type_k_effective={} cache_type_v_effective={} flash_attn_effective={flash_attn}: \
+                 allocated {field} cache {error}",
+                cache_type_name(info.type_k), cache_type_name(info.type_v)
+            )
+        };
+        let k = cache_type(info.type_k).map_err(|error| cache_error("K", error))?;
+        let v = cache_type(info.type_v).map_err(|error| cache_error("V", error))?;
+        Some((k, v))
+    } else {
+        None
+    };
+    let effective = EffectiveCacheConfig { types, flash_attn: info.flash_attn };
+    eprintln!("[engine] {label}: slots={slots} {requested_settings} {}", effective.describe());
+    requested.validate_effective(effective).map_err(|e| format!("{label}: {e}"))
 }
 
 /// (rows, k, indices) for one sub-batch.
@@ -172,8 +240,10 @@ unsafe extern "C" fn log_silenzioso(livello: u32, text: *const c_char, _: *mut s
 impl Engine {
     /// Load the requested layer range and allocate a context for each group.
     /// Return an error if loading fails, a requested draft block is unavailable,
-    /// or a context cannot be allocated.
+    /// or a context cannot honor the requested attention cache settings.
     pub fn load(o: &EngineOptions) -> Result<Engine, String> {
+        // Validate the requested FlashAttention mode before loading the model.
+        let flash_attn_requested = o.cache.requested_flash_attn()?;
         init_backend();
         let path = CString::new(o.model.clone()).map_err(|e| e.to_string())?;
         unsafe {
@@ -227,7 +297,7 @@ impl Engine {
             }
             // Allocate context memory for exactly the configured slots, not groups x ceil(slots / groups).
             let per_gruppo = crate::admission::slots_per_group(o.slots, o.groups);
-            for &per_ctx in &per_gruppo {
+            for (group, &per_ctx) in per_gruppo.iter().enumerate() {
                 let mut cp = sys::llama_context_default_params();
                 cp.n_ctx = o.ctx_per_slot * per_ctx;
                 cp.n_batch = o.n_batch;
@@ -237,15 +307,19 @@ impl Engine {
                 cp.n_threads_batch = o.threads;
                 cp.kv_unified = false;
                 cp.n_rs_seq = o.max_draft_tokens;
+                cp.type_k = ggml_type(o.cache.k);
+                cp.type_v = ggml_type(o.cache.v);
+                cp.flash_attn_type = flash_attn_type(flash_attn_requested);
                 if let Some(c) = &m.cattura {
                     cp.cb_eval = Some(cb_eval);
                     cp.cb_eval_user_data = &**c as *const Cattura as *mut c_void;
                 }
                 let ctx = sys::llama_init_from_model(model, cp);
                 if ctx.is_null() {
-                    return Err("llama_init_from_model failed (possibly out of memory)".into());
+                    return Err(format!("group {group} main context: llama_init_from_model failed ({})", o.cache.describe_requested()));
                 }
                 m.ctxs.push(ctx);
+                check_context_cache(ctx, o.cache, group, "main", per_ctx)?;
                 if o.mtp {
                     // Prompt rows also feed the draft cache, so keep their hidden states even
                     // when they do not request logits.
@@ -260,16 +334,20 @@ impl Engine {
                     cm.n_threads_batch = o.threads;
                     cm.kv_unified = false;
                     cm.ctx_type = sys::llama_context_type_LLAMA_CONTEXT_TYPE_MTP;
+                    cm.type_k = ggml_type(o.cache.k);
+                    cm.type_v = ggml_type(o.cache.v);
+                    cm.flash_attn_type = flash_attn_type(flash_attn_requested);
                     let c = sys::llama_init_from_model(model, cm);
                     if c.is_null() {
-                        return Err("could not create MTP context (llama_init_from_model failed)".into());
+                        return Err(format!("group {group} MTP context: llama_init_from_model failed ({})", o.cache.describe_requested()));
                     }
+                    m.ctxs_mtp.push(c);
+                    check_context_cache(c, o.cache, group, "MTP", per_ctx)?;
                     if o.max_draft_tokens > 1 {
                         // Expose hidden state for requested rows using the logits index.
                         sys::llama_stage_set_embeddings_nextn(c, true, true);
                         m.mtp_stato_uscita = true;
                     }
-                    m.ctxs_mtp.push(c);
                 }
             }
             m.per_ctx = per_gruppo;
@@ -287,6 +365,40 @@ impl Engine {
                 sys::llama_memory_seq_rm(mem, local, -1, -1);
             }
         }
+    }
+
+    /// Only this hybrid memory layout has a verified partial restore contract.
+    pub fn supports_parking(&self) -> bool {
+        self.architettura() == "qwen35moe"
+    }
+
+    pub fn save_checkpoint(&self, slot: u32) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+        let ctx = self.ctxs[(slot >> 16) as usize];
+        let local = (slot & 0xffff) as i32;
+        let flags = sys::LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        // A stage can have no recurrent layers. The serialized state still
+        // has framing, so zero bytes indicate failure.
+        unsafe {
+            let size = sys::llama_state_seq_get_size_ext(ctx, local, flags);
+            let mut data = zeroize::Zeroizing::new(vec![0; size]);
+            if size == 0 || sys::llama_state_seq_get_data_ext(ctx, data.as_mut_ptr(), size, local, flags) != size {
+                return Err("incomplete recurrent checkpoint".into());
+            }
+            Ok(data)
+        }
+    }
+
+    pub fn restore_checkpoint(&self, slot: u32, position: u32, data: &[u8]) -> Result<(), String> {
+        let ctx = self.ctxs[(slot >> 16) as usize];
+        let local = (slot & 0xffff) as i32;
+        let flags = sys::LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        // Restore first so the recurrent entry is at position - 1 when
+        // seq_rm checks whether the attention suffix can be removed.
+        let read = unsafe { sys::llama_state_seq_set_data_ext(ctx, data.as_ptr(), data.len(), local, flags) };
+        if data.is_empty() || read != data.len() {
+            return Err("incomplete recurrent restore".into());
+        }
+        self.riavvolgi(slot, position)
     }
 
     /// Discard the speculative suffix starting at pos. Recurrent rewind uses
@@ -585,6 +697,38 @@ impl Engine {
     /// rendered prompt, and whether the native template API produced it.
     /// Some templates use a local formatter when the native API cannot render them.
     pub fn prepara_conversazione(&self, msgs: &[&Message]) -> Result<(Vec<i32>, String, bool), String> {
+        self.render_chat(msgs, true)
+    }
+
+    pub fn user_checkpoint(&self, msgs: &[&Message], prompt: &[i32]) -> Option<u32> {
+        if msgs.last()?.role != "user" {
+            return None;
+        }
+        let (question, _, native) = self.render_chat(msgs, false).ok()?;
+        (native && !question.is_empty() && question.len() < prompt.len() && prompt.starts_with(&question))
+            .then_some(question.len() as u32)
+    }
+
+    fn chat_template(&self) -> Option<&CStr> {
+        let template = unsafe { sys::llama_model_chat_template(self.model, std::ptr::null()) };
+        (!template.is_null()).then(|| unsafe { CStr::from_ptr(template) })
+    }
+
+    fn uses_deepseek_chat_fallback(&self, template: &str) -> bool {
+        template.is_empty() && self.architettura() == "deepseek4"
+    }
+
+    pub fn chat_uses_think_tags(&self) -> bool {
+        let template = self.chat_template().map(CStr::to_string_lossy).unwrap_or_default();
+        let effective = if self.uses_deepseek_chat_fallback(&template) {
+            crate::service::DEEPSEEK_ASSISTANT_PREFIX
+        } else {
+            &template
+        };
+        crate::service::template_uses_think_tags(effective)
+    }
+
+    fn render_chat(&self, msgs: &[&Message], add_assistant: bool) -> Result<(Vec<i32>, String, bool), String> {
         if msgs.is_empty() {
             return Err("empty conversation".into());
         }
@@ -593,9 +737,10 @@ impl Engine {
         let c_msgs: Vec<sys::llama_chat_message> = ruoli.iter().zip(&contenuti).map(|(r, c)| sys::llama_chat_message { role: r.as_ptr(), content: c.as_ptr() }).collect();
         let lunghezza: usize = msgs.iter().map(|m| m.text.len() + m.role.len()).sum();
         let (text, usato) = unsafe {
-            let tmpl = sys::llama_model_chat_template(self.model, std::ptr::null());
-            let tmpl_testo = if tmpl.is_null() { String::new() } else { std::ffi::CStr::from_ptr(tmpl).to_string_lossy().into_owned() };
-            if tmpl_testo.is_empty() && self.architettura() == "deepseek4" {
+            let template = self.chat_template();
+            let tmpl = template.map_or(std::ptr::null(), CStr::as_ptr);
+            let tmpl_testo = template.map(CStr::to_string_lossy).unwrap_or_default();
+            if self.uses_deepseek_chat_fallback(&tmpl_testo) {
                 // The local formatter supplies the chat markers for this architecture when
                 // the weight file does not provide a template.
                 (crate::service::deepseek4_conversation(msgs.iter().copied())?, false)
@@ -608,11 +753,11 @@ impl Engine {
                 let mut n = if tmpl.is_null() {
                     -1
                 } else {
-                    sys::llama_chat_apply_template(tmpl, c_msgs.as_ptr(), c_msgs.len(), true, buf.as_mut_ptr() as *mut c_char, buf.len() as i32)
+                    sys::llama_chat_apply_template(tmpl, c_msgs.as_ptr(), c_msgs.len(), add_assistant, buf.as_mut_ptr() as *mut c_char, buf.len() as i32)
                 };
                 if n > buf.len() as i32 {
                     buf.resize(n as usize + 16, 0);
-                    n = sys::llama_chat_apply_template(tmpl, c_msgs.as_ptr(), c_msgs.len(), true, buf.as_mut_ptr() as *mut c_char, buf.len() as i32);
+                    n = sys::llama_chat_apply_template(tmpl, c_msgs.as_ptr(), c_msgs.len(), add_assistant, buf.as_mut_ptr() as *mut c_char, buf.len() as i32);
                 }
                 let ultimo_utente = msgs.last().map_or("", |m| m.text.as_str());
                 if n >= 0 {
